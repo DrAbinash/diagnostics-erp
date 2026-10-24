@@ -22,13 +22,6 @@ interface SystemSettings {
     nasHost: string;
     apiPort: number;
     webPort: number;
-    dicomPort: number;
-  };
-  radiology: {
-    modalities: string[];
-    aeTitle: string;
-    viewerEnabled: boolean;
-    defaultTemplates: string[];
   };
   notifications: {
     smtpHost: string;
@@ -68,7 +61,6 @@ export default function SystemSettings() {
       const parsed: SystemSettings = {
         clinic: data.settings.clinic?.value || {},
         network: data.settings.network?.value || {},
-        radiology: data.settings.radiology?.value || {},
         notifications: data.settings.notifications?.value || {},
         security: data.settings.security?.value || {},
         branding: data.settings.branding?.value || {},
@@ -123,7 +115,6 @@ export default function SystemSettings() {
         <TabsList>
           <TabsTrigger value="clinic">Clinic</TabsTrigger>
           <TabsTrigger value="network">Network</TabsTrigger>
-          <TabsTrigger value="radiology">Radiology</TabsTrigger>
           <TabsTrigger value="notifications">Notifications</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
           <TabsTrigger value="branding">Branding</TabsTrigger>
@@ -223,45 +214,8 @@ export default function SystemSettings() {
                   onChange={(e) => updateField("network", "webPort", Number(e.target.value))}
                 />
               </div>
-              <div>
-                <Label>DICOM Port</Label>
-                <Input
-                  type="number"
-                  value={settings.network.dicomPort || 6433}
-                  onChange={(e) => updateField("network", "dicomPort", Number(e.target.value))}
-                />
-              </div>
               <Button onClick={() => saveSettings("network")} disabled={saving}>
                 {saving ? "Saving..." : "Save Network Settings"}
-              </Button>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="radiology">
-          <Card>
-            <CardHeader>
-              <CardTitle>Radiology Configuration</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div>
-                <Label>AE Title</Label>
-                <Input
-                  value={settings.radiology.aeTitle || ""}
-                  onChange={(e) => updateField("radiology", "aeTitle", e.target.value)}
-                />
-              </div>
-              <div className="flex items-center space-x-2">
-                <input
-                  type="checkbox"
-                  id="viewerEnabled"
-                  checked={settings.radiology.viewerEnabled || false}
-                  onChange={(e) => updateField("radiology", "viewerEnabled", e.target.checked)}
-                />
-                <Label htmlFor="viewerEnabled">Enable Web Viewer</Label>
-              </div>
-              <Button onClick={() => saveSettings("radiology")} disabled={saving}>
-                {saving ? "Saving..." : "Save Radiology Settings"}
               </Button>
             </CardContent>
           </Card>

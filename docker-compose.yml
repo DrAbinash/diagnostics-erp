@@ -2,9 +2,9 @@
 # Diagnostics ERP
 #
 # Schema update flow (automatic, every deployment):
-#   diagnostics-db (healthy) → diagnostics-db-patch-v2 → diagnostics-schema-verify → diagnostics-api → diagnostics-web
+#   billing-db (healthy) → billing-db-patch-v2 → billing-schema-verify → billing-api → billing-web
 #
-# diagnostics-db-patch-v2 is the SINGLE automatic schema container. It:
+# billing-db-patch-v2 is the SINGLE automatic schema container. It:
 #   1. Waits for PostgreSQL
 #   2. Bootstraps Drizzle migration tracking (idempotent)
 #   3. Applies Drizzle .sql migration files in order (skips already-applied)
@@ -12,25 +12,25 @@
 #   5. Applies feature migrations from migrations/ (Phase 1: MRI protocols, Phase 2: neuro prompts)
 #   All steps are idempotent. Safe to run on every deployment.
 #
-# diagnostics-schema-verify runs after diagnostics-db-patch-v2 and confirms the schema
-# actually matches what the application expects before diagnostics-api starts —
+# billing-schema-verify runs after billing-db-patch-v2 and confirms the schema
+# actually matches what the application expects before billing-api starts —
 # a safety check, not a migration step itself.
 #
-# diagnostics-migrate is MANUAL/EMERGENCY ONLY (profiles: [manual] — never starts
+# billing-migrate is MANUAL/EMERGENCY ONLY (profiles: [manual] — never starts
 # during a normal `docker compose up`):
-#   docker compose --profile manual run --rm diagnostics-migrate
+#   docker compose --profile manual run --rm billing-migrate
 #   (Runs Drizzle TypeScript migrator — same migrations, alternative path.
 #   Use only when debugging a migration issue outside the normal flow.)
 #
-# diagnostics-migrate is ALSO the approved way to run one-off, owner-reviewed data
+# billing-migrate is ALSO the approved way to run one-off, owner-reviewed data
 # scripts against production (e.g. Phase F template consolidation, blank-
 # accession USG stamp backfill) — same container, same DATABASE_URL, no
 # separate infrastructure:
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:assess
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:execute
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:rollback
-#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:dry-run
-#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:execute
+#   docker compose run --rm billing-migrate pnpm --filter @workspace/db run phase-f:assess
+#   docker compose run --rm billing-migrate pnpm --filter @workspace/db run phase-f:execute
+#   docker compose run --rm billing-migrate pnpm --filter @workspace/db run phase-f:rollback
+#   docker compose --profile manual run --rm billing-migrate pnpm --filter @workspace/db run stamp-accession:dry-run
+#   docker compose --profile manual run --rm billing-migrate pnpm --filter @workspace/db run stamp-accession:execute
 #
 # See SYNOLOGY_DB_MIGRATION_DEPLOYMENT.md for full deployment instructions.
 # =============================================================================
@@ -42,7 +42,7 @@ services:
   # ---------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
-    container_name: diagnostics-db
+    container_name: billing-db
     restart: unless-stopped
     logging:
       driver: json-file
@@ -52,12 +52,12 @@ services:
     ports:
       # Bind the published Postgres port to LOOPBACK by default.
       #
-      # This was "${DB_HOST_PORT:-5433}:5432", which docker binds to 0.0.0.0 —
+      # This was "${DB_HOST_PORT:-5434}:5432", which docker binds to 0.0.0.0 —
       # the database was reachable from every machine on the clinic network
       # (and from the internet if the NAS forwards the port), with the default
       # password `changeme` still in place:
       #
-      #   psql -h <nas-ip> -p 5400 -U erp -d diagnostic_erp
+      #   psql -h <nas-ip> -p 5400 -U erp -d billing_erp
       #
       # That is full read/write on patients, bills and reports, bypassing every
       # permission check, rate limit and audit trail in the application —
@@ -77,15 +77,15 @@ services:
       #
       # Setting DB_BIND_ADDR=0.0.0.0 restores the old, exposed behaviour and
       # should only ever be paired with a strong DB_PASSWORD.
-      - "${DB_BIND_ADDR:-127.0.0.1}:${DB_HOST_PORT:-5433}:5432"
+      - "${DB_BIND_ADDR:-127.0.0.1}:${DB_HOST_PORT:-5434}:5432"
     environment:
       POSTGRES_USER: ${DB_USER:-erp}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-      POSTGRES_DB: ${DB_NAME:-diagnostic_erp}
+      POSTGRES_DB: ${DB_NAME:-billing_erp}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-erp} -d ${DB_NAME:-diagnostic_erp}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-erp} -d ${DB_NAME:-billing_erp}"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -112,17 +112,17 @@ services:
   # ---------------------------------------------------------------------------
   db-patch-v2:
     image: postgres:16-alpine
-    container_name: diagnostics-db-patch-v2
+    container_name: billing-db-patch-v2
     restart: "no"
     environment:
       PGPASSWORD: ${DB_PASSWORD:-changeme}
       DB_HOST: db
       DB_USER: ${DB_USER:-erp}
-      DB_NAME: ${DB_NAME:-diagnostic_erp}
+      DB_NAME: ${DB_NAME:-billing_erp}
       # Identity stamp — used by the deployment guard to fail loudly instead
       # of running migrations against the wrong database (see system_database_
       # identity in docker/db-patch-entrypoint.sh and docs/DEPLOYMENT.md).
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-production}
       # Version metadata — stored in schema_deploy_state by the patch script
       ERP_VERSION: ${ERP_VERSION:-2.0.0}
@@ -145,17 +145,17 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # Schema verifier — runs after db-patch-v2, before diagnostics-api.
+  # Schema verifier — runs after db-patch-v2, before billing-api.
   # Uses the migrate image (Node.js + full workspace) to run
   # scripts/db-schema-verify.cjs, which parses ALL migration SQL files
   # (CREATE/ADD/DROP/RENAME COLUMN, RENAME TABLE, ALTER COLUMN TYPE) and
   # compares the result against the live DB.
   #
   # READ-ONLY BY DEFAULT: this container reports schema drift but never
-  # mutates the schema unless SCHEMA_REPAIR=true is set below. diagnostics-db-patch-v2
+  # mutates the schema unless SCHEMA_REPAIR=true is set below. billing-db-patch-v2
   # is the single source of truth for applying schema changes — this
   # container's job is to confirm the result matches, not to fix it.
-  # Drift alone does not block diagnostics-api from starting (see
+  # Drift alone does not block billing-api from starting (see
   # STARTUP_SCHEMA_VERIFICATION.md after each deploy for details); set
   # SCHEMA_VERIFY_STRICT=true to restore the old "any drift blocks
   # deployment" behaviour. A DB identity mismatch (wrong database entirely)
@@ -166,18 +166,18 @@ services:
       context: .
       dockerfile: Dockerfile
       target: migrate
-    container_name: diagnostics-schema-verify
+    container_name: billing-schema-verify
     restart: "no"
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
       # Auto-repair is OFF by default. Set to "true" only when you've reviewed
       # STARTUP_SCHEMA_VERIFICATION.md and specifically want ADD COLUMN/CREATE
       # TABLE/CREATE INDEX IF NOT EXISTS repairs applied on this deploy.
       SCHEMA_REPAIR: ${SCHEMA_REPAIR:-false}
       # When true, schema drift found in (non-repair) verify mode blocks
-      # diagnostics-api from starting, same as the old default behaviour.
+      # billing-api from starting, same as the old default behaviour.
       SCHEMA_VERIFY_STRICT: ${SCHEMA_VERIFY_STRICT:-false}
       # Pass git metadata so startup report includes commit/branch info
       GIT_COMMIT: ${GIT_COMMIT:-unknown}
@@ -227,7 +227,7 @@ services:
         GIT_BRANCH: ${GIT_BRANCH:-unknown}
         GIT_TAG: ${GIT_TAG:-unknown}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    container_name: diagnostics-api
+    container_name: billing-api
     restart: unless-stopped
     logging:
       driver: json-file
@@ -239,24 +239,24 @@ services:
       com.diagnostics.build: ${BUILD_NUMBER:-0}
       com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      PORT: "8200"
+      PORT: "8300"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       TZ: ${TZ:-Asia/Kolkata}
       # Redis for caching (feature flags, sessions, rate limiting)
       REDIS_URL: redis://redis:6379
       # Identity stamp checked (read-only) at startup before any compatibility
       # patches run — see runStartupMigrations() in src/index.ts. Must match
-      # the same APP_NAME used by diagnostics-db-patch-v2 / diagnostics-schema-verify.
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      # the same APP_NAME used by billing-db-patch-v2 / billing-schema-verify.
+      APP_NAME: ${APP_NAME:-billing-erp}
 
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env — use a 64-char random string}
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env — use a 64-char random string}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
 
       # Super Admin USB pen-drive gate. Must be listed here — Compose does NOT
-      # auto-inject every .env key into the container. Without these, diagnostics-api
+      # auto-inject every .env key into the container. Without these, billing-api
       # sees empty SUPER_ADMIN_USB_* even when .env on disk is correct, so
       # usb/verify and usbPin auto-login fail (PIN is required / invalid key).
       SUPER_ADMIN_USB_KEY: ${SUPER_ADMIN_USB_KEY:-}
@@ -310,7 +310,7 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://localhost}
 
       # ── Hope Hospital integration ──────────────────────────────────────────
-      # When any of these are set, diagnostics-api entrypoint + startup bootstrap
+      # When any of these are set, billing-api entrypoint + startup bootstrap
       # register the HOPE partner and enable ff_hope_care_referrals (idempotent).
       # Template: deploy/synology/care.env (keys matched to Hope hope.env).
       INTEGRATION_HOPE_CALLBACK_URL: ${INTEGRATION_HOPE_CALLBACK_URL:-}
@@ -341,7 +341,7 @@ services:
       #      `care-orthanc` resolves for it, and it is the one actually working.
       #   2. this ERP's in-process poller (lib/pacs/orthancChangesPoller.ts).
       # care-pacs is a different compose project with its own bridge network, so
-      # `care-orthanc` does NOT resolve from diagnostics-api — the in-process poller
+      # `care-orthanc` does NOT resolve from billing-api — the in-process poller
       # just fails every 20s (getaddrinfo ENOTFOUND care-orthanc) and logs.
       #
       # Set this to false whenever care-erp-sync is deployed — which is exactly
@@ -355,7 +355,7 @@ services:
       # Optional: Ollama AI URL (leave blank if not installed)
       OLLAMA_URL: ${OLLAMA_URL:-}
       # ── Local AI / PaddleOCR worker (Windows PC on LAN) ─────────────────────
-      # Synology diagnostics-api → Windows Ollama :11434 + OCR worker :8090.
+      # Synology billing-api → Windows Ollama :11434 + OCR worker :8090.
       # See docs/ai-ocr/AI_OCR_PIPELINE.md. Rollback: OCR_ENGINE=tesseract|vision.
       OLLAMA_PRIMARY_URL: ${OLLAMA_PRIMARY_URL:-}
       OLLAMA_FALLBACK_URL: ${OLLAMA_FALLBACK_URL:-}
@@ -381,7 +381,7 @@ services:
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-16384}
       OLLAMA_THINK: ${OLLAMA_THINK:-0}
       # Qwen Model Studio (Alibaba DashScope OpenAI-compatible). Compose does NOT
-      # auto-inject .env — list these or diagnostics-api never sees QWEN_* even when the
+      # auto-inject .env — list these or billing-api never sees QWEN_* even when the
       # host .env is correct. QWEN_BASE_URL may be the intl default or a workspace
       # Singapore MaaS URL ending in /compatible-mode/v1 (code does not re-append).
       QWEN_API_KEY: ${QWEN_API_KEY:-}
@@ -470,7 +470,7 @@ services:
       #     returns 503 forever, permanently marking itself unhealthy. A
       #     Docker HEALTHCHECK is a liveness probe; permanently failing it
       #     causes Docker to restart the container in a crash-loop. The
-      #     schema check belongs in the diagnostics-web depends_on condition, which
+      #     schema check belongs in the billing-web depends_on condition, which
       #     is where it has always lived and continues to live (see below).
       #
       #   WHY JSON ARRAY FORMAT (not YAML block-list):
@@ -500,7 +500,7 @@ services:
         condition: service_healthy
       db-patch-v2:
         condition: service_completed_successfully
-      # Previously MISSING: diagnostics-api never actually waited on schema-verify
+      # Previously MISSING: billing-api never actually waited on schema-verify
       # completing, despite comments elsewhere claiming it did — the DB
       # identity check and SCHEMA_VERIFY_STRICT mode are meaningless safety
       # guards without this. In the default (non-strict) mode, ordinary
@@ -523,11 +523,11 @@ services:
       dockerfile: Dockerfile
       target: web
       args:
-        # Stamp the diagnostic-erp SPA with the same commit as diagnostics-api.
+        # Stamp the diagnostic-erp SPA with the same commit as billing-api.
         # Canonical env: GIT_COMMIT (set by deploy-synology.sh). The Vite
         # resolver also accepts CARE_GIT_SHA / VITE_GIT_COMMIT as aliases.
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
-    container_name: diagnostics-web
+    container_name: billing-web
     restart: unless-stopped
     logging:
       driver: json-file
@@ -542,7 +542,7 @@ services:
       com.diagnostics.build: ${BUILD_NUMBER:-0}
       com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
     ports:
-      - "${HOST_PORT:-3100}:80"
+      - "${HOST_PORT:-3200}:80"
     depends_on:
       api:
         condition: service_healthy
@@ -561,13 +561,13 @@ services:
   # ---------------------------------------------------------------------------
   # Manual/emergency migration container — NOT part of normal deployment.
   #
-  # diagnostics-db-patch-v2 (above) already runs all automatic, safe production
+  # billing-db-patch-v2 (above) already runs all automatic, safe production
   # migrations on every deployment — idempotent Drizzle .sql migrations,
   # imperative ADD COLUMN IF NOT EXISTS patches, and feature migrations from
   # migrations/*.sql. Normal Synology Container Manager rebuilds should
   # NEVER need this service.
   #
-  # diagnostics-migrate exists only for manual/emergency use: running the Drizzle
+  # billing-migrate exists only for manual/emergency use: running the Drizzle
   # TypeScript migrator directly (same migrations, alternative execution
   # path) when debugging a migration issue outside the normal flow.
   #
@@ -575,10 +575,10 @@ services:
   # `docker compose up` / `docker compose up -d` — Compose only starts
   # services tagged with a profile when that profile is explicitly
   # requested. This prevents it from ever running duplicate/competing
-  # migrations alongside diagnostics-db-patch-v2 during a routine rebuild.
+  # migrations alongside billing-db-patch-v2 during a routine rebuild.
   #
   # Run manually (only when genuinely needed):
-  #   docker compose --profile manual run --rm diagnostics-migrate
+  #   docker compose --profile manual run --rm billing-migrate
   # ---------------------------------------------------------------------------
   migrate:
     profiles:
@@ -587,12 +587,12 @@ services:
       context: .
       dockerfile: Dockerfile
       target: migrate
-    container_name: diagnostics-migrate
+    container_name: billing-migrate
     restart: "no"
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
     depends_on:
       db:
         condition: service_healthy
@@ -608,7 +608,7 @@ services:
   # and nothing in the running app builds or depends on them.
   # ===========================================================================
 
-# Add the BOUNDARY_API_KEY to the diagnostics-api service's environment in your
+# Add the BOUNDARY_API_KEY to the billing-api service's environment in your
 # .env file so both containers share the same secret:
 #   BOUNDARY_API_KEY=some-long-random-string
 
@@ -621,7 +621,7 @@ services:
   # ───────────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: diagnostics-redis
+    container_name: billing-redis
     restart: unless-stopped
     logging:
       driver: json-file
@@ -629,7 +629,7 @@ services:
         max-size: "10m"
         max-file: "5"
     command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru --save "" --appendonly no
-    # No port published — only accessible within the Docker network (diagnostics-api connects via redis:6379)
+    # No port published — only accessible within the Docker network (billing-api connects via redis:6379)
     # If you need external access for debugging, uncomment:
     # ports:
     #   - "127.0.0.1:6379:6379"
@@ -644,6 +644,6 @@ services:
 volumes:
   db_data:
     external: true
-    name: diagnostics_main_db_data
+    name: billing_main_db_data
   object_storage:
   uploads_data:
