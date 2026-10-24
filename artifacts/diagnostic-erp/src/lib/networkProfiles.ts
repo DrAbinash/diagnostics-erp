@@ -26,7 +26,7 @@ function intVal(raw: unknown, fallback: number): number {
 /** Mutable runtime state. Do not export directly — use the accessors. */
 const state = {
   hosts: {
-    LAN: (env.VITE_NETWORK_LAN_HOST as string) || "172.16.1.139",
+    LAN: (env.VITE_NETWORK_LAN_HOST as string) || "localhost",
     LAN_ALT: (env.VITE_NETWORK_LAN_HOST_ALT as string) || "",
     TAILSCALE: (env.VITE_NETWORK_TAILSCALE_HOST as string) || "100.65.255.115",
     PUBLIC: (env.VITE_NETWORK_PUBLIC_DOMAIN as string) || "caredeoghar.com",
@@ -40,7 +40,7 @@ const NETWORK_SETTINGS_CACHE_KEY = "erp_network_hosts_cache_v2";
 const LAST_WORKING_LAN_HOST_KEY = "erp_last_working_lan_host";
 
 /** Build-time default LAN — used to drop stale cached IPs after NAS moves. */
-const BUILD_DEFAULT_LAN = (env.VITE_NETWORK_LAN_HOST as string) || "172.16.1.139";
+const BUILD_DEFAULT_LAN = (env.VITE_NETWORK_LAN_HOST as string) || "localhost";
 
 /**
  * Hydrate hosts/ports from the admin PACS settings record.
@@ -70,10 +70,10 @@ export function applyNetworkSettings(
 export function hydrateNetworkSettingsFromCache(): void {
   if (typeof window === "undefined") return;
   try {
-    // Drop v1 cache — may contain the obsolete 192.168.1.137 LAN IP.
+    // Drop v1 cache — may contain the obsolete localhost LAN IP.
     window.localStorage.removeItem("erp_network_hosts_cache");
     const last = window.localStorage.getItem(LAST_WORKING_LAN_HOST_KEY)?.trim();
-    if (last === "192.168.1.137" && BUILD_DEFAULT_LAN !== "192.168.1.137") {
+    if (last === "localhost" && BUILD_DEFAULT_LAN !== "localhost") {
       window.localStorage.removeItem(LAST_WORKING_LAN_HOST_KEY);
     }
   } catch {
@@ -86,8 +86,8 @@ export function hydrateNetworkSettingsFromCache(): void {
     if (parsed.network_lan_host?.trim()) {
       const cached = parsed.network_lan_host.trim();
       // Drop stale LAN IPs left in cache after a NAS address change (e.g.
-      // 192.168.1.137 → 172.16.1.139) — wrong redirects broke login on some PCs.
-      if (cached !== BUILD_DEFAULT_LAN && cached === "192.168.1.137") {
+      // localhost → localhost) — wrong redirects broke login on some PCs.
+      if (cached !== BUILD_DEFAULT_LAN && cached === "localhost") {
         /* ignore obsolete cache */
       } else {
         state.hosts.LAN = cached;
@@ -168,7 +168,7 @@ export function publicBaseUrl(): string {
   return `https://${state.hosts.PUBLIC}`;
 }
 
-/** ERP SPA origin on LAN, e.g. "http://172.16.1.139:8888/erp". */
+/** ERP SPA origin on LAN, e.g. "http://localhost:8888/erp". */
 export function erpLanOrigin(): string {
   return erpLanOriginForHost(state.hosts.LAN);
 }

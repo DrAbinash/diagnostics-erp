@@ -103,6 +103,7 @@ const Accounting      = lazy(() => import("@/pages/Accounting"));
 const Banking         = lazy(() => import("@/pages/Banking"));
 const Register        = lazy(() => import("@/pages/Register"));
 const Settings        = lazy(() => import("@/pages/Settings"));
+const SystemSettings  = lazy(() => import("@/pages/SystemSettings"));
 const SystemUpdate    = lazy(() => import("@/pages/SystemUpdate"));
 const Dues            = lazy(() => import("@/pages/Dues"));
 const DicomNodes      = lazy(() => import("@/pages/DicomNodes"));
@@ -742,6 +743,7 @@ function Router() {
                 {() => <AdminOnlySettings><ClinicalContentValidatorPage /></AdminOnlySettings>}
               </Route>
               <Route path="/settings" component={SettingsPageOrRedirect} />
+              <Route path="/system-settings" component={SystemSettings} />
               <Route path="/settings/scanner">
                 {() => <AdminOnlySettings><ScannerSettings /></AdminOnlySettings>}
               </Route>
