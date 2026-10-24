@@ -1,0 +1,3602 @@
+import { Router } from "express";
+import { db, billsTable, paymentsTable, ordersTable, patientsTable } from "@workspace/db";
+import { billAuditsTable, superAdminSessionsTable, ledgersTable, formFRecordsTable, testTokensTable } from "@workspace/db/schema";
+import { sendBillEditEmail, sendBillReprintEmail } from "../email";
+import { isValidUsbKey, isUsbGateEnforced, getUsbKeyHeader } from "../middleware/requireSuperAdminUsb";
+import { auditFromRequest } from "../lib/audit";
+import { lastOverallClosureBoundary, isBeforeClosureBoundary } from "../lib/closureBoundary";
+import type { Request, Response } from "express";
+
+/**
+ * Reject super-admin bill mutations if the USB pen-drive gate is enforced and
+ * the request does not carry a valid X-SA-USB-Key header. Returns true when
+ * the response has been sent (caller should return). Centralised here so the
+ * super-admin token flow used by /:id/super-edit and DELETE /:id matches the
+ * rest of the super-admin surface.
+ *
+ * If the user has remoteLoginEnabled, the USB check is skipped on routes that
+ * already validated the session token via requireSuperAdmin. For the direct
+ * bill-mutation routes the caller should just pass the USB key header.
+ */
+function rejectIfUsbMissing(req: Request, res: Response): boolean {
+  if (!isUsbGateEnforced()) return false;
+  const usb = getUsbKeyHeader(req);
+  if (!usb || !isValidUsbKey(usb)) {
+    res.status(401).json({ error: "USB key required" });
+    return true;
+  }
+  return false;
+}
+import { deriveBillTokenFromTestTokens } from "../lib/deriveBillToken";
+import { generateTestTokensForOrder } from "./test-tokens";
+import { generateStudiesForOrder } from "./radiology";
+import { sendBillWhatsapp } from "./whatsapp";
+import { autoVoucherForPayment } from "../lib/auto-voucher";
+import { getSlowThresholdMs } from "../lib/requestMetrics";
+import { nextDocumentCounter, syncBillNumberSeqForward } from "../lib/documentNumberCounters";
+import { findBillByNumber, ambiguousBillNumberMessage } from "../lib/billByNumber";
+import { enqueueBillingFanout } from "../lib/billingFanoutGate";
+import {
+  cancelRadiologyMwlForBill,
+  cancelRadiologyMwlForOrderTest,
+} from "../lib/pacs/cancelRadiologyStudyFromMwl";
+import { eq, and, sql, desc, like, or, gt, ne, inArray } from "drizzle-orm";
+import { z } from "zod";
+import {
+  ListBillsQueryParams,
+  CreateBillBody,
+  GetBillParams,
+  UpdateBillParams,
+  UpdateBillBody,
+  CreatePaymentBody,
+  ListPaymentsQueryParams,
+  SuperEditBillParams,
+  SuperEditBillBody,
+  DeleteBillParams,
+  DeleteBillBody,
+  LogBillReprintParams,
+  LogBillReprintBody,
+  ListBillAuditsParams,
+  CancelBillParams,
+  CancelBillBody,
+  CancelRefundTestsBody,
+  RefundBillParams,
+  RefundBillBody,
+} from "@workspace/api-zod";
+import { orderTestsTable, testsTable, doctorsTable, clinicSettingsTable } from "@workspace/db";
+import { vouchersTable } from "@workspace/db/schema";
+import { sanitizePatient } from "./patients";
+import type { StaffAuthRequest } from "../middleware/requireStaffAuth";
+import { FULL_ACCESS_ROLES, requireStaffSubPermission } from "../middleware/requireStaffAuth";
+import { planDueWaiver } from "../lib/dueWaiver";
+import { getWalkInLedgerId } from "./ledgers";
+import {
+  billBalanceFromParts,
+  billTotalFromParts,
+  moneyAdd,
+  moneyMax0,
+  moneySub,
+  paiseToRupees,
+  rupeesToPaise,
+  scaleLinePaiseToTotal,
+} from "../lib/money";
+import {
+  assertDiscountNotBelowCollected,
+  assertNonNegativePayment,
+  assertPaymentWithinOutstanding,
+  isCollectiblePayment,
+  recomputedBillBalance,
+} from "../lib/financialIntegrity";
+
+export const billsRouter = Router();
+export const paymentsRouter = Router();
+
+// Per-ledger counter — id=1 (default) also includes legacy NULL rows
+async function countBillsForLedger(ledgerId: number): Promise<number> {
+  const where = ledgerId === 1
+    ? sql`${billsTable.ledgerId} = 1 OR ${billsTable.ledgerId} IS NULL`
+    : sql`${billsTable.ledgerId} = ${ledgerId}`;
+  const r = await db.select({ count: sql<number>`count(*)` }).from(billsTable).where(where);
+  return Number(r[0]?.count ?? 0);
+}
+
+// ── Fast-mode token cache ──────────────────────────────────────────────────
+// When the billing desk saves with ?fast=1, tokens are generated in the
+// background and cached here. The client fetches them via GET /:id/tokens
+// (optionally with waitMs long-poll) once the print dialog is ready.
+type BillTokenRow = Awaited<ReturnType<typeof generateTestTokensForOrder>>[number] & {
+  tokenDate?: string;
+};
+interface CachedTokens { tokens: BillTokenRow[]; generatedAt: number; }
+const tokenCache = new Map<number, CachedTokens>();
+const tokenWaiters = new Map<number, Array<(tokens: CachedTokens["tokens"] | null) => void>>();
+const TOKEN_CACHE_TTL_MS = 120_000;
+// Clean up expired entries every 5 minutes to prevent unbounded growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of tokenCache) {
+    if (now - val.generatedAt > TOKEN_CACHE_TTL_MS) tokenCache.delete(key);
+  }
+}, 300_000).unref();
+
+function mapDbRowsToBillTokens(
+  rows: Array<{
+    orderTestId: number | null;
+    testName: string | null;
+    department: string;
+    roomNumber: string | null;
+    floorLabel: string | null;
+    tokenNo: number;
+    tokenDate: string;
+  }>,
+): BillTokenRow[] {
+  const out: BillTokenRow[] = [];
+  for (const t of rows) {
+    if (t.orderTestId == null) continue;
+    out.push({
+      orderTestId: t.orderTestId,
+      testName: t.testName || "",
+      department: t.department,
+      roomNumber: t.roomNumber || "",
+      floorLabel: t.floorLabel || "",
+      tokenNo: t.tokenNo,
+      tokenDate: t.tokenDate,
+    });
+  }
+  return out;
+}
+
+function publishBillTokens(billId: number, tokens: CachedTokens["tokens"]) {
+  tokenCache.set(billId, { tokens, generatedAt: Date.now() });
+  const waiters = tokenWaiters.get(billId);
+  if (waiters?.length) {
+    tokenWaiters.delete(billId);
+    for (const w of waiters) {
+      try { w(tokens); } catch { /* waiter must not break fan-out */ }
+    }
+  }
+}
+
+/** Wake long-poll waiters without caching (generation failed). */
+function failBillTokens(billId: number) {
+  const waiters = tokenWaiters.get(billId);
+  if (waiters?.length) {
+    tokenWaiters.delete(billId);
+    for (const w of waiters) {
+      try { w(null); } catch { /* ignore */ }
+    }
+  }
+}
+
+function waitForBillTokens(billId: number, waitMs: number): Promise<CachedTokens["tokens"] | null> {
+  if (waitMs <= 0) return Promise.resolve(null);
+  const cached = tokenCache.get(billId);
+  if (cached && Date.now() - cached.generatedAt < TOKEN_CACHE_TTL_MS) {
+    return Promise.resolve(cached.tokens);
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const list = tokenWaiters.get(billId);
+      if (list) {
+        const next = list.filter((w) => w !== onReady);
+        if (next.length) tokenWaiters.set(billId, next);
+        else tokenWaiters.delete(billId);
+      }
+      resolve(null);
+    }, waitMs);
+    const onReady = (tokens: CachedTokens["tokens"] | null) => {
+      clearTimeout(timer);
+      resolve(tokens);
+    };
+    const list = tokenWaiters.get(billId) ?? [];
+    list.push(onReady);
+    tokenWaiters.set(billId, list);
+  });
+}
+
+// Takes the order row the caller already holds (this runs inside the hot
+// save-and-print guard wave — no re-select).
+async function resolveLedgerForOrder(order: typeof ordersTable.$inferSelect): Promise<number> {
+  if (order.ledgerId) return order.ledgerId;
+  if (order.doctorId) {
+    const [d] = await db.select().from(doctorsTable).where(eq(doctorsTable.id, order.doctorId));
+    if (d?.ledgerId) return d.ledgerId;
+  }
+  // Walk-in / no-referral: route to the designated walk-in ledger
+  return getWalkInLedgerId();
+}
+
+/**
+ * Bill numbers are pure-numeric: YYYYMM + 4-digit sequence (e.g. 2026050001).
+ * Older rows in the DB may still carry the legacy `BILL-YYYYMM-####` prefix;
+ * `parseBillNumberParts` handles both shapes so the renumber logic keeps
+ * working across the migration.
+ *
+ * The suffix is allocated PER BOOK (`ledgerId`), which is what makes a register
+ * restartable at 0001. It is the same value the caller already resolved to
+ * attribute the bill — see zzzzzz_bill_numbering_per_ledger.sql.
+ */
+// A pooled db handle OR an open transaction — pass `tx` so nextval runs on the
+// same connection as the bill insert (sequences are concurrent; no long lock).
+type DbOrTx = typeof db | Parameters<Parameters<(typeof db)["transaction"]>[0]>[0];
+export async function generateBillNumber(ledgerId: number, dbHandle: DbOrTx = db): Promise<string> {
+  const date = new Date();
+  const yyyymm = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}`;
+  // SEQUENCE nextval on this book's own sequence — concurrent desk saves no
+  // longer serialize on a global advisory lock for the whole bill insert.
+  const seq = await nextDocumentCounter(dbHandle, "bill", String(ledgerId));
+  return `${yyyymm}${String(seq).padStart(4, "0")}`;
+}
+
+function parseBillNumberParts(billNumber: string): { monthPrefix: string; seq: number } | null {
+  const legacy = billNumber.match(/^BILL-(\d{6})-(\d+)$/);
+  if (legacy) return { monthPrefix: legacy[1]!, seq: Number(legacy[2]) };
+  const numeric = billNumber.match(/^(\d{6})(\d{4,})$/);
+  if (numeric) return { monthPrefix: numeric[1]!, seq: Number(numeric[2]) };
+  return null;
+}
+
+type BuiltBill = Awaited<ReturnType<typeof buildBill>>;
+
+function mapBillNumbers(bill: typeof billsTable.$inferSelect) {
+  return {
+    ...bill,
+    subtotal: Number(bill.subtotal),
+    discount: Number(bill.discount),
+    taxAmount: Number(bill.taxAmount),
+    totalAmount: Number(bill.totalAmount),
+    originalTotal: Number(bill.originalTotal),
+    paidAmount: Number(bill.paidAmount),
+    balanceAmount: Number(bill.balanceAmount),
+  };
+}
+
+/**
+ * Batch-hydrate a page of bills into the same shape as `buildBill`.
+ *
+ * The list endpoint used to call `buildBill` once per row (~5 queries each).
+ * Today's Collections polls `/api/bills?limit=100` every 30s, so that was
+ * hundreds of queries/minute competing with desk saves. This helper does a
+ * fixed handful of IN(...) lookups for the whole page instead.
+ *
+ * `compact: true` skips payments + order line items (desk/Collections panels
+ * only need patient name + amounts). Full detail remains the default so
+ * Form 3C / Dues / OpenAPI clients keep receiving tests + payments.
+ */
+async function buildBillsBatch(
+  bills: (typeof billsTable.$inferSelect)[],
+  opts: { compact?: boolean } = {},
+): Promise<BuiltBill[]> {
+  if (bills.length === 0) return [];
+
+  const compact = opts.compact === true;
+  const billIds = bills.map((b) => b.id);
+  const patientIds = [...new Set(bills.map((b) => b.patientId))];
+  const orderIds = [...new Set(bills.map((b) => b.orderId))];
+
+  const [patients, orders, payments] = await Promise.all([
+    patientIds.length
+      ? db.select().from(patientsTable).where(inArray(patientsTable.id, patientIds))
+      : Promise.resolve([] as (typeof patientsTable.$inferSelect)[]),
+    orderIds.length
+      ? db.select().from(ordersTable).where(inArray(ordersTable.id, orderIds))
+      : Promise.resolve([] as (typeof ordersTable.$inferSelect)[]),
+    compact || billIds.length === 0
+      ? Promise.resolve([] as (typeof paymentsTable.$inferSelect)[])
+      : db
+          .select()
+          .from(paymentsTable)
+          .where(inArray(paymentsTable.billId, billIds))
+          .orderBy(desc(paymentsTable.createdAt)),
+  ]);
+
+  const patientById = new Map(patients.map((p) => [p.id, p]));
+  const orderById = new Map(orders.map((o) => [o.id, o]));
+
+  const doctorIds = [
+    ...new Set(
+      orders
+        .map((o) => o.doctorId)
+        .filter((id): id is number => typeof id === "number" && Number.isFinite(id)),
+    ),
+  ];
+  const doctors = doctorIds.length
+    ? await db.select().from(doctorsTable).where(inArray(doctorsTable.id, doctorIds))
+    : [];
+  const doctorById = new Map(doctors.map((d) => [d.id, d]));
+
+  type OrderTestJoined = {
+    orderTest: typeof orderTestsTable.$inferSelect;
+    test: typeof testsTable.$inferSelect | null;
+  };
+  // Line names are needed even in compact mode so the Bills list can show and
+  // search by test. Only the full `tests` hydration stays gated.
+  let orderTestRows: OrderTestJoined[] = [];
+  if (orderIds.length > 0) {
+    orderTestRows = await db
+      .select({ orderTest: orderTestsTable, test: testsTable })
+      .from(orderTestsTable)
+      .leftJoin(testsTable, eq(orderTestsTable.testId, testsTable.id))
+      .where(inArray(orderTestsTable.orderId, orderIds));
+  }
+  const testsByOrderId = new Map<number, OrderTestJoined[]>();
+  for (const row of orderTestRows) {
+    const list = testsByOrderId.get(row.orderTest.orderId);
+    if (list) list.push(row);
+    else testsByOrderId.set(row.orderTest.orderId, [row]);
+  }
+
+  const paymentsByBillId = new Map<number, (typeof paymentsTable.$inferSelect)[]>();
+  for (const p of payments) {
+    const list = paymentsByBillId.get(p.billId);
+    if (list) list.push(p);
+    else paymentsByBillId.set(p.billId, [p]);
+  }
+
+  return bills.map((bill) => {
+    const patient = patientById.get(bill.patientId) ?? null;
+    const order = orderById.get(bill.orderId) ?? null;
+    const sanitized = patient ? sanitizePatient(patient) : null;
+    const lineItems = order ? (testsByOrderId.get(order.id) ?? []) : [];
+
+    const orderDetails = order
+      ? {
+          ...order,
+          totalAmount: Number(order.totalAmount),
+          patient: sanitized,
+          doctor: order.doctorId != null ? (doctorById.get(order.doctorId) ?? null) : null,
+          // Mirrors what the bill prints: the per-order override wins over the
+          // master name. Cancelled lines stay listed so a test-wise search that
+          // matched them shows why the bill came back.
+          testNames: lineItems.map(
+            (ot) => ot.orderTest.displayName?.trim() || ot.test?.name || "",
+          ).filter(Boolean),
+          tests: compact
+            ? []
+            : lineItems.map((ot) => ({
+                ...ot.orderTest,
+                price: Number(ot.orderTest.price),
+                displayName: ot.orderTest.displayName ?? null,
+                test: ot.test ? { ...ot.test, price: Number(ot.test.price) } : null,
+              })),
+        }
+      : null;
+
+    return {
+      ...mapBillNumbers(bill),
+      patient: sanitized,
+      order: orderDetails,
+      payments: (paymentsByBillId.get(bill.id) ?? []).map((p) => ({ ...p, amount: Number(p.amount) })),
+    };
+  }) as BuiltBill[];
+}
+
+async function buildBill(bill: typeof billsTable.$inferSelect) {
+  // Single-bill detail / mutation responses. Independent lookups stay concurrent.
+  const [[patient], [order], payments] = await Promise.all([
+    db.select().from(patientsTable).where(eq(patientsTable.id, bill.patientId)),
+    db.select().from(ordersTable).where(eq(ordersTable.id, bill.orderId)),
+    db.select().from(paymentsTable).where(eq(paymentsTable.billId, bill.id)).orderBy(desc(paymentsTable.createdAt)),
+  ]);
+
+  let orderDetails = null;
+  if (order) {
+    const [orderTestRows, doctorRows] = await Promise.all([
+      db
+        .select({ orderTest: orderTestsTable, test: testsTable })
+        .from(orderTestsTable)
+        .leftJoin(testsTable, eq(orderTestsTable.testId, testsTable.id))
+        .where(eq(orderTestsTable.orderId, order.id)),
+      order.doctorId
+        ? db.select().from(doctorsTable).where(eq(doctorsTable.id, order.doctorId))
+        : Promise.resolve([] as (typeof doctorsTable.$inferSelect)[]),
+    ]);
+
+    const doctor = doctorRows[0] ?? null;
+
+    orderDetails = {
+      ...order,
+      totalAmount: Number(order.totalAmount),
+      patient: patient ? sanitizePatient(patient) : null,
+      doctor,
+      tests: orderTestRows.map((ot) => ({
+        ...ot.orderTest,
+        price: Number(ot.orderTest.price),
+        displayName: ot.orderTest.displayName ?? null,
+        test: ot.test ? { ...ot.test, price: Number(ot.test.price) } : null,
+      })),
+    };
+  }
+
+  return {
+    ...mapBillNumbers(bill),
+    patient: patient ? sanitizePatient(patient) : null,
+    order: orderDetails,
+    payments: payments.map((p) => ({ ...p, amount: Number(p.amount) })),
+  };
+}
+
+function parsePositiveInt(raw: unknown): number | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+billsRouter.get("/creators", async (_req, res) => {
+  const rows = await db
+    .selectDistinct({ createdByName: billsTable.createdByName })
+    .from(billsTable)
+    .where(sql`${billsTable.createdByName} IS NOT NULL AND ${billsTable.createdByName} != ''`)
+    .orderBy(billsTable.createdByName);
+  return res.json(rows.map((r) => r.createdByName));
+});
+
+/**
+ * Referring doctors that actually appear on bills — the option set for the
+ * Bills page referral filter. Scoped to billed orders on purpose: the doctors
+ * master is longer and mostly irrelevant here.
+ */
+billsRouter.get("/referrers", async (_req, res) => {
+  const rows = await db
+    .selectDistinct({ id: doctorsTable.id, name: doctorsTable.name })
+    .from(billsTable)
+    .innerJoin(ordersTable, eq(billsTable.orderId, ordersTable.id))
+    .innerJoin(doctorsTable, eq(ordersTable.doctorId, doctorsTable.id))
+    .orderBy(doctorsTable.name);
+  return res.json(rows);
+});
+
+/**
+ * Catalog tests that actually appear on bills — the option set for the Bills
+ * page test filter. Keyed by catalog id, not by the per-order display-name
+ * override, so picking "MRI Brain" returns every bill containing that test
+ * however the desk printed the line.
+ */
+billsRouter.get("/billed-tests", async (_req, res) => {
+  const rows = await db
+    .select({
+      id: testsTable.id,
+      code: testsTable.code,
+      name: testsTable.name,
+    })
+    .from(billsTable)
+    .innerJoin(ordersTable, eq(billsTable.orderId, ordersTable.id))
+    .innerJoin(orderTestsTable, eq(orderTestsTable.orderId, ordersTable.id))
+    .innerJoin(testsTable, eq(orderTestsTable.testId, testsTable.id))
+    .groupBy(testsTable.id, testsTable.code, testsTable.name)
+    .orderBy(testsTable.name);
+  return res.json(rows);
+});
+
+billsRouter.get("/search", async (req, res) => {
+  const q = String(req.query.q ?? "").trim();
+  const dueOnly = req.query.dueOnly === "1" || req.query.dueOnly === "true";
+  if (q.length < 2) {
+    res.json([]);
+    return;
+  }
+  const pattern = `%${q.toLowerCase()}%`;
+  const rows = await db
+    .select({
+      id: billsTable.id,
+      billNumber: billsTable.billNumber,
+      totalAmount: billsTable.totalAmount,
+      paidAmount: billsTable.paidAmount,
+      balanceAmount: billsTable.balanceAmount,
+      status: billsTable.status,
+      createdAt: billsTable.createdAt,
+      patientName: sql<string>`${patientsTable.firstName} || ' ' || ${patientsTable.lastName}`,
+      patientId: patientsTable.patientId,
+      phone: patientsTable.phone,
+      doctorName: doctorsTable.name,
+    })
+    .from(billsTable)
+    .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+    .leftJoin(ordersTable, eq(billsTable.orderId, ordersTable.id))
+    .leftJoin(doctorsTable, eq(ordersTable.doctorId, doctorsTable.id))
+    .where(
+      and(
+        or(
+          sql`LOWER(${billsTable.billNumber}) LIKE ${pattern}`,
+          sql`LOWER(${patientsTable.firstName} || ' ' || ${patientsTable.lastName}) LIKE ${pattern}`,
+          sql`LOWER(${patientsTable.patientId}) LIKE ${pattern}`,
+          sql`${patientsTable.phone} LIKE ${pattern}`,
+        ),
+        dueOnly ? gt(sql`${billsTable.balanceAmount}::numeric`, sql`0`) : undefined,
+      ),
+    )
+    .orderBy(desc(billsTable.createdAt))
+    .limit(15);
+
+  res.json(
+    rows.map((r) => ({
+      ...r,
+      totalAmount: Number(r.totalAmount),
+      paidAmount: Number(r.paidAmount),
+      balanceAmount: Number(r.balanceAmount),
+      doctorName: r.doctorName ?? null,
+    })),
+  );
+});
+
+billsRouter.get("/preview-number", async (req, res) => {
+  // Either ledgerId or doctorId must resolve to a valid ledger. We refuse to
+  // silently default to ledger #1 because that misnumbers and mis-attributes
+  // bills for any branch other than the first.
+  const doctorIdRaw = req.query.doctorId;
+  const ledgerIdRaw = req.query.ledgerId;
+  let ledgerId: number | null = null;
+  if (ledgerIdRaw !== undefined && ledgerIdRaw !== "") {
+    const n = Number(ledgerIdRaw);
+    if (!Number.isInteger(n) || n < 1) {
+      return res.status(400).json({ error: "Invalid request", details: [{ path: ["ledgerId"], message: "ledgerId must be a positive integer" }] });
+    }
+    const [lg] = await db.select({ id: ledgersTable.id }).from(ledgersTable).where(eq(ledgersTable.id, n));
+    if (!lg) {
+      return res.status(400).json({ error: "Invalid request", details: [{ path: ["ledgerId"], message: `Ledger with id ${n} does not exist.` }] });
+    }
+    ledgerId = n;
+  } else if (doctorIdRaw !== undefined && doctorIdRaw !== "") {
+    const docId = Number(doctorIdRaw);
+    if (!Number.isInteger(docId) || docId < 1) {
+      return res.status(400).json({ error: "Invalid request", details: [{ path: ["doctorId"], message: "doctorId must be a positive integer" }] });
+    }
+    const [d] = await db.select().from(doctorsTable).where(eq(doctorsTable.id, docId));
+    if (!d) {
+      return res.status(400).json({ error: "Invalid request", details: [{ path: ["doctorId"], message: `Doctor with id ${docId} does not exist.` }] });
+    }
+    if (d.ledgerId == null) {
+      return res.status(400).json({ error: "Invalid request", details: [{ path: ["doctorId"], message: `Doctor ${docId} has no ledger assigned; specify ledgerId explicitly.` }] });
+    }
+    ledgerId = d.ledgerId;
+  } else {
+    // No params given — use the designated walk-in ledger (falls back to id=1 if none tagged)
+    ledgerId = await getWalkInLedgerId();
+  }
+  const next = await generateBillNumber(ledgerId);
+  return res.json({ next, ledgerId });
+});
+
+billsRouter.get("/", async (req, res) => {
+  const parsed = ListBillsQueryParams.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid query params" });
+    return;
+  }
+  const { status, patientId, page = 1, limit = 20 } = parsed.data;
+  const offset = (page - 1) * limit;
+
+  // Extra filters not in the strict zod schema: dues-only + date range. These
+  // are read directly from req.query so we don't have to round-trip OpenAPI
+  // codegen. Powers the Dues report page.
+  const dueOnly = req.query.dueOnly === "1" || req.query.dueOnly === "true";
+  // When no specific status filter is set, callers can pass excludeCancelled=1
+  // to suppress cancelled rows (default view on the Bills page).
+  const excludeCancelled = req.query.excludeCancelled === "1" || req.query.excludeCancelled === "true";
+  const dateFrom = typeof req.query.dateFrom === "string" && req.query.dateFrom ? req.query.dateFrom : null;
+  const dateTo = typeof req.query.dateTo === "string" && req.query.dateTo ? req.query.dateTo : null;
+  const dateField = req.query.dateField === "due" ? "due" : "created";
+  const createdBy = typeof req.query.createdBy === "string" && req.query.createdBy ? req.query.createdBy : null;
+
+  // Referral-wise / test-wise search. Read raw like the filters above so the
+  // generated OpenAPI zod schema doesn't have to round-trip every tweak.
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const referralDoctorId = parsePositiveInt(req.query.referralDoctorId);
+  const testId = parsePositiveInt(req.query.testId);
+  if (req.query.referralDoctorId && referralDoctorId === null) {
+    res.status(400).json({ error: "referralDoctorId must be a positive integer" });
+    return;
+  }
+  if (req.query.testId && testId === null) {
+    res.status(400).json({ error: "testId must be a positive integer" });
+    return;
+  }
+
+  // ISO date strings only — basic guard against SQL injection via the raw fragments.
+  const isoDateRe = /^\d{4}-\d{2}-\d{2}$/;
+  if (dateFrom && !isoDateRe.test(dateFrom)) {
+    res.status(400).json({ error: "dateFrom must be YYYY-MM-DD" });
+    return;
+  }
+  if (dateTo && !isoDateRe.test(dateTo)) {
+    res.status(400).json({ error: "dateTo must be YYYY-MM-DD" });
+    return;
+  }
+
+  const conditions: (ReturnType<typeof eq> | ReturnType<typeof gt> | ReturnType<typeof sql>)[] = [];
+  if (status) conditions.push(eq(billsTable.status, status));
+  else if (excludeCancelled) conditions.push(ne(billsTable.status, "cancelled"));
+  if (patientId) conditions.push(eq(billsTable.patientId, patientId));
+  if (dueOnly) {
+    // Only include bills with an actual outstanding balance AND not cancelled.
+    // Cancelled bills should have balanceAmount=0 already (zeroed on cancel),
+    // but the status exclusion is a safety net for any legacy rows.
+    conditions.push(gt(sql`${billsTable.balanceAmount}::numeric`, sql`0`));
+    conditions.push(ne(billsTable.status, "cancelled"));
+  }
+  if (createdBy) {
+    conditions.push(sql`${billsTable.createdByName} = ${createdBy}`);
+  }
+  if (referralDoctorId) {
+    conditions.push(sql`${billsTable.orderId} IN (
+      SELECT ${ordersTable.id} FROM ${ordersTable}
+      WHERE ${ordersTable.doctorId} = ${referralDoctorId}
+    )`);
+  }
+  if (testId) {
+    conditions.push(sql`${billsTable.orderId} IN (
+      SELECT ${orderTestsTable.orderId} FROM ${orderTestsTable}
+      WHERE ${orderTestsTable.testId} = ${testId}
+    )`);
+  }
+  if (q.length >= 2) {
+    // One box, referral- and test-aware. Semi-joins rather than joins so a bill
+    // with ten line items still counts once and the page totals stay correct.
+    // A test line matches on its catalogue name/code OR the desk's display-name
+    // override, so renaming a bill line never hides it from a catalogue search
+    // — the same grouping the testId filter gives.
+    const like = `%${q.toLowerCase()}%`;
+    conditions.push(sql`(
+      LOWER(${billsTable.billNumber}) LIKE ${like}
+      OR EXISTS (
+        SELECT 1 FROM ${patientsTable}
+        WHERE ${patientsTable.id} = ${billsTable.patientId}
+          AND (LOWER(${patientsTable.firstName} || ' ' || ${patientsTable.lastName}) LIKE ${like}
+               OR LOWER(${patientsTable.patientId}) LIKE ${like}
+               OR ${patientsTable.phone} LIKE ${like})
+      )
+      OR EXISTS (
+        SELECT 1 FROM ${ordersTable}
+        LEFT JOIN ${doctorsTable} ON ${doctorsTable.id} = ${ordersTable.doctorId}
+        WHERE ${ordersTable.id} = ${billsTable.orderId}
+          AND (LOWER(${ordersTable.orderNumber}) LIKE ${like}
+               OR LOWER(${doctorsTable.name}) LIKE ${like})
+      )
+      OR EXISTS (
+        SELECT 1 FROM ${orderTestsTable}
+        LEFT JOIN ${testsTable} ON ${testsTable.id} = ${orderTestsTable.testId}
+        WHERE ${orderTestsTable.orderId} = ${billsTable.orderId}
+          AND (LOWER(${testsTable.name}) LIKE ${like}
+               OR LOWER(${testsTable.code}) LIKE ${like}
+               OR LOWER(COALESCE(${orderTestsTable.displayName}, '')) LIKE ${like})
+      )
+    )`);
+  }
+  if (dateFrom || dateTo) {
+    if (dateField === "due") {
+      // Bills only have a due date when one was set; bills with NULL dueDate are excluded by this filter.
+      if (dateFrom) conditions.push(sql`${billsTable.dueDate} >= ${dateFrom}` as unknown as ReturnType<typeof eq>);
+      if (dateTo) conditions.push(sql`${billsTable.dueDate} <= ${dateTo}` as unknown as ReturnType<typeof eq>);
+    } else {
+      // Compare on the date portion of created_at, in the server's local timezone.
+      if (dateFrom) conditions.push(sql`(${billsTable.createdAt})::date >= ${dateFrom}::date` as unknown as ReturnType<typeof eq>);
+      if (dateTo) conditions.push(sql`(${billsTable.createdAt})::date <= ${dateTo}::date` as unknown as ReturnType<typeof eq>);
+    }
+  }
+
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  // Desk Collections / recent panels pass compact=1 — patient + amounts only.
+  // Default stays full detail for Form 3C, Dues, and generated OpenAPI clients.
+  const compact = req.query.compact === "1" || req.query.compact === "true";
+
+  const [bills, countResult, totalsResult] = await Promise.all([
+    db.select().from(billsTable).where(where).orderBy(desc(billsTable.createdAt)).limit(limit).offset(offset),
+    db.select({ count: sql<number>`count(*)` }).from(billsTable).where(where),
+    // Aggregate totals across the FULL filtered set (not just the current page) — used by the Dues card.
+    db.select({
+      totalAmount: sql<string>`COALESCE(SUM(${billsTable.totalAmount}::numeric), 0)`,
+      paidAmount: sql<string>`COALESCE(SUM(${billsTable.paidAmount}::numeric), 0)`,
+      balanceAmount: sql<string>`COALESCE(SUM(${billsTable.balanceAmount}::numeric), 0)`,
+      refundAmount: sql<string>`COALESCE(SUM(${billsTable.refundAmount}::numeric), 0)`,
+    }).from(billsTable).where(where),
+  ]);
+
+  const billsWithDetails = await buildBillsBatch(bills, { compact });
+  res.json({
+    bills: billsWithDetails,
+    total: Number(countResult[0]?.count ?? 0),
+    page,
+    limit,
+    totals: {
+      totalAmount: Number(totalsResult[0]?.totalAmount ?? 0),
+      paidAmount: Number(totalsResult[0]?.paidAmount ?? 0),
+      balanceAmount: Number(totalsResult[0]?.balanceAmount ?? 0),
+      refundAmount: Number(totalsResult[0]?.refundAmount ?? 0),
+    },
+  });
+});
+
+billsRouter.post("/", createBillHandler);
+
+export async function createBillHandler(req: StaffAuthRequest, res: Response): Promise<void> {
+  const payload = req.body?.data ?? req.body ?? {};
+  const parsed = CreateBillBody.safeParse(payload);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid body", details: parsed.error.issues });
+    return;
+  }
+  const { orderId, discount = 0, dueDate, clientRef } = parsed.data;
+  const startedAt = Date.now();
+  const inlinePayments = Array.isArray(payload.payments) ? payload.payments : [];
+  const discountReason = typeof payload?.discountReason === "string" ? payload.discountReason.trim() || null : null;
+  const discountReasonNote = typeof payload?.discountReasonNote === "string" ? payload.discountReasonNote.trim() || null : null;
+  const isVip = !!payload?.isVip;
+
+  // ── Idempotency check — clientRef deduplication ───────────────────────────
+  // If this request carries a clientRef UUID, check whether a bill was already
+  // created for it. If yes, return the existing bill immediately (HTTP 200).
+  // This makes POST /api/bills safe to retry after a network timeout — the
+  // browser gets the real bill response instead of a duplicate or a 409.
+  if (clientRef) {
+    const existingByRef = await db.execute<{ id: number }>(
+      sql`SELECT id FROM bills WHERE client_ref = ${clientRef} AND status != 'cancelled' LIMIT 1`
+    );
+    const refRows = Array.isArray(existingByRef) ? existingByRef : (existingByRef as any).rows ?? [];
+    const refId: number | undefined = refRows[0]?.id;
+    if (refId) {
+      const [existingBillRow] = await db.select().from(billsTable)
+        .where(eq(billsTable.id, refId));
+      if (existingBillRow) {
+        // Return paid/balance so Billing Desk can resume online payment (or
+        // show due) instead of printing a false "fully paid" receipt. The
+        // desk decides needsOnlinePayment from its own online split + balance
+        // — we must not force the gateway for ordinary unpaid / pay-later bills.
+        const built = await buildBill(existingBillRow);
+        res.status(200).json({
+          id: existingBillRow.id,
+          billNumber: existingBillRow.billNumber,
+          createdAt: existingBillRow.createdAt,
+          createdByName: existingBillRow.createdByName,
+          paidAmount: built.paidAmount,
+          balanceAmount: built.balanceAmount,
+          status: existingBillRow.status,
+          _idempotent: true,
+          needsOnlinePayment: false,
+          onlineAmount: Number(built.balanceAmount) > 0.01 ? Number(built.balanceAmount) : 0,
+        });
+        return;
+      }
+    }
+  }
+
+  if (discount > 0 && !discountReason) {
+    res.status(400).json({ error: "Discount reason is required when a discount is given" });
+    return;
+  }
+
+  // Optional DICOM MWL fields captured at billing desk and written into the
+  // auto-generated radiology study rows. Not part of the Zod schema so we read
+  // them directly from the raw payload — same pattern as discountReason above.
+  const rawDicom = payload?.dicomFields;
+  const dicomFields: { studyDescription?: string; bodyPart?: string; scheduledStationAETitle?: string; referringDoctor?: string } | undefined =
+    rawDicom && typeof rawDicom === "object"
+      ? {
+          studyDescription: typeof rawDicom.studyDescription === "string" ? rawDicom.studyDescription.trim() || undefined : undefined,
+          bodyPart: typeof rawDicom.bodyPart === "string" ? rawDicom.bodyPart.trim() || undefined : undefined,
+          scheduledStationAETitle: typeof rawDicom.scheduledStationAETitle === "string" ? rawDicom.scheduledStationAETitle.trim() || undefined : undefined,
+          referringDoctor: typeof rawDicom.referringDoctor === "string" ? rawDicom.referringDoctor.trim() || undefined : undefined,
+        }
+      : undefined;
+
+  const [order] = await db.select().from(ordersTable).where(eq(ordersTable.id, orderId));
+  if (!order) {
+    res.status(404).json({ error: "Order not found" });
+    return;
+  }
+
+  // The guard lookups, order-line fetch, ledger resolution, and Form-F clinic
+  // flags are all independent once the order row is loaded — batch them into
+  // one round-trip wave instead of five sequential awaits. This is the hot
+  // billing-desk save path; every serial round-trip here delays the receipt
+  // print. Result checks below run in the original order so error precedence
+  // is unchanged.
+  const tenSecondsAgo = new Date(Date.now() - 60_000); // 60s window (was 10s) — covers slow connections and timeout retries
+  const [existingBillRows, existingRecentRows, orderLineTests, ledgerId, formFClinic, patientPreload] = await Promise.all([
+    db
+      .select({ id: billsTable.id, billNumber: billsTable.billNumber })
+      .from(billsTable)
+      .where(and(eq(billsTable.orderId, orderId), ne(billsTable.status, "cancelled")))
+      .limit(1),
+    // Skipped entirely when the caller sent a clientRef: the idempotency
+    // check above (lines ~376-395) already matches THIS exact submission
+    // precisely by UUID, which is what this guard exists to catch ("network
+    // retries" per the comment below). Without this skip, a billing-desk
+    // user who legitimately bills the same patient twice in quick succession
+    // (e.g. a forgotten test added as a second order) gets falsely blocked
+    // for up to 60s even though clientRef proves this is a brand-new,
+    // distinct submission, not a retry of the first one.
+    clientRef
+      ? Promise.resolve([] as { id: number; billNumber: string }[])
+      : db
+          .select({ id: billsTable.id, billNumber: billsTable.billNumber })
+          .from(billsTable)
+          .where(and(
+            eq(billsTable.patientId, order.patientId),
+            ne(billsTable.status, "cancelled"),
+            gt(billsTable.createdAt, tenSecondsAgo),
+          ))
+          .limit(1),
+    db
+      .select({ testId: orderTestsTable.testId, isActive: testsTable.isActive, name: testsTable.name })
+      .from(orderTestsTable)
+      .innerJoin(testsTable, eq(testsTable.id, orderTestsTable.testId))
+      .where(eq(orderTestsTable.orderId, orderId)),
+    resolveLedgerForOrder(order),
+    // Only shapes the response at the very end; a failure here must not fail
+    // billing, so it degrades to null instead of rejecting the whole wave.
+    db
+      .select({ formFTestIds: clinicSettingsTable.formFTestIds, formFBillingPrompt: clinicSettingsTable.formFBillingPrompt })
+      .from(clinicSettingsTable)
+      .limit(1)
+      .then((rows) => rows[0] ?? null)
+      .catch((e) => {
+        req.log?.warn?.({ err: e }, "Form-F billing prompt check failed");
+        return null;
+      }),
+    // Patient for ledger backfill + voucher/WhatsApp — load outside the
+    // bill-number advisory lock so concurrent saves don't serialize on it.
+    db.select().from(patientsTable).where(eq(patientsTable.id, order.patientId)).limit(1)
+      .then((rows) => rows[0] ?? null),
+  ]);
+
+  // Guard against double-billing:
+  // 1) Same order — prevents re-billing an order that already has a bill.
+  // 2) Same patient within 60s, clientRef-less requests only — a fallback
+  //    fence for callers that don't send an idempotency key (multi-tab
+  //    races, keyboard+click races). Callers that do send a clientRef are
+  //    already deduplicated precisely above, so this is skipped for them.
+  const [existingBill] = existingBillRows;
+  if (existingBill) {
+    res.status(409).json({
+      error: `This order already has an active bill (${existingBill.billNumber}). Cancel it first before creating a new one.`,
+    });
+    return;
+  }
+
+  const [existingRecent] = existingRecentRows;
+  if (existingRecent) {
+    res.status(409).json({
+      error: `A bill for this patient was just created (${existingRecent.billNumber}). Please wait a few seconds before billing again.`,
+    });
+    return;
+  }
+
+  // Refuse to bill against an order that contains discontinued / removed tests
+  // (matches the same guard applied at order creation in orders.ts). Catches
+  // the case where a test is deactivated *between* order creation and billing.
+  const inactiveLineTests = orderLineTests.filter((t) => !t.isActive);
+  if (inactiveLineTests.length > 0) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [{
+        path: ["orderId"],
+        message: `Order contains discontinued tests and cannot be billed: ${inactiveLineTests.map((t) => `#${t.testId} ${t.name}`).join(", ")}. Edit the order to remove them.`,
+      }],
+    });
+    return;
+  }
+
+  const subtotal = Number(order.totalAmount);
+  const discountAmt = Number(discount);
+
+  if (!Number.isFinite(discountAmt) || discountAmt < 0) {
+    res.status(400).json({ error: "Discount must be zero or a positive number" });
+    return;
+  }
+  if (discountAmt > subtotal) {
+    res.status(400).json({ error: `Discount (${discountAmt.toFixed(2)}) cannot exceed subtotal (${subtotal.toFixed(2)})` });
+    return;
+  }
+
+  const session = req.staffSession;
+  const actorName = session?.subjectName?.trim() || "";
+  if (session && !FULL_ACCESS_ROLES.has(session.role) && discountAmt > 0) {
+    const maxPct = session.maxDiscount ?? 0;
+    const maxAllowed = Math.round((subtotal * maxPct / 100) * 100) / 100;
+    if (discountAmt > maxAllowed + 0.01) {
+      res.status(403).json({ error: `Your maximum allowed discount is ${maxPct}% (₹${maxAllowed.toFixed(2)} on this bill). Please ask an admin to apply a higher discount.` });
+      return;
+    }
+  }
+
+  const taxAmount = 0;
+  const totalAmount = billTotalFromParts(subtotal, discountAmt, taxAmount);
+
+  const inlinePayPreview = (inlinePayments as Array<{ amount: number; method?: string }>)
+    .filter((p) => Number.isFinite(p.amount) && p.amount > 0 && p.method !== "online");
+  const inlinePaidPreview = moneyAdd(...inlinePayPreview.map((p) => p.amount));
+  if (inlinePaidPreview > totalAmount + 0.01) {
+    res.status(400).json({
+      error: `Payment total (₹${inlinePaidPreview.toFixed(2)}) cannot exceed bill net total (₹${totalAmount.toFixed(2)})`,
+    });
+    return;
+  }
+
+  // Single transaction: allocate number + insert bill + inline payments (atomic).
+  // Do NOT insert payments in a second post-commit txn (would double-pay on retry).
+  const txStartedAt = Date.now();
+  const validPaymentsInput = (inlinePayments as Array<{ amount: number; method?: string; referenceNumber?: string; notes?: string }>)
+    .filter((p) => Number.isFinite(p.amount) && p.amount > 0 && p.method !== "online");
+  const paidAmountInline = moneyAdd(...validPaymentsInput.map((p) => p.amount));
+  const balanceAmountInline = billBalanceFromParts(totalAmount, paidAmountInline, 0);
+  const billStatus = paidAmountInline >= totalAmount - 0.01 ? "paid" : paidAmountInline > 0 ? "partial" : "pending";
+
+  function isBillNumberUniqueViolation(err: unknown): boolean {
+    const e = err as { cause?: { code?: string; constraint?: string }; code?: string; constraint?: string; message?: string };
+    const code = e?.cause?.code ?? e?.code;
+    const constraint = e?.cause?.constraint ?? e?.constraint;
+    if (code === "23505" && (constraint === "bills_bill_number_unique" || String(constraint ?? "").includes("bill_number"))) {
+      return true;
+    }
+    const msg = String(e?.message ?? err ?? "");
+    return /bills_bill_number_unique|bills_ledger_bill_number_uidx|Key \(bill_number\)=/i.test(msg);
+  }
+
+  function isBillClientRefUniqueViolation(err: unknown): boolean {
+    let cur: unknown = err;
+    for (let i = 0; i < 5 && cur && typeof cur === "object"; i++) {
+      const e = cur as { code?: string; constraint?: string; message?: string; cause?: unknown };
+      if (e.code === "23505" && /client_ref|bills_client_ref/i.test(String(e.constraint ?? ""))) return true;
+      if (/Key \(client_ref\)=|bills_client_ref/i.test(String(e.message ?? ""))) return true;
+      cur = e.cause;
+    }
+    return false;
+  }
+
+  function isActiveOrderBillUniqueViolation(err: unknown): boolean {
+    let cur: unknown = err;
+    for (let i = 0; i < 5 && cur && typeof cur === "object"; i++) {
+      const e = cur as { code?: string; constraint?: string; message?: string; cause?: unknown };
+      const constraint = String(e.constraint ?? "");
+      const message = String(e.message ?? "");
+      if (/bills_order_id_active_uidx/i.test(constraint) || /bills_order_id_active_uidx/i.test(message)) {
+        return true;
+      }
+      cur = e.cause;
+    }
+    return false;
+  }
+
+  async function returnExistingBillByClientRef(): Promise<boolean> {
+    if (!clientRef) return false;
+    const existingByRef = await db.execute<{ id: number }>(
+      sql`SELECT id FROM bills WHERE client_ref = ${clientRef} AND status != 'cancelled' LIMIT 1`,
+    );
+    const refRows = Array.isArray(existingByRef) ? existingByRef : (existingByRef as { rows?: { id: number }[] }).rows ?? [];
+    const refId = refRows[0]?.id;
+    if (!refId) return false;
+    const [existingBillRow] = await db.select().from(billsTable).where(eq(billsTable.id, refId));
+    if (!existingBillRow) return false;
+    const built = await buildBill(existingBillRow);
+    res.status(200).json({
+      id: existingBillRow.id,
+      billNumber: existingBillRow.billNumber,
+      createdAt: existingBillRow.createdAt,
+      createdByName: existingBillRow.createdByName,
+      paidAmount: built.paidAmount,
+      balanceAmount: built.balanceAmount,
+      status: existingBillRow.status,
+      _idempotent: true,
+      needsOnlinePayment: false,
+      onlineAmount: Number(built.balanceAmount) > 0.01 ? Number(built.balanceAmount) : 0,
+    });
+    return true;
+  }
+
+  async function returnExistingActiveBillForOrder(): Promise<boolean> {
+    const [existing] = await db
+      .select()
+      .from(billsTable)
+      .where(and(eq(billsTable.orderId, orderId), ne(billsTable.status, "cancelled")))
+      .limit(1);
+    if (!existing) return false;
+    const built = await buildBill(existing);
+    res.status(200).json({
+      id: existing.id,
+      billNumber: existing.billNumber,
+      createdAt: existing.createdAt,
+      createdByName: existing.createdByName,
+      paidAmount: built.paidAmount,
+      balanceAmount: built.balanceAmount,
+      status: existing.status,
+      _idempotent: true,
+      needsOnlinePayment: false,
+      onlineAmount: Number(built.balanceAmount) > 0.01 ? Number(built.balanceAmount) : 0,
+    });
+    return true;
+  }
+
+  let bill: typeof billsTable.$inferSelect | undefined;
+  let pat: typeof patientPreload = patientPreload;
+  let lastUniqueErr: unknown;
+  let txPayments: Array<{ amount: number; method?: string; paymentId: number }> = [];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const result = await db.transaction(async (tx) => {
+        // Bill numbers come from SEQUENCE nextval (documentNumberCounters) — no
+        // process-wide advisory lock that serialized every concurrent desk save.
+        const billNumber = await generateBillNumber(ledgerId, tx);
+
+        if (!order.ledgerId) {
+          await tx.update(ordersTable).set({ ledgerId }).where(eq(ordersTable.id, orderId));
+        }
+        // Patient was preloaded in the guard wave — avoid a SELECT while holding
+        // the bill-number counter row under concurrent desk saves.
+        const patRow = patientPreload;
+        if (patRow && !patRow.ledgerId) {
+          await tx.update(patientsTable).set({ ledgerId }).where(eq(patientsTable.id, patRow.id));
+        }
+
+        const [billRow] = await tx.insert(billsTable).values({
+          billNumber,
+          orderId,
+          patientId: order.patientId,
+          subtotal: subtotal.toFixed(2),
+          discount: discountAmt.toFixed(2),
+          discountReason,
+          discountReasonNote,
+          taxAmount: taxAmount.toFixed(2),
+          totalAmount: totalAmount.toFixed(2),
+          originalTotal: totalAmount.toFixed(2),
+          paidAmount: paidAmountInline.toFixed(2),
+          balanceAmount: balanceAmountInline.toFixed(2),
+          status: billStatus,
+          ledgerId,
+          dueDate: dueDate ?? null,
+          createdByName: actorName || null,
+          // Store idempotency key so retries return this bill, not a duplicate
+          clientRef: clientRef ?? null,
+        }).returning();
+
+        await tx.insert(billAuditsTable).values({
+          billId: billRow.id,
+          editedBy: actorName || "system",
+          reason: "Bill created",
+          changeType: "bill_created",
+          oldValue: null,
+          newValue: `total=₹${totalAmount.toFixed(2)}; status=${billStatus}`,
+        });
+
+        const insertedPayments: Array<{ amount: number; method?: string; paymentId: number }> = [];
+        for (const p of validPaymentsInput) {
+          const [insertedPaymentRow] = await tx.insert(paymentsTable).values({
+            billId: billRow.id,
+            amount: p.amount.toFixed(2),
+            method: p.method || "cash",
+            referenceNumber: p.referenceNumber ?? null,
+            notes: p.notes ?? null,
+            recordedByName: actorName || null,
+          }).returning();
+          insertedPayments.push({ amount: p.amount, method: p.method, paymentId: insertedPaymentRow.id });
+          await tx.insert(billAuditsTable).values({
+            billId: billRow.id,
+            editedBy: actorName || "system",
+            reason: "Payment collected",
+            changeType: "payment_collected",
+            oldValue: null,
+            newValue: `amount=₹${p.amount.toFixed(2)}; method=${p.method || "cash"}`,
+          });
+        }
+
+        return { bill: billRow, pat: patRow, payments: insertedPayments };
+      });
+      bill = result.bill;
+      pat = result.pat;
+      txPayments = result.payments;
+      lastUniqueErr = undefined;
+      break;
+    } catch (err) {
+      if (isBillClientRefUniqueViolation(err)) {
+        if (await returnExistingBillByClientRef()) return;
+        throw err;
+      }
+      if (isActiveOrderBillUniqueViolation(err)) {
+        if (await returnExistingActiveBillForOrder()) return;
+        throw err;
+      }
+      if (!isBillNumberUniqueViolation(err)) throw err;
+      lastUniqueErr = err;
+      req.log?.warn?.({ attempt, err }, "bill_number unique violation — reseeding sequence and retrying");
+      await syncBillNumberSeqForward(db, ledgerId);
+    }
+  }
+  if (!bill) {
+    const message = lastUniqueErr instanceof Error ? lastUniqueErr.message : "Could not allocate a unique bill number";
+    res.status(500).json({ error: message });
+    return;
+  }
+
+  const txnDoneAt = Date.now();
+
+  // Determine Form-F + online payment flags early so both the fast-mode and
+  // normal paths can use them. Uses the clinic row + orderLineTests fetched
+  // in the parallel guard wave above.
+  let needsFormFData = false;
+  try {
+    if (formFClinic?.formFBillingPrompt) {
+      const formFTestIds: number[] = JSON.parse(formFClinic.formFTestIds ?? "[]");
+      needsFormFData = formFTestIds.length > 0 && orderLineTests.some((t) => formFTestIds.includes(t.testId));
+    }
+  } catch (e) {
+    req.log?.warn?.({ err: e }, "Form-F billing prompt check failed");
+  }
+  const onlinePayment = (inlinePayments as Array<{ amount: number; method?: string }>).find(p => p.method === "online");
+  const needsOnlinePayment = !!onlinePayment;
+  const onlineAmount = onlinePayment ? Number(onlinePayment.amount) : 0;
+
+  // Radiology study fan-out — fire-and-forget under the billing fan-out gate so
+  // concurrent Save & Print bursts cannot exhaust the pg pool.
+  enqueueBillingFanout(() =>
+    generateStudiesForOrder({
+      billId: bill.id,
+      orderId: order.id,
+      patientId: order.patientId,
+      priority: isVip ? "vip" : "routine",
+      dicomFields,
+    })
+      .then(async () => {
+        const { maybeStampAccessionsAfterBill } = await import("../lib/pacs/stampAccessionFromBill");
+        await maybeStampAccessionsAfterBill({ billId: bill.id });
+      })
+      .catch((err) => {
+        console.warn("Radiology study fan-out failed:", err);
+      }),
+  );
+
+  // Post-commit fan-out that the response DOES need — the queue token and the
+  // per-test department tokens are printed on the token slip, so they must be
+  // in the response body. They hit different tables and run concurrently with
+  // each other AND with buildBill (which only reads rows the transaction
+  // above already committed), so the desk waits for the slowest of the three,
+  // not the sum. Each token failure is logged but never blocks bill creation.
+  //
+  // FAST PATH (Fix B + C): when the client sends ?fast=1, we skip buildBill
+  // entirely (the client already has patient/order/tests data from its form
+  // state) and make token generation non-blocking — tokens are generated in
+  // the background and the client gets the bill response immediately. This
+  // cuts 1-4 seconds off the save-and-print path on slow Cloudflare Tunnel
+  // connections. The client falls back to a "token pending" state and
+  // refetches the token separately if needed.
+  const fastMode = req.query.fast === "1" || req.query.fast === "true";
+
+  if (fastMode) {
+    // Fire token generation in background — don't block the response
+    const patientName = pat ? `${pat.firstName} ${pat.lastName}`.trim() : undefined;
+    enqueueBillingFanout(() =>
+      generateTestTokensForOrder({
+        ledgerId,
+        billId: bill.id,
+        orderId: order.id,
+        patientId: order.patientId,
+        priority: isVip ? 5 : 0,
+      }).then((tokens) => {
+        // Cache + wake any long-poll GET /:id/tokens waiters
+        publishBillTokens(bill.id, tokens);
+        // WhatsApp needs a token number — send only once tokens are ready.
+        if (pat?.phone && tokens.length > 0) {
+          const tokenInfo = deriveBillTokenFromTestTokens(tokens);
+          if (tokenInfo) {
+            sendBillWhatsapp({
+              phone: pat.phone,
+              patientName: `${pat.firstName} ${pat.lastName}`.trim(),
+              billNumber: bill.billNumber,
+              totalAmount,
+              tokenNo: tokenInfo.tokenNo,
+            }).then((result) => {
+              if (!result.ok && !result.skipped) console.warn(`WhatsApp bill notification failed for bill ${bill.billNumber}:`, result.error);
+            }).catch((err) => console.warn("WhatsApp send failed:", err));
+          }
+        }
+      }).catch((err) => {
+        console.warn("Per-test token generation failed (fast mode):", err);
+        failBillTokens(bill.id);
+      }),
+    );
+
+    // Parity with the slow path: vouchers are fire-and-forget so they must
+    // still run under ?fast=1. Billing Desk always uses fast mode; skipping
+    // these left real-time ledger gaps until admin sync-billing.
+    for (const p of txPayments ?? []) {
+      enqueueBillingFanout(() =>
+        autoVoucherForPayment({
+          billId: bill.id,
+          amount: p.amount,
+          method: p.method || "cash",
+          billNumber: bill.billNumber,
+          patientName,
+          performedBy: actorName || null,
+          paymentId: p.paymentId,
+        }),
+      );
+    }
+
+    const totalMs = Date.now() - startedAt;
+    if (totalMs > getSlowThresholdMs()) {
+      req.log?.warn?.(
+        { totalMs, guardsMs: txStartedAt - startedAt, txnMs: txnDoneAt - txStartedAt, fanoutMs: 0, billId: bill.id, fastMode: true },
+        "bill save (fast mode)",
+      );
+    }
+
+    // Return minimal response — client already has patient/order/tests from form state
+    res.status(201).json({
+      id: bill.id,
+      billNumber: bill.billNumber,
+      createdAt: bill.createdAt,
+      createdByName: bill.createdByName,
+      subtotal: Number(bill.subtotal),
+      discount: Number(bill.discount),
+      taxAmount: Number(bill.taxAmount),
+      totalAmount: Number(bill.totalAmount),
+      paidAmount: Number(bill.paidAmount),
+      balanceAmount: Number(bill.balanceAmount),
+      status: bill.status,
+      patient: null,
+      order: null,
+      payments: [],
+      token: null,
+      testTokens: [],
+      studies: [],
+      needsFormFData,
+      needsOnlinePayment,
+      onlineAmount,
+      _fastMode: true,
+    });
+    return;
+  }
+
+  const [testTokens, built] = await Promise.all([
+    generateTestTokensForOrder({
+      ledgerId,
+      billId: bill.id,
+      orderId: order.id,
+      patientId: order.patientId,
+      priority: isVip ? 5 : 0,
+    }).catch((err) => {
+      console.warn("Per-test token generation failed:", err);
+      return [];
+    }),
+    buildBill(bill),
+  ]);
+  const tokenInfo = deriveBillTokenFromTestTokens(testTokens);
+
+  // Auto-generate accounting vouchers for each inline payment — async, never blocks billing
+  const patientName = pat ? `${pat.firstName} ${pat.lastName}`.trim() : undefined;
+  for (const p of txPayments ?? []) {
+    enqueueBillingFanout(() =>
+      autoVoucherForPayment({
+        billId: bill.id,
+        amount: p.amount,
+        method: p.method || "cash",
+        billNumber: bill.billNumber,
+        patientName,
+        performedBy: actorName || null,
+        paymentId: p.paymentId,
+      }),
+    );
+  }
+
+  // Fire WhatsApp send asynchronously — don't block the response.
+  // sendBillWhatsapp never rejects (it always resolves with {ok, error, ...}
+  // per the wa_outbox contract), so the .catch() below only covers genuinely
+  // unexpected throws; a resolved ok:false must be logged separately here or
+  // a bill-notification failure would be completely invisible to staff/ops.
+  if (pat?.phone && tokenInfo) {
+    sendBillWhatsapp({
+      phone: pat.phone,
+      patientName: `${pat.firstName} ${pat.lastName}`.trim(),
+      billNumber: bill.billNumber,
+      totalAmount,
+      tokenNo: tokenInfo.tokenNo,
+    }).then((result) => {
+      if (!result.ok && !result.skipped) console.warn(`WhatsApp bill notification failed for bill ${bill.billNumber}:`, result.error);
+    }).catch((err) => console.warn("WhatsApp send failed:", err));
+  }
+
+  const totalMs = Date.now() - startedAt;
+  if (totalMs > getSlowThresholdMs()) {
+    // Phase breakdown in the container logs (same slow threshold as the
+    // /erp/diagnostics page, which records totals via requestMetrics), so
+    // "the desk is slow" is diagnosable from production instead of guessed.
+    req.log?.warn?.(
+      {
+        totalMs,
+        guardsMs: txStartedAt - startedAt,
+        txnMs: txnDoneAt - txStartedAt,
+        fanoutMs: Date.now() - txnDoneAt,
+        billId: bill.id,
+      },
+      "slow bill save",
+    );
+  }
+
+  // `studies` is now created asynchronously (see fire-and-forget above); the
+  // key stays in the response for shape compatibility, but no client reads it.
+  res.status(201).json({ ...built, token: tokenInfo, testTokens, studies: [], needsFormFData, needsOnlinePayment, onlineAmount });
+}
+
+// PATCH /form-f-patient-data — Billing Desk Form F popup after bill create.
+// Lives on /bills (billing permission) so counters without /form-f module
+// access can still save guardian + address from the post-bill dialog.
+billsRouter.patch("/form-f-patient-data", async (req: StaffAuthRequest, res) => {
+  try {
+    const body = req.body ?? {};
+    const billNumber = String(body.billNumber ?? "").trim();
+    const address = String(body.address ?? "").trim();
+    const husbandFatherName = String(body.husbandFatherName ?? body.husbandName ?? "").trim();
+
+    if (!billNumber) {
+      res.status(400).json({ error: "billNumber is required" });
+      return;
+    }
+    if (!husbandFatherName) {
+      res.status(400).json({ error: "Husband / Father name is required", field: "husbandFatherName" });
+      return;
+    }
+
+    const hit = await findBillByNumber(billNumber);
+    if (hit.status === "ambiguous") {
+      res.status(409).json({ error: ambiguousBillNumberMessage(billNumber) });
+      return;
+    }
+    if (hit.status === "not_found") {
+      res.status(404).json({ error: "Bill not found" });
+      return;
+    }
+    const bill = hit.bill;
+
+    if (bill.patientId) {
+      if (address) {
+        await db.update(patientsTable).set({ address }).where(eq(patientsTable.id, bill.patientId));
+      }
+
+      const [existing] = await db
+        .select({ id: formFRecordsTable.id })
+        .from(formFRecordsTable)
+        .where(
+          and(
+            // bill_number is only unique inside its own book, so the number
+            // fallback is confined to this bill's patient: it must not reach
+            // another patient's statutory record that happens to share a number.
+            eq(formFRecordsTable.patientId, bill.patientId),
+            or(
+              eq(formFRecordsTable.billId, bill.id),
+              eq(formFRecordsTable.billNumber, billNumber),
+            ),
+          ),
+        )
+        .orderBy(desc(formFRecordsTable.createdAt))
+        .limit(1);
+
+      if (existing) {
+        await db
+          .update(formFRecordsTable)
+          .set({ husbandFatherName, ...(address ? { address } : {}) })
+          .where(eq(formFRecordsTable.id, existing.id));
+      } else {
+        const [patient] = await db
+          .select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName })
+          .from(patientsTable)
+          .where(eq(patientsTable.id, bill.patientId))
+          .limit(1);
+        const patientName = [patient?.firstName, patient?.lastName].filter(Boolean).join(" ").trim();
+        await db.insert(formFRecordsTable).values({
+          billId: bill.id,
+          billNumber,
+          patientId: bill.patientId,
+          patientName,
+          husbandFatherName,
+          address,
+        });
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[bills] form-f-patient-data error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /:id/tokens — fetch test tokens for a fast-mode bill save.
+// Supports ?waitMs=N (capped) so the billing desk can long-poll once instead
+// of a fixed 5×500ms retry loop. Also falls back to DB rows when the
+// in-process cache missed (multi-worker / restart).
+billsRouter.get("/:id/tokens", async (req, res) => {
+  const billId = Number(req.params.id);
+  if (!Number.isInteger(billId) || billId <= 0) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+
+  const respondReady = (tokens: CachedTokens["tokens"]) => {
+    res.json({ tokens, ready: true });
+  };
+
+  const cached = tokenCache.get(billId);
+  if (cached && Date.now() - cached.generatedAt < TOKEN_CACHE_TTL_MS) {
+    respondReady(cached.tokens);
+    return;
+  }
+
+  // DB fallback — background generator may have committed rows already.
+  const fromDb = await db
+    .select({
+      orderTestId: testTokensTable.orderTestId,
+      testName: testsTable.name,
+      department: testTokensTable.department,
+      roomNumber: testTokensTable.roomNumber,
+      floorLabel: testsTable.floorLabel,
+      tokenNo: testTokensTable.tokenNo,
+      tokenDate: testTokensTable.tokenDate,
+    })
+    .from(testTokensTable)
+    .leftJoin(testsTable, eq(testsTable.id, testTokensTable.testId))
+    .where(eq(testTokensTable.billId, billId));
+  if (fromDb.length > 0) {
+    const tokens = mapDbRowsToBillTokens(fromDb);
+    if (tokens.length > 0) {
+      publishBillTokens(billId, tokens);
+      respondReady(tokens);
+      return;
+    }
+  }
+
+  const waitRaw = Number(req.query.waitMs);
+  const waitMs = Number.isFinite(waitRaw) ? Math.max(0, Math.min(Math.floor(waitRaw), 3000)) : 0;
+  if (waitMs > 0) {
+    const waited = await waitForBillTokens(billId, waitMs);
+    if (waited && waited.length > 0) {
+      respondReady(waited);
+      return;
+    }
+    // Re-check DB after wait — another worker may have written tokens.
+    const again = await db
+      .select({
+        orderTestId: testTokensTable.orderTestId,
+        testName: testsTable.name,
+        department: testTokensTable.department,
+        roomNumber: testTokensTable.roomNumber,
+        floorLabel: testsTable.floorLabel,
+        tokenNo: testTokensTable.tokenNo,
+        tokenDate: testTokensTable.tokenDate,
+      })
+      .from(testTokensTable)
+      .leftJoin(testsTable, eq(testsTable.id, testTokensTable.testId))
+      .where(eq(testTokensTable.billId, billId));
+    if (again.length > 0) {
+      const tokens = mapDbRowsToBillTokens(again);
+      if (tokens.length > 0) {
+        publishBillTokens(billId, tokens);
+        respondReady(tokens);
+        return;
+      }
+    }
+  }
+
+  res.json({ tokens: [], ready: false });
+});
+
+billsRouter.get("/:id", async (req, res) => {
+  const parsed = GetBillParams.safeParse({ id: Number(req.params.id) });
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, parsed.data.id));
+  if (!bill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+  res.json(await buildBill(bill));
+});
+
+billsRouter.put("/:id", requireStaffSubPermission("/billing", "edit"), async (req: StaffAuthRequest, res) => {
+  const paramsParsed = UpdateBillParams.safeParse({ id: Number(req.params.id) });
+  const bodyParsed = UpdateBillBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({ error: "Invalid request" });
+    return;
+  }
+  // Status transitions are intentionally excluded from UpdateBillBody — use
+  // POST /:id/cancel, payment collection, or POST /:id/refund so cascade /
+  // audit / accounting side effects always run.
+  const { discount, dueDate } = bodyParsed.data;
+
+  const [existingBill] = await db.select().from(billsTable).where(eq(billsTable.id, paramsParsed.data.id));
+  if (!existingBill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+
+  // Terminal-state: cancelled bills must not regain an outstanding balance via
+  // ordinary money-field edits (discount → total/balance recompute). dueDate-only
+  // updates do not resurrect money state and remain allowed.
+  if (existingBill.status === "cancelled" && discount !== undefined) {
+    res.status(409).json({ error: "Bill is cancelled — money fields cannot be edited" });
+    return;
+  }
+
+  const updateData: Record<string, unknown> = {};
+  if (dueDate !== undefined) updateData.dueDate = dueDate;
+  if (discount !== undefined) {
+    const newDiscount = Number(discount);
+    const subtotal = Number(existingBill.subtotal);
+    const taxAmount = Number(existingBill.taxAmount);
+
+    if (!Number.isFinite(newDiscount) || newDiscount < 0) {
+      res.status(400).json({ error: "Discount must be zero or a positive number" });
+      return;
+    }
+    if (newDiscount > subtotal) {
+      res.status(400).json({ error: `Discount (${newDiscount.toFixed(2)}) cannot exceed subtotal (${subtotal.toFixed(2)})` });
+      return;
+    }
+
+    const session = req.staffSession;
+    if (session && !FULL_ACCESS_ROLES.has(session.role) && newDiscount > 0) {
+      const maxPct = session.maxDiscount ?? 0;
+      const maxAllowed = Math.round((subtotal * maxPct / 100) * 100) / 100;
+      if (newDiscount > maxAllowed + 0.01) {
+        res.status(403).json({ error: `Your maximum allowed discount is ${maxPct}% (₹${maxAllowed.toFixed(2)} on this bill). Please ask an admin to apply a higher discount.` });
+        return;
+      }
+    }
+
+    const newTotal = billTotalFromParts(subtotal, newDiscount, taxAmount);
+    const paidAmount = Number(existingBill.paidAmount);
+    const discountGate = assertDiscountNotBelowCollected({
+      subtotal,
+      discount: newDiscount,
+      tax: taxAmount,
+      collectedNet: paidAmount,
+    });
+    if (discountGate) {
+      res.status(400).json({ error: discountGate });
+      return;
+    }
+    const refundAmount = Number(existingBill.refundAmount || 0);
+    const newBalance = billBalanceFromParts(newTotal, paidAmount, refundAmount);
+    updateData.discount = String(newDiscount);
+    updateData.totalAmount = String(newTotal);
+    updateData.balanceAmount = String(newBalance);
+  }
+
+  // Status (and any other unknown keys) are stripped by UpdateBillBody. An
+  // empty set would throw drizzle "No values to set" → HTTP 500; treat as a
+  // no-op so a stale client sending only `status` cannot mutate or crash.
+  if (Object.keys(updateData).length === 0) {
+    res.json({ ...(await buildBill(existingBill)), closedPeriodWarning: null });
+    return;
+  }
+
+  // Money-field writes must re-check cancelled under FOR UPDATE so a concurrent
+  // cancel cannot leave balanceAmount > 0 on a terminal bill. dueDate-only
+  // updates skip the lock (they do not recreate outstanding balance).
+  let updated: typeof existingBill;
+  if (discount !== undefined) {
+    try {
+      const rows = await db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select()
+          .from(billsTable)
+          .where(eq(billsTable.id, paramsParsed.data.id))
+          .for("update")
+          .limit(1);
+        if (!locked) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+        if (locked.status === "cancelled") {
+          throw Object.assign(new Error("Bill is cancelled — money fields cannot be edited"), { httpStatus: 409 });
+        }
+        return tx
+          .update(billsTable)
+          .set(updateData)
+          .where(eq(billsTable.id, paramsParsed.data.id))
+          .returning();
+      });
+      updated = rows[0]!;
+    } catch (err: unknown) {
+      const httpStatus = (err as { httpStatus?: number })?.httpStatus;
+      if (httpStatus) {
+        res.status(httpStatus).json({ error: err instanceof Error ? err.message : "Update failed" });
+        return;
+      }
+      throw err;
+    }
+  } else {
+    const rows = await db.update(billsTable).set(updateData).where(eq(billsTable.id, paramsParsed.data.id)).returning();
+    updated = rows[0]!;
+  }
+
+  // Always-on advisory audit: a discount edit that exceeds 50% of the active
+  // order_tests subtotal is flagged for CA review. Fires regardless of whether
+  // the caller supplied editedBy/reason — actor falls back to the staff
+  // session so the row is never anonymous. Non-blocking.
+  if (discount !== undefined && String(discount) !== existingBill.discount) {
+    try {
+      const otRows = await db.select({ price: orderTestsTable.price })
+        .from(orderTestsTable)
+        .where(and(eq(orderTestsTable.orderId, existingBill.orderId), ne(orderTestsTable.status, "cancelled")));
+      const ruleSubtotal = otRows.reduce((s, r) => s + Number(r.price ?? 0), 0);
+      const newDiscountVal = Number(discount);
+      if (ruleSubtotal > 0 && newDiscountVal > 0 && (newDiscountVal / ruleSubtotal) * 100 > 50) {
+        const session = req.staffSession;
+        const actor = (req.body?.editedBy as string | undefined)
+          || session?.subjectName
+          || (session ? `staff:${session.id}` : "system");
+        await db.insert(billAuditsTable).values({
+          billId: paramsParsed.data.id,
+          editedBy: actor,
+          reason: (req.body?.reason as string | undefined) || "auto-flagged: discount > 50% of active subtotal",
+          changeType: "discount_override_warning",
+          oldValue: `subtotal=₹${ruleSubtotal.toFixed(2)}`,
+          newValue: `discount=₹${newDiscountVal.toFixed(2)} (${((newDiscountVal / ruleSubtotal) * 100).toFixed(1)}% — review)`,
+        });
+      }
+    } catch { /* never block edit on advisory check */ }
+  }
+
+  // Audit trail + email notification.
+  // The actor is taken from the authenticated session, never trusted from the
+  // request body. Previously the whole block was gated on a client-supplied
+  // `editedBy`, so a bill discount change could be misattributed (spoofed
+  // editedBy) or — worse — skip auditing entirely simply by omitting the field.
+  // A real discount change is now ALWAYS audited under the session actor;
+  // `reason` falls back to a default when the caller omits one.
+  const editActor = req.staffSession?.subjectName?.trim()
+    || (req.body?.editedBy as string | undefined)?.trim()
+    || (req.staffSession ? `staff:${req.staffSession.id}` : "unknown");
+  const editReason = (req.body?.reason as string | undefined)?.trim() || "bill edit";
+  const discountChanged = discount !== undefined && String(discount) !== existingBill.discount;
+  const dueDateChanged = dueDate !== undefined && dueDate !== existingBill.dueDate;
+
+  // Post-close edit notice — reuses the SAME boundary helpers as /:id/cancel
+  // and /:id/refund, which already surface this for money-moving operations.
+  // Editing a bill that was created before the last day-close rewrites the
+  // totals of an already-signed-off period, so the edit is flagged here too.
+  // Advisory only (never blocks, matching the sibling routes), but it is also
+  // stamped into the audit reason so the trail itself records that the edit
+  // landed on a closed period.
+  let closedPeriodWarning: { billCreatedBeforeClose: boolean; lastClosureAt: string | null } | null = null;
+  if (discountChanged || dueDateChanged) {
+    try {
+      const boundary = await lastOverallClosureBoundary();
+      closedPeriodWarning = {
+        billCreatedBeforeClose: isBeforeClosureBoundary(new Date(updated.createdAt), boundary),
+        lastClosureAt: boundary ? boundary.toISOString() : null,
+      };
+    } catch (err) {
+      req.log?.warn?.({ err }, "Closed-period check failed — edit still succeeded, notice omitted");
+    }
+  }
+  const auditReason = closedPeriodWarning?.billCreatedBeforeClose
+    ? `${editReason} [post-close edit: period closed at ${closedPeriodWarning.lastClosureAt}]`
+    : editReason;
+
+  {
+    const auditEntries: { billId: number; editedBy: string; reason: string; changeType: string; oldValue: string | null; newValue: string | null }[] = [];
+    const emailChanges: { field: string; from: string | null; to: string | null }[] = [];
+
+    if (discountChanged) {
+      auditEntries.push({ billId: paramsParsed.data.id, editedBy: editActor, reason: auditReason, changeType: "discount", oldValue: existingBill.discount, newValue: String(discount) });
+      emailChanges.push({ field: "Discount (₹)", from: existingBill.discount, to: String(discount) });
+    }
+    if (dueDateChanged) {
+      auditEntries.push({
+        billId: paramsParsed.data.id,
+        editedBy: editActor,
+        reason: auditReason,
+        changeType: "due_date",
+        oldValue: existingBill.dueDate ?? null,
+        newValue: dueDate ?? null,
+      });
+      emailChanges.push({ field: "Due date", from: existingBill.dueDate ?? null, to: dueDate ?? null });
+    }
+    if (auditEntries.length > 0) {
+      await db.insert(billAuditsTable).values(auditEntries);
+
+      // Fire email asynchronously — don't block the response
+      const billForEmail = await buildBill(updated);
+      const patientName = billForEmail.patient
+        ? `${billForEmail.patient.firstName} ${billForEmail.patient.lastName}`
+        : "Unknown Patient";
+
+      sendBillEditEmail({
+        billNumber: updated.billNumber,
+        patientName,
+        editedBy: editActor,
+        reason: auditReason,
+        changes: emailChanges,
+      }).catch(err => console.error("[email] bill edit notification failed:", err));
+    }
+  }
+
+  res.json({ ...(await buildBill(updated)), closedPeriodWarning });
+});
+
+// ── Re-print log: insert audit + email admin/super-admin ─────────────────────
+billsRouter.post("/:id/reprint-log", async (req, res) => {
+  const paramsParsed = LogBillReprintParams.safeParse(req.params);
+  const bodyParsed = LogBillReprintBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [
+        ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+        ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+      ],
+    });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const reprintedBy = bodyParsed.data.reprintedBy.trim();
+  const reason = bodyParsed.data.reason.trim();
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, id));
+  if (!bill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+
+  // Insert the audit row first so concurrent reprints can never collide on the
+  // sequence number. The count is then read back, including this just-inserted
+  // row, which gives a monotonic per-bill reprint number even under contention.
+  const [inserted] = await db.insert(billAuditsTable).values({
+    billId: id,
+    editedBy: reprintedBy,
+    reason,
+    changeType: "reprint",
+    oldValue: null,
+    newValue: "reprint",
+  }).returning();
+
+  const counted = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(billAuditsTable)
+    .where(and(
+      eq(billAuditsTable.billId, id),
+      eq(billAuditsTable.changeType, "reprint"),
+      sql`${billAuditsTable.id} <= ${inserted.id}`,
+    ));
+  const reprintCount = Number(counted[0]?.count ?? 1);
+
+  // Patch the row with its assigned sequence number for cleaner audit display.
+  await db.update(billAuditsTable)
+    .set({ newValue: `reprint #${reprintCount}` })
+    .where(eq(billAuditsTable.id, inserted.id));
+
+  // Patient name for the email
+  const [pat] = await db.select().from(patientsTable).where(eq(patientsTable.id, bill.patientId));
+  const patientName = pat ? `${pat.firstName} ${pat.lastName}`.trim() : "Unknown Patient";
+
+  // Fire email asynchronously — don't block the response
+  sendBillReprintEmail({
+    billNumber: bill.billNumber,
+    patientName,
+    reprintedBy,
+    reason,
+    reprintCount,
+    totalAmount: Number(bill.totalAmount),
+  }).catch((err) => console.error("[email] bill reprint notification failed:", err));
+
+  res.json({ success: true, reprintCount });
+});
+
+billsRouter.get("/:id/audits", async (req, res) => {
+  const paramsParsed = ListBillAuditsParams.safeParse(req.params);
+  if (!paramsParsed.success) {
+    res.status(400).json({ error: "Invalid request", details: paramsParsed.error.issues });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const audits = await db.select().from(billAuditsTable).where(eq(billAuditsTable.billId, id)).orderBy(desc(billAuditsTable.createdAt));
+  res.json(audits);
+});
+
+// ── Cancel a bill ─────────────────────────────────────────────────────────────
+// Marks a bill as cancelled with mandatory reason + actor. Audit-logged.
+// Available to any staff (no super-admin token); same trust model as Edit Bill.
+billsRouter.post("/:id/cancel", requireStaffSubPermission("/billing", "delete"), async (req, res) => {
+  const paramsParsed = CancelBillParams.safeParse(req.params);
+  const bodyParsed = CancelBillBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [
+        ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+        ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+      ],
+    });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const performedBy = (req as StaffAuthRequest).staffSession?.subjectName?.trim() || bodyParsed.data.performedBy.trim();
+  const reason = bodyParsed.data.reason.trim();
+  if (!performedBy) {
+    res.status(401).json({ error: "Staff authentication required" });
+    return;
+  }
+
+  // Serialize concurrent cancel/refund attempts on this bill via row-level lock.
+  const txResult = await db.transaction(async (tx) => {
+    const [bill] = await tx.select().from(billsTable).where(eq(billsTable.id, id)).for("update");
+    if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+    if (bill.status === "cancelled") {
+      throw Object.assign(new Error("Bill is already cancelled"), { httpStatus: 409 });
+    }
+
+    // Optional clinic policy: cancel of a paid bill must include autoRefund.
+    const autoRefundPreview = z.object({
+      autoRefund: z.object({ method: z.string().min(1) }).optional(),
+    }).safeParse(req.body);
+    const hasAutoRefund = !!(autoRefundPreview.success && autoRefundPreview.data.autoRefund);
+    if (Number(bill.paidAmount) > 0.0001 && !hasAutoRefund) {
+      const [settings] = await tx
+        .select({ cancelRequiresRefund: clinicSettingsTable.cancelRequiresRefund })
+        .from(clinicSettingsTable)
+        .limit(1);
+      if (settings?.cancelRequiresRefund) {
+        throw Object.assign(
+          new Error("This clinic requires a refund when cancelling a paid bill. Use Refund & Cancel (or pass autoRefund)."),
+          { httpStatus: 400 },
+        );
+      }
+    }
+
+    const [updated] = await tx.update(billsTable).set({
+      status: "cancelled",
+      cancelledAt: new Date(),
+      cancelledByName: performedBy,
+      cancellationReason: reason,
+      // Zero out the outstanding balance so cancelled bills never appear
+      // in the Due Payments report (dueOnly filter: balanceAmount > 0).
+      balanceAmount: "0.00",
+      // Free client_ref so cancel+rebill / offline queue can reuse the UUID
+      // (partial unique index also excludes cancelled; this clears the column).
+      clientRef: null,
+    }).where(eq(billsTable.id, id)).returning();
+
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: performedBy,
+      reason,
+      changeType: "bill_cancelled",
+      oldValue: bill.status,
+      newValue: "cancelled",
+    });
+
+    // CRITICAL: cascade cancellation into order_tests so referral commission
+    // and doctor-ledger reports (which filter on order_tests.status, NOT
+    // bills.status) stop accruing on this bill. Without this, a cancelled
+    // bill keeps paying commission to the referring doctor forever.
+    const cascadedTests = await tx.update(orderTestsTable).set({
+      status: "cancelled",
+      cancelledByName: performedBy,
+      cancelledAt: new Date(),
+      cancellationReason: `Bill cancelled: ${reason}`,
+    } as Partial<typeof orderTestsTable.$inferSelect>)
+      .where(and(eq(orderTestsTable.orderId, bill.orderId), ne(orderTestsTable.status, "cancelled")))
+      .returning({ id: orderTestsTable.id });
+
+    if (cascadedTests.length > 0) {
+      await tx.insert(billAuditsTable).values({
+        billId: id,
+        editedBy: performedBy,
+        reason,
+        changeType: "tests_cancelled_cascade",
+        oldValue: "active",
+        newValue: `${cascadedTests.length} test(s) cancelled (commission accrual stopped)`,
+      });
+    }
+
+    // Optional: simultaneously refund the paid amount in the same transaction.
+    // Body shape: { autoRefund: { method: "cash" | "upi" | ... } }. When omitted,
+    // behaviour is unchanged (cancel-only).
+    const autoRefundParsed = z.object({
+      autoRefund: z.object({ method: z.string().min(1) }).optional(),
+    }).safeParse(req.body);
+    let refundedAmount = 0;
+    let refundMethod: string | null = null;
+    let cancelRefundPaymentId: number | null = null;
+    if (autoRefundParsed.success && autoRefundParsed.data.autoRefund) {
+      const currentPaid = Number(bill.paidAmount);
+      if (rupeesToPaise(currentPaid) > 0) {
+        refundMethod = autoRefundParsed.data.autoRefund.method.trim().toLowerCase();
+        refundedAmount = paiseToRupees(rupeesToPaise(currentPaid));
+        const currentRefund = Number(bill.refundAmount);
+        const newRefund = moneyAdd(currentRefund, refundedAmount);
+        const [cancelRefundRow] = await tx.insert(paymentsTable).values({
+          billId: id,
+          amount: String(-refundedAmount),
+          method: refundMethod,
+          referenceNumber: null,
+          notes: `REFUND on cancellation: ${reason}`,
+          recordedByName: performedBy,
+        }).returning();
+        cancelRefundPaymentId = cancelRefundRow.id;
+        // FIX: totalAmount is NEVER mutated — cancelled bill's balance is always 0.
+        await tx.update(billsTable).set({
+          paidAmount: "0.00",
+          refundAmount: String(newRefund),
+          balanceAmount: "0.00",
+        }).where(eq(billsTable.id, id));
+        await tx.insert(billAuditsTable).values({
+          billId: id,
+          editedBy: performedBy,
+          reason,
+          changeType: "refund_processed",
+          oldValue: `paid=₹${currentPaid.toFixed(2)}`,
+          newValue: `refund=₹${refundedAmount.toFixed(2)} via ${refundMethod} (auto on cancel)`,
+        });
+      }
+    }
+
+    return { updated, oldStatus: bill.status, cascadedTestCount: cascadedTests.length, refundedAmount, refundMethod, cancelRefundPaymentId };
+  }).catch((err: Error & { httpStatus?: number }) => {
+    if (err.httpStatus) {
+      res.status(err.httpStatus).json({ error: err.message });
+      return null;
+    }
+    throw err;
+  });
+  if (!txResult) return;
+  const { updated, oldStatus, cascadedTestCount, refundedAmount, refundMethod, cancelRefundPaymentId } = txResult;
+
+  // Cascade cancel → MWL: remove Orthanc .wl + mark scheduled procedures CANCELLED
+  // so modalities no longer C-FIND voided exams. Best-effort; never blocks response.
+  cancelRadiologyMwlForBill(id).catch((err) => {
+    req.log?.warn?.({ err, billId: id }, "MWL cancel cascade after bill cancel failed");
+  });
+
+  // Auto-generate refund voucher when an auto-refund happened on cancellation.
+  if (refundedAmount > 0 && refundMethod) {
+    try {
+      const [patForVoucher] = await db
+        .select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName })
+        .from(patientsTable)
+        .where(eq(patientsTable.id, updated.patientId));
+      autoVoucherForPayment({
+        billId: id,
+        amount: -refundedAmount,
+        method: refundMethod,
+        billNumber: updated.billNumber,
+        patientName: patForVoucher ? `${patForVoucher.firstName} ${patForVoucher.lastName}`.trim() : null,
+        performedBy,
+        paymentId: cancelRefundPaymentId,
+      }).catch(() => {});
+    } catch { /* never block */ }
+  }
+
+  // Best-effort email notification (re-use the bill-edit template)
+  try {
+    const billForEmail = await buildBill(updated);
+    const patientName = billForEmail.patient
+      ? `${billForEmail.patient.firstName} ${billForEmail.patient.lastName}`
+      : "Unknown Patient";
+    const changes: { field: string; from: string | null; to: string | null }[] = [
+      { field: "Status", from: oldStatus, to: "cancelled" },
+    ];
+    if (cascadedTestCount > 0) {
+      changes.push({ field: "Tests cancelled", from: null, to: `${cascadedTestCount} (commission stopped)` });
+    }
+    if (refundedAmount > 0 && refundMethod) {
+      changes.push({ field: "Auto refund", from: null, to: `₹${refundedAmount.toFixed(2)} via ${refundMethod}` });
+    }
+    sendBillEditEmail({
+      billNumber: updated.billNumber,
+      patientName,
+      editedBy: performedBy,
+      reason: `[CANCELLED] ${reason}`,
+      changes,
+    }).catch((err) => console.error("[email] bill cancel notification failed:", err));
+  } catch (err) {
+    req.log?.warn?.({ err }, "Cancel email send failed");
+  }
+
+  // Same closed-period notice as /:id/refund — only meaningful when this
+  // cancellation actually moved money (autoRefund). See the refund route
+  // below for the full rationale; never blocks, no approval required.
+  let closedPeriodWarning: { billCreatedBeforeClose: boolean; lastClosureAt: string | null } | null = null;
+  if (refundedAmount > 0 && refundMethod) {
+    try {
+      const boundary = await lastOverallClosureBoundary();
+      closedPeriodWarning = {
+        billCreatedBeforeClose: isBeforeClosureBoundary(new Date(updated.createdAt), boundary),
+        lastClosureAt: boundary ? boundary.toISOString() : null,
+      };
+    } catch (err) {
+      req.log?.warn?.({ err }, "Closed-period check failed — cancellation still succeeded, notice omitted");
+    }
+  }
+
+  res.json({ ...(await buildBill(updated)), closedPeriodWarning });
+});
+
+// ── Waive unpaid balance (discount) — NOT a cash refund ───────────────────────
+// Waive the CURRENT unpaid balance by converting it to additional discount.
+// This is deliberately NOT a refund: no negative payment row is created and
+// refundAmount / physical cash are untouched. The amount is server-derived
+// under FOR UPDATE so a concurrent payment cannot be accidentally waived.
+billsRouter.post("/:id/waive-due", requireStaffSubPermission("/billing", "edit"), async (req: StaffAuthRequest, res) => {
+  const paramsParsed = z.object({ id: z.coerce.number().int().positive() }).safeParse(req.params);
+  const bodyParsed = z.object({ reason: z.string().trim().min(3).max(500) }).safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({ error: "Invalid request — a reason of at least 3 characters is required" });
+    return;
+  }
+
+  try {
+    const updated = await db.transaction(async (tx) => {
+      const [bill] = await tx
+        .select()
+        .from(billsTable)
+        .where(eq(billsTable.id, paramsParsed.data.id))
+        .for("update")
+        .limit(1);
+
+      if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+
+      const session = req.staffSession;
+      const plan = planDueWaiver(bill, {
+        role: session?.role ?? null,
+        maxDiscountPct: session?.maxDiscount ?? 0,
+        fullAccessRoles: FULL_ACCESS_ROLES,
+      });
+      if (!plan.ok) {
+        throw Object.assign(new Error(plan.error), { httpStatus: plan.httpStatus });
+      }
+
+      const [saved] = await tx
+        .update(billsTable)
+        .set({
+          discount: plan.newDiscount.toFixed(2),
+          discountReason: bodyParsed.data.reason.slice(0, 200),
+          discountReasonNote: bodyParsed.data.reason,
+          totalAmount: plan.newTotal.toFixed(2),
+          balanceAmount: plan.newBalance.toFixed(2),
+          // paidAmount + refundAmount intentionally omitted — unchanged.
+          status: plan.newStatus,
+        })
+        .where(eq(billsTable.id, bill.id))
+        .returning();
+
+      const actor = session?.subjectName?.trim() || (session ? `staff:${session.id}` : "system");
+      await tx.insert(billAuditsTable).values({
+        billId: bill.id,
+        editedBy: actor,
+        reason: bodyParsed.data.reason,
+        changeType: "balance_waived",
+        oldValue: `total=₹${plan.oldTotal.toFixed(2)}, paid=₹${plan.paidAmount.toFixed(2)}, balance=₹${plan.oldBalance.toFixed(2)}, discount=₹${plan.oldDiscount.toFixed(2)}`,
+        newValue: `waived=₹${plan.waivedAmount.toFixed(2)}, total=₹${plan.newTotal.toFixed(2)}, paid=₹${plan.paidAmount.toFixed(2)}, balance=₹${plan.newBalance.toFixed(2)}, discount=₹${plan.newDiscount.toFixed(2)}`,
+      });
+
+      return saved!;
+    });
+
+    res.json(await buildBill(updated));
+  } catch (err: unknown) {
+    const httpStatus = (err as { httpStatus?: number })?.httpStatus;
+    if (httpStatus) {
+      res.status(httpStatus).json({ error: err instanceof Error ? err.message : "Due waiver failed" });
+      return;
+    }
+    throw err;
+  }
+});
+
+// Records a refund of `amount`. Inserts a negative-amount payment row so the
+// payment history shows it, decrements paidAmount, increments refundAmount,
+// recomputes balanceAmount + status, audits, and emails.
+billsRouter.post("/:id/refund", requireStaffSubPermission("/billing", "refund"), async (req, res) => {
+  const paramsParsed = RefundBillParams.safeParse(req.params);
+  const bodyParsed = RefundBillBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [
+        ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+        ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+      ],
+    });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const performedBy = (req as StaffAuthRequest).staffSession?.subjectName?.trim() || bodyParsed.data.performedBy.trim();
+  const reason = bodyParsed.data.reason.trim();
+  const rawAmount = bodyParsed.data.amount;
+  const method = (bodyParsed.data.method ?? "cash").trim().toLowerCase();
+  if (!performedBy) {
+    res.status(401).json({ error: "Staff authentication required" });
+    return;
+  }
+
+  // Normalize to 2-decimal rupees via paise (avoids float comparison surprises).
+  const amount = paiseToRupees(rupeesToPaise(rawAmount));
+
+  // Serialize concurrent refunds against this bill: lock the row, re-read latest
+  // values inside the transaction, then validate + write atomically. This
+  // prevents two simultaneous refund requests from each reading the same
+  // paidAmount and over-refunding the bill.
+  const result = await db.transaction(async (tx) => {
+    const [bill] = await tx.select().from(billsTable).where(eq(billsTable.id, id)).for("update");
+    if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+
+    const currentPaid = Number(bill.paidAmount);
+    const currentTotal = Number(bill.totalAmount);
+    const currentRefund = Number(bill.refundAmount);
+
+    if (rupeesToPaise(amount) > rupeesToPaise(currentPaid)) {
+      throw Object.assign(
+        new Error(`Refund (₹${amount.toFixed(2)}) cannot exceed amount currently paid (₹${currentPaid.toFixed(2)})`),
+        { httpStatus: 400 },
+      );
+    }
+
+    const newPaid = moneyMax0(moneySub(currentPaid, amount));
+    const newRefund = moneyAdd(currentRefund, amount);
+    // FIX: totalAmount is NEVER mutated by a refund — it preserves the original
+    // billed amount for historical revenue accuracy.
+    // balance_amount = total − paid − refund  ← true net money still owed.
+    // This means balance = 0 when the patient has paid their net obligation
+    // (paid_amount + refund_amount = total_amount), so:
+    //   • Dues filter (balance > 0) correctly excludes fully-settled refund bills.
+    //   • Add-payment guard uses the correct remaining payable amount.
+    //   • Daily-summary outstanding = SUM(balance) is correct without adjustment.
+    const newBalance = billBalanceFromParts(currentTotal, newPaid, newRefund);
+    // Status: paid when net owed (total − refund) is fully collected.
+    const netOwed = moneyMax0(moneySub(currentTotal, newRefund));
+    const newStatus = bill.status === "cancelled"
+      ? "cancelled"
+      : rupeesToPaise(newPaid) <= 0
+        ? "pending"
+        : rupeesToPaise(newPaid) < rupeesToPaise(netOwed)
+          ? "partial"
+          : "paid";
+
+    // Insert the refund as a negative-amount payment row so it shows up inline
+    // in the payment history alongside regular payments.
+    const [refundPaymentRow] = await tx.insert(paymentsTable).values({
+      billId: id,
+      amount: String(-amount),
+      method,
+      referenceNumber: null,
+      notes: `REFUND: ${reason}`,
+      recordedByName: performedBy,
+    }).returning();
+
+    // totalAmount intentionally excluded — must not be mutated by a refund.
+    const [updated] = await tx.update(billsTable).set({
+      paidAmount: String(newPaid),
+      refundAmount: String(newRefund),
+      balanceAmount: String(newBalance),
+      status: newStatus,
+    }).where(eq(billsTable.id, id)).returning();
+
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: performedBy,
+      reason,
+      changeType: "refund_processed",
+      oldValue: `paid=₹${currentPaid.toFixed(2)}, refunded=₹${currentRefund.toFixed(2)}`,
+      newValue: `refund=₹${amount.toFixed(2)} via ${method}; paid=₹${newPaid.toFixed(2)}, refunded=₹${newRefund.toFixed(2)}`,
+    });
+
+    return { updated, currentPaid, currentRefund, newPaid, newRefund, refundPaymentId: refundPaymentRow.id };
+  }).catch((err: Error & { httpStatus?: number }) => {
+    if (err.httpStatus) {
+      res.status(err.httpStatus).json({ error: err.message });
+      return null;
+    }
+    throw err;
+  });
+  if (!result) return;
+  const { updated, currentPaid, currentRefund, newPaid, newRefund, refundPaymentId } = result;
+
+  // Auto-generate refund voucher — async, never blocks response
+  try {
+    const [patForVoucher] = await db
+      .select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName })
+      .from(patientsTable)
+      .where(eq(patientsTable.id, updated.patientId));
+    autoVoucherForPayment({
+      billId: id,
+      amount: -amount, // negative signals a refund voucher
+      method,
+      billNumber: updated.billNumber,
+      patientName: patForVoucher ? `${patForVoucher.firstName} ${patForVoucher.lastName}`.trim() : null,
+      performedBy,
+      paymentId: refundPaymentId,
+    }).catch(() => {/* already logged inside */});
+  } catch { /* never block */ }
+
+  try {
+    const billForEmail = await buildBill(updated);
+    const patientName = billForEmail.patient
+      ? `${billForEmail.patient.firstName} ${billForEmail.patient.lastName}`
+      : "Unknown Patient";
+    sendBillEditEmail({
+      billNumber: updated.billNumber,
+      patientName,
+      editedBy: performedBy,
+      reason: `[REFUND] ${reason}`,
+      changes: [
+        { field: "Refund (₹)", from: currentRefund.toFixed(2), to: newRefund.toFixed(2) },
+        { field: "Paid (₹)", from: currentPaid.toFixed(2), to: newPaid.toFixed(2) },
+      ],
+    }).catch((err) => console.error("[email] refund notification failed:", err));
+  } catch (err) {
+    req.log?.warn?.({ err }, "Refund email send failed");
+  }
+
+  // ── Closed-period notice (informational only — never blocks) ───────────
+  // Per the ERP's existing carry-forward rule (Specification §7, Locked
+  // Rule #10/#11): this refund is NOT blocked and requires NO owner
+  // approval even if the original bill predates the most recent day-close.
+  // It already correctly belongs to the current open reconciliation window
+  // (see bills.ts refund transaction above — payment.createdAt = NOW()).
+  // This flag exists purely so staff get a heads-up that the bill they are
+  // refunding was part of an already-closed, signed-off period.
+  let closedPeriodWarning: { billCreatedBeforeClose: boolean; lastClosureAt: string | null } | null = null;
+  try {
+    const boundary = await lastOverallClosureBoundary();
+    closedPeriodWarning = {
+      billCreatedBeforeClose: isBeforeClosureBoundary(new Date(updated.createdAt), boundary),
+      lastClosureAt: boundary ? boundary.toISOString() : null,
+    };
+  } catch (err) {
+    req.log?.warn?.({ err }, "Closed-period check failed — refund still succeeded, notice omitted");
+  }
+
+  res.json({ ...(await buildBill(updated)), closedPeriodWarning });
+});
+
+// ── Change Referring Doctor ──────────────────────────────────────────────────
+// Updates the order's doctorId, audit-logs the change, and returns the updated
+// bill. Commission recalculation happens naturally because the commission
+// report reads the current doctorId on each run.
+billsRouter.post("/:id/change-doctor", async (req: StaffAuthRequest, res) => {
+  const paramsParsed = z.object({ id: z.coerce.number().positive() }).safeParse(req.params);
+  const bodyParsed = z.object({
+    newDoctorId: z.union([z.coerce.number().positive(), z.literal(0), z.null()]),
+    reason: z.string().min(1),
+    // Actor is taken from the authenticated session, not trusted from the body
+    // (this endpoint redirects a referrer's commission, so a spoofed actor
+    // hid who reassigned it). Kept optional as a legacy fallback only.
+    performedBy: z.string().min(1).optional(),
+  }).safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({ error: "Invalid request", details: [...(paramsParsed.error?.issues ?? []), ...(bodyParsed.error?.issues ?? [])] });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const { newDoctorId, reason } = bodyParsed.data;
+  const actor = req.staffSession?.subjectName?.trim() || bodyParsed.data.performedBy?.trim() || "unknown";
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, id));
+  if (!bill) { res.status(404).json({ error: "Bill not found" }); return; }
+
+  // Resolve old and new doctor names for the audit trail
+  const [order] = await db.select().from(ordersTable).where(eq(ordersTable.id, bill.orderId));
+  const [oldDoctor] = order?.doctorId
+    ? await db.select({ name: doctorsTable.name }).from(doctorsTable).where(eq(doctorsTable.id, order.doctorId))
+    : [undefined];
+
+  const isSelf = newDoctorId === 0 || newDoctorId === null;
+  const [newDoctor] = isSelf
+    ? [{ name: "Walk-in / Self", ledgerId: null as number | null }]
+    : await db.select({ name: doctorsTable.name, ledgerId: doctorsTable.ledgerId }).from(doctorsTable).where(eq(doctorsTable.id, newDoctorId as number));
+  if (!isSelf && !newDoctor) { res.status(400).json({ error: "New doctor not found" }); return; }
+
+  const nextLedgerId = isSelf
+    ? await getWalkInLedgerId()
+    : (newDoctor?.ledgerId ?? await getWalkInLedgerId());
+
+  // Bill numbers are unique per book, so moving a bill between books can land it
+  // on a number the destination register has already issued. The number on the
+  // patient's printed receipt cannot silently change, so refuse instead of
+  // renumbering or 500-ing on the constraint.
+  if (nextLedgerId !== bill.ledgerId) {
+    const [clash] = await db
+      .select({ id: billsTable.id })
+      .from(billsTable)
+      .where(
+        and(
+          eq(billsTable.ledgerId, nextLedgerId),
+          eq(billsTable.billNumber, bill.billNumber),
+          ne(billsTable.id, id),
+        ),
+      )
+      .limit(1);
+    if (clash) {
+      res.status(409).json({
+        error: `Bill ${bill.billNumber} cannot move to that book — it has already issued number ${bill.billNumber}. Cancel and rebill to renumber it under the new book.`,
+      });
+      return;
+    }
+  }
+
+  await db.transaction(async (tx) => {
+    // Update the order (doctor lives on the order, not the bill) + ledger routing
+    await tx.update(ordersTable).set({
+      doctorId: isSelf ? null : newDoctorId,
+      ledgerId: nextLedgerId,
+    }).where(eq(ordersTable.id, bill.orderId));
+    await tx.update(billsTable).set({ ledgerId: nextLedgerId }).where(eq(billsTable.id, id));
+
+    // Audit
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: actor,
+      reason,
+      changeType: "referral",
+      oldValue: oldDoctor?.name ?? "(none)",
+      newValue: newDoctor?.name ?? "(none)",
+    });
+  });
+
+  const [freshBill] = await db.select().from(billsTable).where(eq(billsTable.id, id));
+  res.json(await buildBill(freshBill ?? bill));
+});
+
+// Helper: verify super admin session token
+async function verifySuperAdminToken(token: string): Promise<{ valid: boolean; userName: string }> {
+  if (!token) return { valid: false, userName: "" };
+  const [session] = await db.select().from(superAdminSessionsTable).where(eq(superAdminSessionsTable.token, token));
+  if (!session || !session.isActive || new Date(session.expiresAt) < new Date()) {
+    return { valid: false, userName: "" };
+  }
+  return { valid: true, userName: session.userName };
+}
+
+// ── Super-admin: full amount edit ─────────────────────────────────────────────
+billsRouter.patch("/:id/super-edit", async (req, res) => {
+  if (rejectIfUsbMissing(req, res)) return;
+  const paramsParsed = SuperEditBillParams.safeParse(req.params);
+  const bodyParsed = SuperEditBillBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [
+        ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+        ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+      ],
+    });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const { token, reason, subtotal, discount, taxAmount } = bodyParsed.data;
+
+  const { valid, userName } = await verifySuperAdminToken(token);
+  if (!valid) {
+    res.status(403).json({ error: "Super admin session expired or invalid. Please re-authenticate via the Super Admin Portal." });
+    return;
+  }
+  const superAdminName = userName;
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, id));
+  if (!bill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+
+  const newSubtotal  = subtotal  !== undefined ? Number(subtotal)  : Number(bill.subtotal);
+  const newDiscount  = discount  !== undefined ? Number(discount)  : Number(bill.discount);
+  const newTaxAmount = taxAmount !== undefined ? Number(taxAmount) : Number(bill.taxAmount);
+  const paidAmount   = Number(bill.paidAmount);
+  const discountGate = assertDiscountNotBelowCollected({
+    subtotal: newSubtotal,
+    discount: newDiscount,
+    tax: newTaxAmount,
+    collectedNet: paidAmount,
+  });
+  if (discountGate) {
+    res.status(400).json({ error: discountGate });
+    return;
+  }
+  const { total: newTotal, balance: newBalance } = recomputedBillBalance({
+    subtotal: newSubtotal,
+    discount: newDiscount,
+    tax: newTaxAmount,
+    paid: paidAmount,
+    refund: Number(bill.refundAmount ?? 0),
+  });
+  // Status: paid when net owed (total − refund) is fully collected.
+  const refundAmount = Number(bill.refundAmount ?? 0);
+  const netOwed    = Math.max(0, newTotal - refundAmount);
+  const newStatus    = newBalance <= 0 && paidAmount > 0 ? "paid"
+                     : paidAmount > 0 && paidAmount < netOwed ? "partial"
+                     : paidAmount > 0 ? "paid"
+                     : "pending";
+
+  // When subtotal changes, scale active order_tests so Σ lines = new subtotal.
+  if (newSubtotal !== Number(bill.subtotal)) {
+    const otRows = await db.select({ id: orderTestsTable.id, price: orderTestsTable.price, status: orderTestsTable.status })
+      .from(orderTestsTable).where(eq(orderTestsTable.orderId, bill.orderId));
+    const active = otRows.filter((r) => r.status !== "cancelled");
+    if (active.length > 0) {
+      const scaled = scaleLinePaiseToTotal(
+        active.map((r) => rupeesToPaise(r.price)),
+        newSubtotal,
+      );
+      for (let i = 0; i < active.length; i++) {
+        await db.update(orderTestsTable)
+          .set({ price: paiseToRupees(scaled[i] ?? 0).toFixed(2) })
+          .where(eq(orderTestsTable.id, active[i].id));
+      }
+      await db.update(ordersTable)
+        .set({ totalAmount: newSubtotal.toFixed(2) })
+        .where(eq(ordersTable.id, bill.orderId));
+    }
+  }
+
+  const [updated] = await db.update(billsTable).set({
+    subtotal:      String(newSubtotal),
+    discount:      String(newDiscount),
+    taxAmount:     String(newTaxAmount),
+    totalAmount:   String(newTotal),
+    balanceAmount: String(Math.max(0, newBalance)),
+    status:        newStatus,
+  }).where(eq(billsTable.id, id)).returning();
+
+  // Audit each changed field
+  const auditRows: { billId: number; editedBy: string; reason: string; changeType: string; oldValue: string | null; newValue: string | null }[] = [];
+  if (newSubtotal !== Number(bill.subtotal))   auditRows.push({ billId: id, editedBy: superAdminName, reason, changeType: "subtotal",   oldValue: bill.subtotal,   newValue: String(newSubtotal) });
+
+  // Audit warning: if the new subtotal no longer matches sum(order_tests.price),
+  // commission/doctor-ledger reports (which compute off order_tests, not bills)
+  // will silently disagree with the bill. Surface this for the CA review page.
+  if (newSubtotal !== Number(bill.subtotal)) {
+    const otRows = await db.select({ price: orderTestsTable.price, status: orderTestsTable.status })
+      .from(orderTestsTable).where(eq(orderTestsTable.orderId, bill.orderId));
+    const activeSum = otRows
+      .filter((r) => r.status !== "cancelled")
+      .reduce((s, r) => s + Number(r.price ?? 0), 0);
+    if (Math.abs(activeSum - newSubtotal) > 0.01) {
+      auditRows.push({
+        billId: id, editedBy: superAdminName, reason,
+        changeType: "subtotal_mismatch_warning",
+        oldValue: `order_tests sum=₹${activeSum.toFixed(2)}`,
+        newValue: `bill subtotal=₹${newSubtotal.toFixed(2)} (commission report will use order_tests sum, not this)`,
+      });
+    }
+  }
+  if (newDiscount !== Number(bill.discount))   auditRows.push({ billId: id, editedBy: superAdminName, reason, changeType: "discount",   oldValue: bill.discount,   newValue: String(newDiscount) });
+  if (newTaxAmount !== Number(bill.taxAmount)) auditRows.push({ billId: id, editedBy: superAdminName, reason, changeType: "taxAmount",  oldValue: bill.taxAmount,  newValue: String(newTaxAmount) });
+  if (newTotal !== Number(bill.totalAmount))   auditRows.push({ billId: id, editedBy: superAdminName, reason, changeType: "totalAmount", oldValue: bill.totalAmount, newValue: String(newTotal) });
+  if (auditRows.length > 0) await db.insert(billAuditsTable).values(auditRows);
+
+  res.json(await buildBill(updated));
+});
+
+// ── Super-admin: delete bill + renumber subsequent ────────────────────────────
+billsRouter.delete("/:id", async (req, res) => {
+  if (rejectIfUsbMissing(req, res)) return;
+  const paramsParsed = DeleteBillParams.safeParse(req.params);
+  const bodyParsed = DeleteBillBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      error: "Invalid request",
+      details: [
+        ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+        ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+      ],
+    });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const { token, reason } = bodyParsed.data;
+
+  const { valid, userName } = await verifySuperAdminToken(token);
+  if (!valid) {
+    res.status(403).json({ error: "Super admin session expired or invalid. Please re-authenticate via the Super Admin Portal." });
+    return;
+  }
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, id));
+  if (!bill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+
+  // Parse bill number to get YYYYMM prefix and sequence number (handles both
+  // legacy `BILL-YYYYMM-####` and current pure-numeric `YYYYMM####`).
+  const billNumMatch = parseBillNumberParts(bill.billNumber);
+
+  // Pre-audit (bill_audits has no FK constraint so insert before or after is fine)
+  await db.insert(billAuditsTable).values({
+    billId: id,
+    editedBy: userName,
+    reason: `[DELETED] ${reason}`,
+    changeType: "deleted",
+    oldValue: bill.billNumber,
+    newValue: null,
+  });
+
+  // Delete vouchers + cancel order_tests + delete payments + bill, reset order,
+  // renumber later bills — all in one transaction. Otherwise a partial failure
+  // (e.g. mid-renumber) leaves the sequence with gaps or duplicate numbers and
+  // an inconsistent order status. Hard DELETE stays allowed for superadmin.
+  await db.transaction(async (tx) => {
+    await tx.delete(vouchersTable).where(eq(vouchersTable.billId, id));
+    await tx.update(orderTestsTable).set({
+      status: "cancelled",
+      cancellationReason: "bill_deleted",
+      cancelledAt: new Date(),
+      cancelledByName: userName,
+    }).where(eq(orderTestsTable.orderId, bill.orderId));
+    // Nullable FKs with ON DELETE NO ACTION — clear before hard-deleting the bill.
+    await tx.update(formFRecordsTable).set({ billId: null }).where(eq(formFRecordsTable.billId, id));
+    await tx.update(testTokensTable).set({ billId: null }).where(eq(testTokensTable.billId, id));
+    await tx.delete(paymentsTable).where(eq(paymentsTable.billId, id));
+    await tx.delete(billsTable).where(eq(billsTable.id, id));
+    await tx.update(ordersTable).set({ status: "pending" }).where(eq(ordersTable.id, bill.orderId));
+
+    if (billNumMatch) {
+      const { monthPrefix, seq: deletedSeq } = billNumMatch;
+
+      // Renumber THIS BOOK only. Numbers are unique per book, so another book's
+      // rows for the same month share the prefix but are a separate register:
+      // shifting them would both corrupt that book's sequence and collide with
+      // its own issued numbers.
+      //
+      // Match both legacy `BILL-YYYYMM-...` and numeric `YYYYMM...` rows for the
+      // same month so renumbering works during/after the format switch.
+      const laterBills = await tx
+        .select()
+        .from(billsTable)
+        .where(
+          and(
+            eq(billsTable.ledgerId, bill.ledgerId),
+            or(
+              like(billsTable.billNumber, `BILL-${monthPrefix}-%`),
+              like(billsTable.billNumber, `${monthPrefix}%`),
+            ),
+          ),
+        )
+        .orderBy(billsTable.billNumber);
+
+      for (const lb of laterBills) {
+        const parts = parseBillNumberParts(lb.billNumber);
+        if (!parts || parts.monthPrefix !== monthPrefix) continue;
+        if (parts.seq <= deletedSeq) continue;
+        const newBillNumber = `${monthPrefix}${String(parts.seq - 1).padStart(4, "0")}`;
+        await tx.update(billsTable).set({ billNumber: newBillNumber }).where(eq(billsTable.id, lb.id));
+      }
+    }
+  });
+
+  res.json({ success: true, deletedBillNumber: bill.billNumber });
+});
+
+// Payments
+paymentsRouter.get("/", async (req, res) => {
+  const parsed = ListPaymentsQueryParams.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid query params" });
+    return;
+  }
+  const { billId, page = 1, limit = 20 } = parsed.data;
+  const offset = (page - 1) * limit;
+
+  // Optional text search (q >= 2 chars) — finds bills by patient name/ID/phone/bill#
+  // then filters payments to those bills. Read directly from req.query to avoid
+  // roundtripping through OpenAPI codegen.
+  const q = typeof req.query.q === "string" && req.query.q.trim().length >= 2 ? req.query.q.trim() : null;
+
+  // Resolve text-search into a set of bill IDs upfront
+  let searchBillIds: number[] | null = null;
+  if (q) {
+    const pattern = `%${q.toLowerCase()}%`;
+    const matchingBills = await db
+      .select({ id: billsTable.id })
+      .from(billsTable)
+      .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+      .where(
+        or(
+          sql`LOWER(${billsTable.billNumber}) LIKE ${pattern}`,
+          sql`LOWER(${patientsTable.firstName} || ' ' || COALESCE(${patientsTable.lastName}, '')) LIKE ${pattern}`,
+          sql`LOWER(COALESCE(${patientsTable.patientId}, '')) LIKE ${pattern}`,
+          sql`COALESCE(${patientsTable.phone}, '') LIKE ${pattern}`,
+        ),
+      )
+      .limit(100);
+    searchBillIds = matchingBills.map((b) => b.id);
+    if (searchBillIds.length === 0) {
+      res.json({ payments: [], total: 0, page, limit });
+      return;
+    }
+  }
+
+  const conditions = [];
+  if (billId) conditions.push(eq(paymentsTable.billId, billId));
+  if (searchBillIds) conditions.push(inArray(paymentsTable.billId, searchBillIds));
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  const [rows, countResult] = await Promise.all([
+    db
+      .select({
+        id: paymentsTable.id,
+        billId: paymentsTable.billId,
+        billNumber: billsTable.billNumber,
+        amount: paymentsTable.amount,
+        method: paymentsTable.method,
+        referenceNumber: paymentsTable.referenceNumber,
+        notes: paymentsTable.notes,
+        recordedByName: paymentsTable.recordedByName,
+        createdAt: paymentsTable.createdAt,
+        patientName: sql<string>`COALESCE(${patientsTable.firstName} || ' ' || COALESCE(${patientsTable.lastName}, ''), '')`,
+        patientPid: patientsTable.patientId,
+      })
+      .from(paymentsTable)
+      .leftJoin(billsTable, eq(paymentsTable.billId, billsTable.id))
+      .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+      .where(where)
+      .orderBy(desc(paymentsTable.createdAt))
+      .limit(limit)
+      .offset(offset),
+    db.select({ count: sql<number>`count(*)` }).from(paymentsTable).where(where),
+  ]);
+
+  res.json({
+    payments: rows.map((p) => ({
+      ...p,
+      amount: Number(p.amount),
+      billNumber: p.billNumber ?? `#${p.billId}`,
+      patientName: p.patientName?.trim() || null,
+      patientPid: p.patientPid ?? null,
+    })),
+    total: Number(countResult[0]?.count ?? 0),
+    page,
+    limit,
+  });
+});
+
+// ── Cancel a single test on a bill (partial cancellation) ────────────────────
+// Marks one order_test row as cancelled, recalculates bill totals, and audits.
+// Requires at least one active test to remain — to cancel everything, use the
+// full-bill cancel endpoint instead.
+billsRouter.post("/:id/cancel-test", async (req: StaffAuthRequest, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    res.status(400).json({ error: "Invalid bill id" });
+    return;
+  }
+  const { orderTestId, performedBy, reason } = req.body as { orderTestId?: unknown; performedBy?: unknown; reason?: unknown };
+  if (!orderTestId || !performedBy || !reason) {
+    res.status(400).json({ error: "orderTestId, performedBy, and reason are required" });
+    return;
+  }
+  const otId = Number(orderTestId);
+  const actor = String(performedBy).trim();
+  const why = String(reason).trim();
+  if (!Number.isInteger(otId) || otId < 1) {
+    res.status(400).json({ error: "orderTestId must be a positive integer" });
+    return;
+  }
+  if (!actor) { res.status(400).json({ error: "performedBy is required" }); return; }
+  if (!why)   { res.status(400).json({ error: "reason is required" }); return; }
+
+  const result = await db.transaction(async (tx) => {
+    const [bill] = await tx.select().from(billsTable).where(eq(billsTable.id, id)).for("update");
+    if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+    if (bill.status === "cancelled") throw Object.assign(new Error("Bill is already cancelled"), { httpStatus: 409 });
+
+    const [orderTest] = await tx.select().from(orderTestsTable).where(eq(orderTestsTable.id, otId));
+    if (!orderTest) throw Object.assign(new Error("Test not found"), { httpStatus: 404 });
+    if (orderTest.orderId !== bill.orderId) throw Object.assign(new Error("Test does not belong to this bill's order"), { httpStatus: 400 });
+    if ((orderTest as { status?: string }).status === "cancelled") throw Object.assign(new Error("Test is already cancelled"), { httpStatus: 409 });
+
+    // Get all tests on this order to check we won't remove the last active one
+    const allTests = await tx.select().from(orderTestsTable).where(eq(orderTestsTable.orderId, bill.orderId));
+    const remainingActive = allTests.filter((t) => t.id !== otId && (t as { status?: string }).status !== "cancelled");
+    if (remainingActive.length === 0) {
+      throw Object.assign(
+        new Error("Cannot cancel the last active test. Use 'Cancel Bill' to cancel the whole bill."),
+        { httpStatus: 400 },
+      );
+    }
+
+    // Mark the test as cancelled
+    await tx.update(orderTestsTable).set({
+      status: "cancelled",
+      cancelledByName: actor,
+      cancelledAt: new Date(),
+      cancellationReason: why,
+    } as Partial<typeof orderTestsTable.$inferSelect>).where(eq(orderTestsTable.id, otId));
+
+    // Recalculate totals from remaining active tests
+    const newSubtotal = remainingActive.reduce((sum, t) => moneyAdd(sum, t.price), 0);
+    const oldDiscount = Number(bill.discount);
+    const newDiscount = moneyMax0(
+      paiseToRupees(Math.min(rupeesToPaise(oldDiscount), rupeesToPaise(newSubtotal))),
+    );
+    const newTotal = billTotalFromParts(newSubtotal, newDiscount, bill.taxAmount);
+    const newPaid = Number(bill.paidAmount);
+    const refundAmount = Number(bill.refundAmount || 0);
+    const newBalance = billBalanceFromParts(newTotal, newPaid, refundAmount);
+    const newStatus = newBalance <= 0 && newPaid > 0 ? "paid"
+      : newPaid > 0 ? "partial"
+      : "pending";
+
+    const [updated] = await tx.update(billsTable).set({
+      subtotal: String(newSubtotal),
+      discount: String(newDiscount),
+      totalAmount: String(newTotal),
+      balanceAmount: String(newBalance),
+      status: newStatus,
+    }).where(eq(billsTable.id, id)).returning();
+
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: actor,
+      reason: why,
+      changeType: "test-cancelled",
+      oldValue: `testId=${otId}, price=₹${Number(orderTest.price).toFixed(2)}`,
+      newValue: `subtotal=₹${newSubtotal.toFixed(2)}, total=₹${newTotal.toFixed(2)}`,
+    });
+
+    return updated;
+  }).catch((err: Error & { httpStatus?: number }) => {
+    if (err.httpStatus) { res.status(err.httpStatus).json({ error: err.message }); return null; }
+    throw err;
+  });
+
+  if (!result) return;
+
+  // Partial cancel → drop MWL for that order_test's radiology study (best-effort).
+  cancelRadiologyMwlForOrderTest(otId).catch((err) => {
+    req.log?.warn?.({ err, orderTestId: otId }, "MWL cancel cascade after cancel-test failed");
+  });
+
+  res.json(await buildBill(result));
+});
+
+// ── Cancel selected tests and optionally refund their value ──────────────────────────────────────────────────────
+// Cancels multiple order_test rows, recalculates bill totals, and if the
+// bill is now over-paid, records a refund for the excess amount.
+billsRouter.post("/:id/cancel-refund-tests", async (req: StaffAuthRequest, res) => {
+  const paramsParsed = z.object({ id: z.coerce.number() }).safeParse(req.params);
+  const bodyParsed = CancelRefundTestsBody.safeParse(req.body);
+  if (!paramsParsed.success || !bodyParsed.success) {
+    res.status(400).json({ error: "Invalid request", details: [
+      ...(paramsParsed.success ? [] : paramsParsed.error.issues),
+      ...(bodyParsed.success ? [] : bodyParsed.error.issues),
+    ] });
+    return;
+  }
+  const id = paramsParsed.data.id;
+  const { orderTestIds, reason, performedBy, refundMethod } = bodyParsed.data;
+  const actor = performedBy.trim() || req.staffSession?.subjectName?.trim() || "";
+  if (!actor) { res.status(401).json({ error: "Staff authentication required" }); return; }
+  if (!Array.isArray(orderTestIds) || orderTestIds.length === 0) {
+    res.status(400).json({ error: "Select at least one test to cancel" }); return;
+  }
+
+  const txResult = await db.transaction(async (tx) => {
+    const [bill] = await tx.select().from(billsTable).where(eq(billsTable.id, id)).for("update");
+    if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+    if (bill.status === "cancelled") throw Object.assign(new Error("Bill is already cancelled"), { httpStatus: 409 });
+
+    // Fetch all tests for this order
+    const allTests = await tx.select().from(orderTestsTable).where(eq(orderTestsTable.orderId, bill.orderId));
+    const targetIds = new Set(orderTestIds.map(Number));
+    const targets = allTests.filter((t) => targetIds.has(t.id));
+    if (targets.length !== targetIds.size) {
+      throw Object.assign(new Error("One or more selected tests do not belong to this bill"), { httpStatus: 400 });
+    }
+    const alreadyCancelled = targets.filter((t) => (t as { status?: string }).status === "cancelled");
+    if (alreadyCancelled.length > 0) {
+      throw Object.assign(new Error(`${alreadyCancelled.length} test(s) already cancelled`), { httpStatus: 409 });
+    }
+
+    // Ensure at least one active test remains
+    const remainingActive = allTests.filter(
+      (t) => !targetIds.has(t.id) && (t as { status?: string }).status !== "cancelled",
+    );
+    if (remainingActive.length === 0) {
+      throw Object.assign(new Error("Cannot cancel all tests. Use 'Cancel Bill' to void the entire bill."), { httpStatus: 400 });
+    }
+
+    // Cancel selected tests
+    const now = new Date();
+    for (const ot of targets) {
+      await tx.update(orderTestsTable).set({
+        status: "cancelled",
+        cancelledByName: actor,
+        cancelledAt: now,
+        cancellationReason: reason,
+      } as Partial<typeof orderTestsTable.$inferSelect>).where(eq(orderTestsTable.id, ot.id));
+    }
+
+    // Recalculate bill totals from remaining active tests
+    const newSubtotal = remainingActive.reduce((sum, t) => moneyAdd(sum, t.price), 0);
+    const oldDiscount = Number(bill.discount);
+    const newDiscount = moneyMax0(
+      paiseToRupees(Math.min(rupeesToPaise(oldDiscount), rupeesToPaise(newSubtotal))),
+    );
+    const newTotal = billTotalFromParts(newSubtotal, newDiscount, bill.taxAmount);
+    const oldPaid = Number(bill.paidAmount);
+    const oldRefund = Number(bill.refundAmount);
+
+    let refundedAmount = 0;
+    let refundRecorded = false;
+    let refundPaymentId: number | null = null;
+
+    // If overpaid after removing tests, auto-refund the excess
+    if (rupeesToPaise(oldPaid) > rupeesToPaise(newTotal)) {
+      refundedAmount = paiseToRupees(rupeesToPaise(oldPaid) - rupeesToPaise(newTotal));
+      const method = (refundMethod ?? "cash").trim().toLowerCase();
+      const newRefund = moneyAdd(oldRefund, refundedAmount);
+      const newPaid = moneyMax0(moneySub(oldPaid, refundedAmount));
+      const newBalance = billBalanceFromParts(newTotal, newPaid, newRefund);
+      const newStatus = rupeesToPaise(newPaid) <= 0
+        ? "pending"
+        : rupeesToPaise(newPaid) < rupeesToPaise(newTotal)
+          ? "partial"
+          : "paid";
+
+      const [refundRow] = await tx.insert(paymentsTable).values({
+        billId: id,
+        amount: String(-refundedAmount),
+        method,
+        referenceNumber: null,
+        notes: `REFUND (test cancel): ${reason}`,
+        recordedByName: actor,
+      }).returning();
+      refundPaymentId = refundRow.id;
+
+      await tx.update(billsTable).set({
+        subtotal: String(newSubtotal),
+        discount: String(newDiscount),
+        totalAmount: String(newTotal),
+        paidAmount: String(newPaid),
+        refundAmount: String(newRefund),
+        balanceAmount: String(newBalance),
+        status: newStatus,
+      }).where(eq(billsTable.id, id));
+
+      refundRecorded = true;
+    } else {
+      const newPaid = oldPaid;
+      const newBalance = billBalanceFromParts(newTotal, newPaid, oldRefund);
+      const newStatus = rupeesToPaise(newPaid) <= 0
+        ? "pending"
+        : rupeesToPaise(newPaid) < rupeesToPaise(newTotal)
+          ? "partial"
+          : "paid";
+
+      await tx.update(billsTable).set({
+        subtotal: String(newSubtotal),
+        discount: String(newDiscount),
+        totalAmount: String(newTotal),
+        balanceAmount: String(newBalance),
+        status: newStatus,
+      }).where(eq(billsTable.id, id));
+    }
+
+    const [updated] = await tx.select().from(billsTable).where(eq(billsTable.id, id));
+
+    // Audit log
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: actor,
+      reason,
+      changeType: "tests-cancelled",
+      oldValue: `cancelled ${targets.length} test(s): ${targets.map((t) => `id=${t.id}, price=₹${Number(t.price).toFixed(2)}`).join("; ")}`,
+      newValue: `subtotal=₹${newSubtotal.toFixed(2)}, total=₹${newTotal.toFixed(2)}, paid=₹${updated.paidAmount}${refundRecorded ? `, refunded=₹${refundedAmount.toFixed(2)}` : ""}`,
+    });
+
+    return { updated, targets, refundedAmount, refundRecorded, refundMethod: refundMethod ?? "cash", refundPaymentId };
+  }).catch((err: Error & { httpStatus?: number }) => {
+    if (err.httpStatus) { res.status(err.httpStatus).json({ error: err.message }); return null; }
+    throw err;
+  });
+
+  if (!txResult) return;
+  const { updated, targets, refundedAmount, refundRecorded, refundMethod: method, refundPaymentId } = txResult;
+
+  // Drop MWL entries for each cancelled radiology order_test (best-effort).
+  for (const t of targets) {
+    cancelRadiologyMwlForOrderTest(t.id).catch((err) => {
+      req.log?.warn?.({ err, orderTestId: t.id }, "MWL cancel cascade after cancel-refund-tests failed");
+    });
+  }
+
+  // Voucher + email
+  if (refundRecorded && refundedAmount > 0) {
+    try {
+      const [patForVoucher] = await db
+        .select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName })
+        .from(patientsTable).where(eq(patientsTable.id, updated.patientId));
+      autoVoucherForPayment({
+        billId: id, amount: -refundedAmount, method,
+        billNumber: updated.billNumber,
+        patientName: patForVoucher ? `${patForVoucher.firstName} ${patForVoucher.lastName}`.trim() : null,
+        performedBy: actor,
+        paymentId: refundPaymentId,
+      }).catch(() => {});
+    } catch { /* never block */ }
+  }
+
+  try {
+    const billForEmail = await buildBill(updated);
+    const patientName = billForEmail.patient
+      ? `${billForEmail.patient.firstName} ${billForEmail.patient.lastName}`
+      : "Unknown Patient";
+    const changes: { field: string; from: string | null; to: string | null }[] = [
+      { field: "Tests cancelled", from: null, to: `${targets.length} (commission stopped)` },
+      { field: "New Total", from: null, to: `₹${Number(updated.totalAmount).toFixed(2)}` },
+    ];
+    if (refundRecorded) {
+      changes.push({ field: "Auto Refund", from: null, to: `₹${refundedAmount.toFixed(2)} via ${method}` });
+    }
+    sendBillEditEmail({
+      billNumber: updated.billNumber,
+      patientName,
+      editedBy: actor,
+      reason: `[TESTS CANCELLED] ${reason}`,
+      changes,
+    }).catch((err) => console.error("[email] cancel-refund-tests notification failed:", err));
+  } catch (err) {
+    req.log?.warn?.({ err }, "Cancel-refund-tests email send failed");
+  }
+
+  res.json(await buildBill(updated));
+});
+
+paymentsRouter.post("/", async (req, res) => {
+  const parsed = CreatePaymentBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid body", details: parsed.error.issues });
+    return;
+  }
+  const { billId, amount, method, referenceNumber, notes } = parsed.data;
+  const actorName = (req as StaffAuthRequest).staffSession?.subjectName?.trim();
+
+  const negErr = assertNonNegativePayment(amount);
+  if (negErr) {
+    res.status(400).json({ error: negErr });
+    return;
+  }
+
+  // ── Serialize concurrent payment attempts on this bill via row-level lock ──
+  // Wrapping in a transaction with FOR UPDATE prevents two simultaneous payment
+  // requests from both passing the balance check before either commits.
+  // This closes the double-click race condition (Bug #1).
+  let payment: typeof paymentsTable.$inferSelect;
+  let newPaidAmount: number;
+  let voucherBillNumber: string | null = null;
+  let voucherPatientName: string | null = null;
+
+  try {
+    const txResult = await db.transaction(async (tx) => {
+      const [bill] = await tx
+        .select()
+        .from(billsTable)
+        .where(eq(billsTable.id, billId))
+        .for("update")
+        .limit(1);
+
+      if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+
+      // Terminal-state: cancelled is immutable for normal collection. Checked
+      // inside FOR UPDATE so cancel-vs-payment races cannot resurrect the bill
+      // after a concurrent cancel commits.
+      if (bill.status === "cancelled") {
+        throw Object.assign(new Error("Bill is cancelled — payment not allowed"), { httpStatus: 409 });
+      }
+
+      // Idempotent on referenceNumber + collectible settlement
+      if (referenceNumber) {
+        const existing = await tx
+          .select()
+          .from(paymentsTable)
+          .where(and(eq(paymentsTable.billId, billId), eq(paymentsTable.referenceNumber, referenceNumber)))
+          .limit(5);
+        const hit = existing.find((p) => isCollectiblePayment(p));
+        if (hit) {
+          return {
+            inserted: hit,
+            paid: Number(bill.paidAmount),
+            billNumber: bill.billNumber,
+            patientName: null as string | null,
+            idempotent: true,
+          };
+        }
+      }
+
+      const outstanding = billBalanceFromParts(
+        bill.totalAmount,
+        bill.paidAmount,
+        bill.refundAmount ?? 0,
+      );
+      const withinErr = assertPaymentWithinOutstanding(amount, outstanding);
+      if (withinErr) {
+        throw Object.assign(new Error(withinErr), { httpStatus: 400 });
+      }
+
+      const [inserted] = await tx.insert(paymentsTable).values({
+        billId,
+        amount: String(amount),
+        method,
+        referenceNumber: referenceNumber ?? null,
+        notes: notes ?? null,
+        recordedByName: actorName || null,
+      }).returning();
+
+      const paid = moneyAdd(bill.paidAmount, amount);
+      const { balance } = recomputedBillBalance({
+        subtotal: bill.subtotal,
+        discount: bill.discount,
+        tax: bill.taxAmount,
+        paid,
+        refund: bill.refundAmount ?? 0,
+      });
+      const newStatus = balance <= 0 ? "paid" : paid > 0 ? "partial" : bill.status;
+
+      await tx.update(billsTable).set({
+        paidAmount: String(paid),
+        balanceAmount: String(Math.max(0, balance)),
+        status: newStatus,
+      }).where(eq(billsTable.id, billId));
+
+      // Resolve voucher metadata inside the same tx so the HTTP response does
+      // not wait on two extra post-commit SELECTs (collect-payment hot path).
+      const [patientRow] = await tx
+        .select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName })
+        .from(patientsTable)
+        .where(eq(patientsTable.id, bill.patientId))
+        .limit(1);
+
+      return {
+        inserted,
+        paid,
+        billNumber: bill.billNumber,
+        patientName: patientRow ? `${patientRow.firstName} ${patientRow.lastName}`.trim() : null,
+        idempotent: false,
+      };
+    });
+
+    payment = txResult.inserted;
+    newPaidAmount = txResult.paid;
+    voucherBillNumber = txResult.billNumber;
+    voucherPatientName = txResult.patientName;
+
+    if (txResult.idempotent) {
+      res.status(200).json({ ...payment, amount: Number(payment.amount), _idempotent: true });
+      return;
+    }
+  } catch (err: any) {
+    const status = err.httpStatus ?? 500;
+    res.status(status).json({ error: err.message });
+    return;
+  }
+
+  // Auto-generate accounting voucher — async, never blocks payment response
+  if (voucherBillNumber) {
+    autoVoucherForPayment({
+      billId,
+      amount,
+      method,
+      billNumber: voucherBillNumber,
+      patientName: voucherPatientName,
+      performedBy: actorName || null,
+      paymentId: payment.id,
+    }).catch(() => {/* already logged inside */});
+  }
+
+  res.status(201).json({ ...payment, amount: Number(payment.amount) });
+});
+
+// ── Swap a test on an active bill (replaces testId + price, recalculates totals) ──
+// This replaces the old "display name" edit. The new test is selected from the
+// catalog, so commission rules apply correctly to the swapped testId.
+billsRouter.post("/:id/swap-test", async (req: StaffAuthRequest, res) => {
+  const id = Number(req.params.id);
+  const { orderTestId, newTestId, reason, performedBy } = req.body as {
+    orderTestId?: number; newTestId?: number; reason?: string; performedBy?: string;
+  };
+
+  if (!Number.isFinite(id) || !Number.isFinite(orderTestId) || !Number.isFinite(newTestId)) {
+    res.status(400).json({ error: "Invalid bill, orderTest, or newTest id" });
+    return;
+  }
+  if (!reason || !reason.trim()) {
+    res.status(400).json({ error: "Reason is required" });
+    return;
+  }
+  if (!performedBy || !performedBy.trim()) {
+    res.status(401).json({ error: "Staff name required" });
+    return;
+  }
+
+  const txResult = await db.transaction(async (tx) => {
+    // 1) Lock the bill
+    const [bill] = await tx.select().from(billsTable).where(eq(billsTable.id, id)).for("update");
+    if (!bill) throw Object.assign(new Error("Bill not found"), { httpStatus: 404 });
+    if (bill.status === "cancelled") {
+      throw Object.assign(new Error("Bill is cancelled — cannot swap test"), { httpStatus: 409 });
+    }
+
+    // 2) Find the orderTest row
+    const [otRow] = await tx.select().from(orderTestsTable).where(eq(orderTestsTable.id, orderTestId!));
+    if (!otRow) throw Object.assign(new Error("Order test not found"), { httpStatus: 404 });
+    if (otRow.status === "cancelled") {
+      throw Object.assign(new Error("Cannot swap a cancelled test"), { httpStatus: 409 });
+    }
+    if (otRow.orderId !== bill.orderId) {
+      throw Object.assign(new Error("Order test does not belong to this bill"), { httpStatus: 400 });
+    }
+
+    // 3) Fetch the new test
+    const [newTest] = await tx.select().from(testsTable).where(eq(testsTable.id, newTestId!));
+    if (!newTest) throw Object.assign(new Error("New test not found in catalog"), { httpStatus: 404 });
+    if (!newTest.isActive) {
+      throw Object.assign(new Error("New test is inactive"), { httpStatus: 400 });
+    }
+
+    const oldTestName = otRow.displayName || (await tx.select({ name: testsTable.name }).from(testsTable).where(eq(testsTable.id, otRow.testId)).then(r => r[0]?.name ?? "Unknown"));
+    const oldPrice = paiseToRupees(rupeesToPaise(otRow.price));
+    const newPrice = paiseToRupees(rupeesToPaise(newTest.price));
+    const priceDiff = moneySub(newPrice, oldPrice);
+
+    // 4) Update the orderTest row with new testId and price
+    await tx.update(orderTestsTable).set({
+      testId: newTestId,
+      price: newPrice.toFixed(2),
+      displayName: null, // clear any old override
+    }).where(eq(orderTestsTable.id, orderTestId!));
+
+    // 5) Recalculate order total
+    const allTests = await tx.select().from(orderTestsTable).where(eq(orderTestsTable.orderId, bill.orderId));
+    const activeTests = allTests.filter((t) => t.status !== "cancelled");
+    const newOrderTotal = activeTests.reduce((s, t) => moneyAdd(s, t.price), 0);
+    await tx.update(ordersTable).set({
+      totalAmount: newOrderTotal.toFixed(2),
+      updatedAt: new Date(),
+    }).where(eq(ordersTable.id, bill.orderId));
+
+    // 6) Recalculate bill — same discount-cap / floor-at-zero / +tax formula
+    // cancel-test and cancel-refund-tests already use below; this endpoint
+    // was missing all three, so swapping to a cheaper test could leave
+    // oldDiscount exceeding the new subtotal and drive totalAmount negative.
+    const oldDiscount = Number(bill.discount);
+    const newSubtotal = newOrderTotal;
+    const newDiscount = moneyMax0(
+      paiseToRupees(Math.min(rupeesToPaise(oldDiscount), rupeesToPaise(newSubtotal))),
+    );
+    const newTotal = billTotalFromParts(newSubtotal, newDiscount, bill.taxAmount);
+    const paidAmount = Number(bill.paidAmount);
+    const refundAmount = Number(bill.refundAmount || 0);
+
+    // 7) Audit the swap
+    await tx.insert(billAuditsTable).values({
+      billId: id,
+      editedBy: performedBy,
+      reason: reason.trim(),
+      changeType: "test_swapped",
+      oldValue: `${oldTestName} (testId=${otRow.testId}, price=${oldPrice.toFixed(2)})`,
+      newValue: `${newTest.name} (testId=${newTestId}, price=${newPrice.toFixed(2)})`,
+    });
+
+    // 8/9) Settle cash ONLY from bill over/under-payment after the new total —
+    // never from raw line priceDiff. Unpaid USG₹1500 → X-ray₹1000 must NOT
+    // invent a ₹500 cash refund; paid bills only refund excess paid > newTotal.
+    // Price increases leave balance due (no auto cash collection).
+    let extraPayment: { amount: number; method: string; paymentId: number } | null = null;
+    let refundInfo: { amount: number; method: string; paymentId: number } | null = null;
+    let nextPaid = paidAmount;
+    let nextRefund = refundAmount;
+
+    const excessPaise = rupeesToPaise(paidAmount) - rupeesToPaise(newTotal);
+    if (excessPaise > 1) {
+      const refundAmt = paiseToRupees(excessPaise);
+      const method = (req.body.refundMethod as string) || "cash";
+      const [refundRow] = await tx.insert(paymentsTable).values({
+        billId: id,
+        amount: `-${refundAmt.toFixed(2)}`,
+        method,
+        notes: `Refund for test swap: ${oldTestName} → ${newTest.name}`,
+        recordedByName: performedBy,
+      }).returning();
+      refundInfo = { amount: refundAmt, method, paymentId: refundRow.id };
+      nextRefund = moneyAdd(refundAmount, refundAmt);
+      nextPaid = moneyMax0(moneySub(paidAmount, refundAmt));
+
+      await tx.insert(billAuditsTable).values({
+        billId: id,
+        editedBy: performedBy,
+        reason: reason.trim(),
+        changeType: "refund_processed",
+        oldValue: `paid=₹${paidAmount.toFixed(2)}`,
+        newValue: `refund=₹${refundAmt.toFixed(2)} via ${method} (test swap excess)`,
+      });
+    }
+
+    const newBalance = billBalanceFromParts(newTotal, nextPaid, nextRefund);
+    const newStatus = rupeesToPaise(newBalance) <= 1 && rupeesToPaise(nextPaid) > 0
+      ? "paid"
+      : rupeesToPaise(nextPaid) > 0
+        ? "partial"
+        : "pending";
+
+    await tx.update(billsTable).set({
+      subtotal: newSubtotal.toFixed(2),
+      discount: newDiscount.toFixed(2),
+      totalAmount: newTotal.toFixed(2),
+      paidAmount: nextPaid.toFixed(2),
+      refundAmount: nextRefund.toFixed(2),
+      balanceAmount: newBalance.toFixed(2),
+      status: newStatus,
+      updatedAt: new Date(),
+    }).where(eq(billsTable.id, id));
+
+    return {
+      billId: id,
+      oldTestName,
+      oldPrice,
+      newTestName: newTest.name,
+      newPrice,
+      priceDiff,
+      extraPayment,
+      refundInfo,
+      newTotal,
+      newBalance,
+      paidAmount: nextPaid,
+      refundAmount: nextRefund,
+    };
+  }).catch((err: Error & { httpStatus?: number }) => {
+    if (err.httpStatus) {
+      res.status(err.httpStatus).json({ error: err.message });
+      return null;
+    }
+    throw err;
+  });
+
+  if (!txResult) return;
+
+  // 10) Best-effort auto-voucher for the payment/refund
+  if (txResult.extraPayment || txResult.refundInfo) {
+    const [billForVoucher] = await db.select({ billNumber: billsTable.billNumber, patientId: billsTable.patientId }).from(billsTable).where(eq(billsTable.id, id));
+    if (billForVoucher) {
+      const [patientRow] = await db.select({ firstName: patientsTable.firstName, lastName: patientsTable.lastName }).from(patientsTable).where(eq(patientsTable.id, billForVoucher.patientId));
+      const info = txResult.extraPayment || txResult.refundInfo;
+      if (info) {
+        autoVoucherForPayment({
+          billId: id,
+          amount: txResult.extraPayment ? info.amount : -info.amount,
+          method: info.method,
+          billNumber: billForVoucher.billNumber,
+          patientName: patientRow ? `${patientRow.firstName} ${patientRow.lastName}`.trim() : null,
+          performedBy: performedBy || null,
+          paymentId: info.paymentId,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  // 11) System audit log
+  await auditFromRequest(req as unknown as Request, {
+    userId: req.staffSession?.subjectId ?? null,
+    userName: performedBy || "system",
+    role: req.staffSession?.role ?? "system",
+    action: "edit",
+    module: "billing",
+    entityType: "bill",
+    entityId: String(id),
+    oldValue: JSON.stringify({ test: txResult.oldTestName, price: txResult.oldPrice }),
+    newValue: JSON.stringify({ test: txResult.newTestName, price: txResult.newPrice }),
+    reason: reason?.trim(),
+  });
+
+  res.json(await buildBill(await db.select().from(billsTable).where(eq(billsTable.id, id)).then(r => r[0]!)));
+});
+
+// ─── ICICI Billing Desk Gateway Integration ────────────────────────────────────
+import { PaymentEngine } from "../lib/payments/PaymentEngine";
+import { initiateIciciOrangePayment, buildIciciOrangePayQrUrl } from "../lib/payments/initiateIciciOrangePayment";
+import { resolveActiveGateway } from "../lib/payments/resolveActiveGateway";
+import { resolveBillDeskCollector } from "../lib/payments/resolveBillDeskCollector";
+import { paymentLogsTable } from "@workspace/db/schema";
+import crypto from "node:crypto";
+import { logger } from "../lib/logger";
+
+// POST /api/bills/:id/initiate-gateway-payment
+billsRouter.post("/:id/initiate-gateway-payment", async (req: StaffAuthRequest, res): Promise<void> => {
+  const id = Number(req.params.id);
+  const { amount: requestedAmount, expiryMinutes = 30 } = req.body || {};
+  const initiatedByName = req.staffSession?.subjectName?.trim() || "";
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, id)).limit(1);
+  if (!bill) {
+    res.status(404).json({ error: "Bill not found" });
+    return;
+  }
+
+  if (bill.status === "paid") {
+    res.status(400).json({ error: "Bill is already fully paid" });
+    return;
+  }
+
+  const collectAmount = requestedAmount !== undefined ? Number(requestedAmount) : Number(bill.balanceAmount);
+  if (!collectAmount || collectAmount <= 0 || collectAmount > Number(bill.balanceAmount)) {
+    res.status(400).json({ error: "Invalid payment amount requested" });
+    return;
+  }
+
+  const [patient] = await db.select().from(patientsTable).where(eq(patientsTable.id, bill.patientId)).limit(1);
+  const patientName = patient ? `${patient.firstName} ${patient.lastName}`.trim() : "VALUED PATIENT";
+  const patientPhone = (patient?.phone || "9973497200").trim();
+  const patientEmail = (patient?.email || "").trim();
+
+  // Generate unique transaction reference
+  const txnRef = `BILLPAY-${id}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+  
+  // Calculate expiry
+  const expiryTime = expiryMinutes && expiryMinutes > 0
+    ? new Date(Date.now() + expiryMinutes * 60 * 1000)
+    : null;
+
+  try {
+    const [settings] = await db.select().from(clinicSettingsTable).where(eq(clinicSettingsTable.id, 1)).limit(1);
+    const activeGateway = resolveActiveGateway(settings || {}) || settings?.activePaymentGateway || "icici";
+
+    // Same ICICI initiate path + return URL as webpage online booking (icici-initiate).
+    const result = await initiateIciciOrangePayment({
+      bookingRef: txnRef,
+      name: patientName,
+      phone: patientPhone,
+      email: patientEmail,
+      amount: collectAmount,
+      activeGateway,
+      reqHeaders: {
+        "x-forwarded-for": (req.headers["x-forwarded-for"] as string) || "",
+        "user-agent": (req.headers["user-agent"] as string) || "",
+        referer: (req.headers["referer"] as string) || (req.headers["referrer"] as string) || "",
+        origin: (req.headers["origin"] as string) || "",
+        "x-client-ip": req.ip || req.socket?.remoteAddress || "",
+      },
+    });
+
+    if (!result.success) {
+      res.status(400).json({ error: "Could not initiate ICICI payment. Please try again.", details: result.errorMessage });
+      return;
+    }
+
+    // Persist redirectUrl + expiry so the public QR bridge
+    // (GET /api/public/booking/icici-pay/:txnRef) can send phones onto the
+    // ICICI HPP after they first land on caredeoghar.com (domain whitelist).
+    let existingPayload: Record<string, unknown> = {};
+    try {
+      const [row] = await db.select({ requestPayload: paymentLogsTable.requestPayload })
+        .from(paymentLogsTable)
+        .where(eq(paymentLogsTable.bookingRef, txnRef))
+        .limit(1);
+      if (row?.requestPayload) existingPayload = JSON.parse(row.requestPayload);
+    } catch {
+      existingPayload = {};
+    }
+    // Persist the initiating cashier so poll / callback / S2S settle paths
+    // credit Bill Desk online collections to that staff member (not Super Admin).
+    await db.update(paymentLogsTable)
+      .set({
+        requestPayload: JSON.stringify({
+          ...existingPayload,
+          redirectUrl: result.redirectUrl,
+          ...(initiatedByName ? { initiatedByName } : {}),
+          ...(expiryTime ? { expiryTime: expiryTime.toISOString(), expiryMinutes } : {}),
+        }),
+      })
+      .where(eq(paymentLogsTable.bookingRef, txnRef));
+
+    const qrPayUrl = buildIciciOrangePayQrUrl(txnRef);
+
+    res.json({
+      success: true,
+      txnRef,
+      amount: collectAmount,
+      redirectUrl: result.redirectUrl,
+      /** Encode this in the customer QR — caredeoghar.com bridge, not raw ICICI. */
+      qrPayUrl,
+      tranCtx: result.rawResponse?.tranCtx,
+      expiryTime,
+    });
+  } catch (err: any) {
+    logger.error({ err, billId: id }, "Gateway payment initiation failed");
+    res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+// GET /api/bills/gateway-payment-status/:txnRef
+billsRouter.get("/gateway-payment-status/:txnRef", async (req: StaffAuthRequest, res): Promise<void> => {
+  const txnRef = String(req.params.txnRef || "").trim();
+  if (!txnRef) {
+    res.status(400).json({ error: "Transaction reference is required" });
+    return;
+  }
+
+  const [logRecord] = await db.select()
+    .from(paymentLogsTable)
+    .where(eq(paymentLogsTable.bookingRef, txnRef))
+    .limit(1);
+
+  if (!logRecord) {
+    res.status(404).json({ error: "Transaction log not found" });
+    return;
+  }
+
+  // Check if expired
+  let isExpired = false;
+  try {
+    const payload = JSON.parse(logRecord.requestPayload || "{}");
+    if (payload.expiryTime && new Date(payload.expiryTime) < new Date()) {
+      isExpired = true;
+      if (logRecord.status === "initiated" || logRecord.status === "verifying") {
+        await db.update(paymentLogsTable)
+          .set({ status: "expired" })
+          .where(eq(paymentLogsTable.id, logRecord.id));
+      }
+    }
+  } catch (err) {
+    // Two distinct failures were being swallowed here: a malformed stored
+    // requestPayload, and a failed status→"expired" UPDATE. The latter leaves
+    // the payment log stuck in "initiated"/"verifying" forever, so the row is
+    // never reconciled. Expiry detection is still best-effort (the response
+    // below is unaffected), but the failure is no longer invisible.
+    req.log?.warn?.({ err, txnRef, logId: logRecord.id }, "Payment-log expiry check failed");
+  }
+
+  if (isExpired) {
+    res.json({ status: "expired", amount: Number(logRecord.amount) });
+    return;
+  }
+
+  if (logRecord.status === "success") {
+    res.json({ status: "success", amount: Number(logRecord.amount) });
+    return;
+  }
+
+  if (logRecord.status === "failed") {
+    res.json({ status: "failed", amount: Number(logRecord.amount), error: logRecord.errorMessage });
+    return;
+  }
+
+  // If status is initiated or verifying, query ICICI status to reconcile
+  const parts = txnRef.split("-");
+  const billId = Number(parts[1]);
+  if (!billId || Number.isNaN(billId)) {
+    res.json({ status: logRecord.status, amount: Number(logRecord.amount) });
+    return;
+  }
+
+  const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, billId)).limit(1);
+  if (!bill) {
+    res.json({ status: logRecord.status, amount: Number(logRecord.amount) });
+    return;
+  }
+
+  try {
+    const gateway = logRecord.gateway || "icici";
+    const provider = await PaymentEngine.getProvider(gateway);
+    const verification = await PaymentEngine.verifyPayment(
+      gateway,
+      {
+        bookingRef: txnRef,
+        payload: {},
+      },
+      logRecord.patientName,
+      Number(logRecord.amount)
+    );
+
+    if (verification.success && verification.status === "paid") {
+      // Reconcile and save payment
+      await db.transaction(async (tx) => {
+        const [lockedBill] = await tx
+          .select()
+          .from(billsTable)
+          .where(eq(billsTable.id, billId))
+          .for("update")
+          .limit(1);
+        if (!lockedBill) return;
+        if (lockedBill.status === "cancelled") {
+          logger.warn(
+            { billId, txnRef },
+            "Online payment poll refused settlement — bill is cancelled (terminal)",
+          );
+          return;
+        }
+
+        // F1 canonical idempotency: match our merchant reference in either
+        // identifier column so a payment recorded by the S2S webhook
+        // (including pre-F1 rows keyed by the provider txnID) dedupes here.
+        const [existingPayment] = await tx.select()
+          .from(paymentsTable)
+          .where(and(
+            eq(paymentsTable.billId, billId),
+            or(
+              eq(paymentsTable.referenceNumber, txnRef),
+              eq(paymentsTable.gatewayTxnId, txnRef),
+            ),
+          ))
+          .limit(1);
+
+        if (!existingPayment) {
+          const collectAmount = Number(logRecord.amount);
+          const collectorName = resolveBillDeskCollector({
+            requestPayload: logRecord.requestPayload,
+            sessionName: req.staffSession?.subjectName,
+            billCreatedByName: lockedBill.createdByName,
+          });
+          const [insertedPayment] = await tx.insert(paymentsTable).values({
+            billId,
+            amount: collectAmount.toFixed(2),
+            method: `Online (${provider.displayName})`,
+            referenceNumber: txnRef,
+            settlementStatus: "captured",
+            notes: `Paid online via ${provider.displayName} at Billing Desk.`,
+            recordedByName: collectorName,
+          }).returning();
+
+          const newPaid = Number(lockedBill.paidAmount) + collectAmount;
+          const refundAmount = Number(lockedBill.refundAmount || 0);
+          const newBalance = Math.max(0, Number(lockedBill.totalAmount) - newPaid - refundAmount);
+          const newStatus = newBalance <= 0.01 ? "paid" : "partial";
+          await tx.update(billsTable).set({
+            paidAmount: newPaid.toFixed(2),
+            balanceAmount: newBalance.toFixed(2),
+            status: newStatus,
+            updatedAt: new Date(),
+          }).where(eq(billsTable.id, billId));
+
+          autoVoucherForPayment({
+            billId,
+            amount: collectAmount,
+            method: "Online (ICICI Orange Pay)",
+            billNumber: lockedBill.billNumber,
+            patientName: logRecord.patientName,
+            performedBy: collectorName,
+            paymentId: insertedPayment.id,
+          }).catch(() => {});
+        }
+      });
+
+      res.json({ status: "success", amount: Number(logRecord.amount) });
+      return;
+    }
+  } catch (err: any) {
+    logger.error({ err, txnRef }, "Error checking dynamic gateway status");
+  }
+
+  res.json({ status: logRecord.status, amount: Number(logRecord.amount) });
+});
+
+// GET /api/bills/gateway-stats
+billsRouter.get("/gateway-stats", async (req, res): Promise<void> => {
+  try {
+    const stats = await db.select({
+      status: paymentLogsTable.status,
+      count: sql<number>`count(*)`,
+    })
+    .from(paymentLogsTable)
+    .where(like(paymentLogsTable.bookingRef, "BILLPAY-%"))
+    .groupBy(paymentLogsTable.status);
+
+    const result = {
+      pending: 0,
+      success: 0,
+      failed: 0,
+      expired: 0,
+    };
+
+    for (const row of stats) {
+      if (row.status === "initiated" || row.status === "verifying") result.pending += Number(row.count);
+      else if (row.status === "success") result.success += Number(row.count);
+      else if (row.status === "failed") result.failed += Number(row.count);
+      else if (row.status === "expired") result.expired += Number(row.count);
+    }
+
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});

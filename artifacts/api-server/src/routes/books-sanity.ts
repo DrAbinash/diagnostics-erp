@@ -1,0 +1,404 @@
+import { Router } from "express";
+import { db } from "@workspace/db";
+import { sql } from "drizzle-orm";
+import { todayIST } from "../lib/istDate";
+
+export const booksSanityRouter = Router();
+
+export type BooksSanityAnomaly = {
+  category: string;
+  severity: "high" | "medium" | "low";
+  count: number;
+  totalAmount: number;
+  description: string;
+  rows: Record<string, unknown>[];
+};
+
+export type BooksSanityReport = {
+  range: { from: string; to: string };
+  generatedAt: string;
+  periodTotals: Record<string, string | number>;
+  anomalies: BooksSanityAnomaly[];
+};
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Reusable: produces the same payload as GET /api/books-sanity. Called from
+ * both the HTTP route and from the monthly cron snapshot job.
+ *
+ * `from` / `to` are optional ISO YYYY-MM-DD strings; when both are missing the
+ * report covers the last 90 days. Validation must be done by the caller.
+ */
+export async function runBooksSanity(opts: { from: string | null; to: string | null }): Promise<BooksSanityReport> {
+  const { from: fromRaw, to: toRaw } = opts;
+  const dateFilter = fromRaw && toRaw
+    ? sql`b.created_at >= ${fromRaw}::date AND b.created_at < (${toRaw}::date + INTERVAL '1 day')`
+    : sql`b.created_at >= NOW() - INTERVAL '90 days'`;
+
+  const anomalies: BooksSanityAnomaly[] = [];
+
+  // ── 1. Cancelled bill, but order_tests still active (commission leak) ──────
+  const leak = await db.execute(sql`
+    SELECT b.id, b.bill_number, b.total_amount, b.cancelled_at, b.cancelled_by_name,
+           COUNT(ot.id) AS active_tests
+      FROM bills b
+      JOIN order_tests ot ON ot.order_id = b.order_id
+     WHERE b.status = 'cancelled' AND ot.status <> 'cancelled' AND ${dateFilter}
+     GROUP BY b.id, b.bill_number, b.total_amount, b.cancelled_at, b.cancelled_by_name
+     ORDER BY b.cancelled_at DESC
+  `);
+  if (leak.rows.length > 0) {
+    anomalies.push({
+      category: "Commission leak: cancelled bills with active tests",
+      severity: "high",
+      count: leak.rows.length,
+      totalAmount: leak.rows.reduce((s, r) => s + Number(r.total_amount ?? 0), 0),
+      description: "These bills are cancelled in the books but their order_tests rows are still 'active', so the referral commission report keeps paying the doctor on them. The May 2026 cascade-fix + backfill closes this on creation; rows shown here either pre-date the fix or were edited manually.",
+      rows: leak.rows,
+    });
+  }
+
+  // ── 2. Total != subtotal − discount + tax (arithmetic drift) ───────────────
+  const arith = await db.execute(sql`
+    SELECT b.id, b.bill_number, b.subtotal, b.discount, b.tax_amount, b.total_amount,
+           ROUND((b.subtotal - b.discount + b.tax_amount - b.total_amount)::numeric, 2) AS diff
+      FROM bills b
+     WHERE ABS(b.subtotal - b.discount + b.tax_amount - b.total_amount) > 0.01
+       AND ${dateFilter}
+     ORDER BY ABS(b.subtotal - b.discount + b.tax_amount - b.total_amount) DESC
+     LIMIT 200
+  `);
+  if (arith.rows.length > 0) {
+    anomalies.push({
+      category: "Arithmetic drift: total ≠ subtotal − discount + tax",
+      severity: "high",
+      count: arith.rows.length,
+      totalAmount: arith.rows.reduce((s, r) => s + Math.abs(Number(r.diff ?? 0)), 0),
+      description: "The bill's stored total does not equal subtotal − discount + tax. Usually the result of a super-admin edit that did not propagate.",
+      rows: arith.rows,
+    });
+  }
+
+  // ── 3. paid_amount ≠ SUM(payments.amount) (payment ledger drift) ───────────
+  const paySum = await db.execute(sql`
+    SELECT b.id, b.bill_number, b.paid_amount, COALESCE(SUM(p.amount), 0) AS sum_payments,
+           ROUND((b.paid_amount - COALESCE(SUM(p.amount), 0))::numeric, 2) AS diff
+      FROM bills b
+      LEFT JOIN payments p ON p.bill_id = b.id
+     WHERE ${dateFilter}
+     GROUP BY b.id, b.bill_number, b.paid_amount
+    HAVING ABS(b.paid_amount - COALESCE(SUM(p.amount), 0)) > 0.01
+     ORDER BY ABS(b.paid_amount - COALESCE(SUM(p.amount), 0)) DESC
+     LIMIT 200
+  `);
+  if (paySum.rows.length > 0) {
+    anomalies.push({
+      category: "Payment ledger drift: paid_amount ≠ Σ(payments)",
+      severity: "high",
+      count: paySum.rows.length,
+      totalAmount: paySum.rows.reduce((s, r) => s + Math.abs(Number(r.diff ?? 0)), 0),
+      description: "The bill's stored paid_amount does not match the sum of payment rows for that bill (refunds count as negative). Indicates a payment was inserted/edited/deleted without the bill being recomputed.",
+      rows: paySum.rows,
+    });
+  }
+
+  // ── 4. Cancelled bill still showing positive paid_amount (un-refunded) ─────
+  const unrefunded = await db.execute(sql`
+    SELECT b.id, b.bill_number, b.total_amount, b.paid_amount, b.refund_amount,
+           b.cancelled_at, b.cancelled_by_name
+      FROM bills b
+     WHERE b.status = 'cancelled' AND b.paid_amount > 0.01 AND ${dateFilter}
+     ORDER BY b.cancelled_at DESC
+     LIMIT 200
+  `);
+  if (unrefunded.rows.length > 0) {
+    anomalies.push({
+      category: "Cancelled-but-not-refunded: money still on the books",
+      severity: "medium",
+      count: unrefunded.rows.length,
+      totalAmount: unrefunded.rows.reduce((s, r) => s + Number(r.paid_amount ?? 0), 0),
+      description: "These bills are cancelled but the patient's payment was never refunded — the original Receipt voucher still sits in revenue. Use Cancel & Refund to auto-issue a Payment voucher in one step.",
+      rows: unrefunded.rows,
+    });
+  }
+
+  // ── 5. Discount > 50% (manual override worth reviewing) ────────────────────
+  const bigDisc = await db.execute(sql`
+    SELECT b.id, b.bill_number, b.subtotal, b.discount, b.created_by_name,
+           ROUND((b.discount * 100.0 / NULLIF(b.subtotal, 0))::numeric, 2) AS pct
+      FROM bills b
+     WHERE b.discount > 0 AND b.subtotal > 0
+       AND (b.discount * 100.0 / NULLIF(b.subtotal, 0)) > 50
+       AND ${dateFilter}
+     ORDER BY (b.discount / NULLIF(b.subtotal, 0)) DESC
+     LIMIT 200
+  `);
+  if (bigDisc.rows.length > 0) {
+    anomalies.push({
+      category: "High discount (>50% of subtotal)",
+      severity: "low",
+      count: bigDisc.rows.length,
+      totalAmount: bigDisc.rows.reduce((s, r) => s + Number(r.discount ?? 0), 0),
+      description: "Bills where the applied discount exceeds 50% of subtotal. Usually approved by an admin but worth a CA spot-check.",
+      rows: bigDisc.rows,
+    });
+  }
+
+  // ── 6. Super-admin / override audit trail ──────────────────────────────────
+  const sEdits = await db.execute(sql`
+    SELECT ba.id, ba.bill_id, ba.edited_by, ba.reason, ba.change_type,
+           ba.old_value, ba.new_value, ba.created_at, b.bill_number
+      FROM bill_audits ba
+      LEFT JOIN bills b ON b.id = ba.bill_id
+     WHERE ba.change_type IN ('subtotal','taxAmount','totalAmount','deleted','subtotal_mismatch_warning','discount_override_warning')
+       AND ba.created_at >= COALESCE((${fromRaw})::date, NOW() - INTERVAL '90 days')
+       AND ba.created_at <  COALESCE((${toRaw})::date + INTERVAL '1 day', NOW() + INTERVAL '1 day')
+     ORDER BY ba.created_at DESC
+     LIMIT 500
+  `);
+  if (sEdits.rows.length > 0) {
+    anomalies.push({
+      category: "Super-admin / override audit trail",
+      severity: "low",
+      count: sEdits.rows.length,
+      totalAmount: 0,
+      description: "Every super-admin edit, deletion, and discount-override warning recorded in the period. Provided as-is for the CA's manual review.",
+      rows: sEdits.rows,
+    });
+  }
+
+  // ── F2: positive payments with no accounting voucher ──────────────────────
+  // A payment is vouchered iff a voucher links it via payment_id OR a receipt
+  // voucher on the same bill matches its amount (legacy real-time vouchers).
+  // Superseded (F1-voided) payments are excluded. Surfaces any gap left by a
+  // failed capture-time voucher — the counterpart to the sync backfill.
+  const paymentDateFilter = fromRaw && toRaw
+    ? sql`p.created_at >= ${fromRaw}::date AND p.created_at < (${toRaw}::date + INTERVAL '1 day')`
+    : sql`p.created_at >= NOW() - INTERVAL '90 days'`;
+  const noVoucher = await db.execute(sql`
+    SELECT p.id, p.bill_id, b.bill_number, p.amount, p.method, p.created_at
+      FROM payments p
+      LEFT JOIN bills b ON b.id = p.bill_id
+     WHERE p.amount > 0
+       AND COALESCE(p.settlement_status, '') <> 'superseded'
+       AND ${paymentDateFilter}
+       AND NOT EXISTS (SELECT 1 FROM vouchers v WHERE v.payment_id = p.id)
+       AND NOT EXISTS (
+         SELECT 1 FROM vouchers v
+          WHERE v.bill_id = p.bill_id AND v.type = 'receipt'
+            AND v.payment_id IS NULL
+            AND ROUND(v.amount, 2) = ROUND(p.amount, 2)
+       )
+     ORDER BY p.created_at DESC
+     LIMIT 500
+  `);
+  if (noVoucher.rows.length > 0) {
+    anomalies.push({
+      category: "Payments without an accounting voucher",
+      severity: "high",
+      count: noVoucher.rows.length,
+      totalAmount: noVoucher.rows.reduce((s, r) => s + Number(r.amount ?? 0), 0),
+      description: "Positive payments in the period with no receipt voucher (neither payment_id-linked nor amount-matched). Run Accounting → Sync from Billing to voucher them.",
+      rows: noVoucher.rows,
+    });
+  }
+
+  // ── F2: vouchers linked to a payment that no longer exists (orphans) ──────
+  const orphanVouchers = await db.execute(sql`
+    SELECT v.id, v.voucher_number, v.amount, v.payment_id, v.bill_id, v.date
+      FROM vouchers v
+     WHERE v.payment_id IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.id = v.payment_id)
+     ORDER BY v.id DESC
+     LIMIT 500
+  `);
+  if (orphanVouchers.rows.length > 0) {
+    anomalies.push({
+      category: "Vouchers linked to a missing payment",
+      severity: "medium",
+      count: orphanVouchers.rows.length,
+      totalAmount: orphanVouchers.rows.reduce((s, r) => s + Number(r.amount ?? 0), 0),
+      description: "Receipt vouchers whose payment_id points to a payment row that no longer exists. Investigate before the next Tally export.",
+      rows: orphanVouchers.rows,
+    });
+  }
+
+  // ── Period totals ──────────────────────────────────────────────────────────
+  const periodTotals = await db.execute(sql`
+    SELECT
+      COUNT(*)                                           AS bill_count,
+      COALESCE(SUM(b.subtotal), 0)                       AS subtotal_sum,
+      COALESCE(SUM(b.discount), 0)                       AS discount_sum,
+      COALESCE(SUM(b.tax_amount), 0)                     AS tax_sum,
+      COALESCE(SUM(b.total_amount), 0)                   AS total_sum,
+      COALESCE(SUM(b.paid_amount), 0)                    AS paid_sum,
+      COALESCE(SUM(b.refund_amount), 0)                  AS refund_sum,
+      COALESCE(SUM(b.balance_amount), 0)                 AS balance_sum,
+      SUM(CASE WHEN b.status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+      COALESCE(SUM(CASE WHEN b.status = 'cancelled' THEN b.total_amount ELSE 0 END), 0) AS cancelled_amount
+      FROM bills b
+     WHERE ${dateFilter}
+  `);
+
+  return {
+    range: {
+      from: fromRaw ?? "(last 90 days)",
+      to: toRaw ?? todayIST(),
+    },
+    generatedAt: new Date().toISOString(),
+    periodTotals: (periodTotals.rows[0] ?? {}) as Record<string, string | number>,
+    anomalies,
+  };
+}
+
+booksSanityRouter.get("/", async (req, res) => {
+  const fromRaw = typeof req.query.from === "string" ? req.query.from : null;
+  const toRaw = typeof req.query.to === "string" ? req.query.to : null;
+  if ((fromRaw && !ISO_DATE.test(fromRaw)) || (toRaw && !ISO_DATE.test(toRaw))) {
+    res.status(400).json({ error: "from/to must be YYYY-MM-DD" });
+    return;
+  }
+  if (fromRaw && toRaw && fromRaw > toRaw) {
+    res.status(400).json({ error: "'from' must be on or before 'to'" });
+    return;
+  }
+  const report = await runBooksSanity({ from: fromRaw, to: toRaw });
+  res.json(report);
+});
+
+/**
+ * POST /api/books-sanity/run-backfill
+ *
+ * One-shot backfill that restores total_amount = original_total and
+ * recalculates balance_amount = total - paid - refund for all refunded bills
+ * where total_amount was mutated by the old (buggy) refund logic.
+ *
+ * Query params:
+ *   ?confirm=true   — actually apply the UPDATE (default: dry-run preview only)
+ *
+ * Safe and idempotent — if no rows match the WHERE clause, returns 0 affected.
+ * The WHERE clause only touches bills where total ≠ original_total AND refund > 0.
+ *
+ * Auth: Super Admin (applied at router level in index.ts).
+ *
+ * Usage from browser/curl:
+ *   GET  /api/books-sanity/run-backfill           → dry-run preview
+ *   POST /api/books-sanity/run-backfill?confirm=true → apply fix
+ */
+booksSanityRouter.get("/run-backfill", async (req, res): Promise<void> => {
+  // Dry-run: show what WOULD be affected
+  const preview = await db.execute<{
+    id: number;
+    bill_number: string;
+    current_total: string;
+    original_total: string;
+    refund_amount: string;
+    paid_amount: string;
+    balance_amount: string;
+    status: string;
+    drift: string;
+  }>(sql`
+    SELECT
+      id,
+      bill_number,
+      total_amount::numeric        AS current_total,
+      original_total::numeric      AS original_total,
+      refund_amount::numeric       AS refund_amount,
+      paid_amount::numeric         AS paid_amount,
+      balance_amount::numeric      AS balance_amount,
+      status,
+      ROUND((original_total::numeric - total_amount::numeric)::numeric, 2) AS drift
+    FROM bills
+    WHERE refund_amount::numeric > 0
+      AND ABS(total_amount::numeric - original_total::numeric) > 0.01
+    ORDER BY id
+  `);
+
+  res.json({
+    mode: "dry-run",
+    affected: preview.rows.length,
+    message: preview.rows.length === 0
+      ? "✅ Nothing to fix — all refunded bills have correct total_amount."
+      : `${preview.rows.length} bill(s) will be corrected. POST with ?confirm=true to apply.`,
+    bills: preview.rows,
+  });
+});
+
+booksSanityRouter.post("/run-backfill", async (req, res): Promise<void> => {
+  const confirm = req.query.confirm === "true";
+
+  if (!confirm) {
+    // Dry-run
+    const preview = await db.execute<{
+      id: number; bill_number: string; current_total: string;
+      original_total: string; refund_amount: string; drift: string;
+    }>(sql`
+      SELECT id, bill_number,
+        total_amount::numeric AS current_total,
+        original_total::numeric AS original_total,
+        refund_amount::numeric AS refund_amount,
+        ROUND((original_total::numeric - total_amount::numeric)::numeric, 2) AS drift
+      FROM bills
+      WHERE refund_amount::numeric > 0
+        AND ABS(total_amount::numeric - original_total::numeric) > 0.01
+      ORDER BY id
+    `);
+    res.json({
+      mode: "dry-run",
+      affected: preview.rows.length,
+      message: preview.rows.length === 0
+        ? "✅ Nothing to fix."
+        : `${preview.rows.length} bill(s) need correction. Add ?confirm=true to apply.`,
+      bills: preview.rows,
+    });
+    return;
+  }
+
+  // Apply in a transaction
+  try {
+    const result = await db.transaction(async (tx) => {
+      const updated = await tx.execute<{
+        id: number; bill_number: string; total_amount: string;
+        balance_amount: string; status: string;
+      }>(sql`
+        UPDATE bills
+        SET
+          total_amount    = original_total,
+          balance_amount  = GREATEST(0, original_total::numeric - paid_amount::numeric - refund_amount::numeric),
+          updated_at      = NOW()
+        WHERE refund_amount::numeric > 0
+          AND ABS(total_amount::numeric - original_total::numeric) > 0.01
+        RETURNING id, bill_number, total_amount, balance_amount, status
+      `);
+
+      // Verify zero drift
+      const verify = await tx.execute<{ remaining: string }>(sql`
+        SELECT COUNT(*)::text AS remaining
+        FROM bills
+        WHERE refund_amount::numeric > 0
+          AND ABS(total_amount::numeric - original_total::numeric) > 0.01
+      `);
+      const remaining = parseInt(verify.rows[0]?.remaining ?? "0", 10);
+      if (remaining > 0) {
+        throw new Error(`${remaining} bills still have drift after update — rolling back`);
+      }
+
+      return updated.rows;
+    });
+
+    res.json({
+      mode: "applied",
+      affected: result.length,
+      message: result.length === 0
+        ? "✅ Nothing to fix — all bills were already correct."
+        : `✅ ${result.length} bill(s) corrected and verified. Zero drift remaining.`,
+      bills: result,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "Backfill failed (rolled back): " + msg });
+  }
+});
+
+export default booksSanityRouter;

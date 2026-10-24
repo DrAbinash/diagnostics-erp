@@ -1,0 +1,500 @@
+/**
+ * normalBootstrap.ts — one-time complete-normal-report auto-bootstrap resolver.
+ *
+ * Ports the `usg-reports` product behaviour the clinic asked for:
+ *   OPEN STUDY → appropriate COMPLETE NORMAL REPORT already present
+ *   → radiologist records only deviations → relevant normal yields (slot engine)
+ *   → untouched structures remain normal → Impression stays synchronized.
+ *
+ * This module ONLY decides *which existing Full Report Format* (if any) may be
+ * auto-applied to a genuinely NEW, EMPTY report. It never applies anything
+ * itself and never invents content — application goes through the existing
+ * `applyFormatById` path (identical to a radiologist clicking the format).
+ *
+ * Safety rules (all must hold — "do NOT guess"):
+ *   1. Modality whitelist: MR / CT / XR only (DX/CR/IO map to XR). US/MG never
+ *      auto-bootstrap (mammography is not used at this clinic; US has its own
+ *      companion flow).
+ *   2. Candidates are COMPLETE NORMAL reports only:
+ *        - name carries the word "Normal" or "Screening", AND
+ *        - no pathology term is ASSERTED in findings/impression (a pathology
+ *          term in the same sentence as a denial — "No disc bulge" — is fine).
+ *      A whole-report format that describes Fazekas, bulges, stenosis… can
+ *      never auto-apply: abnormalities are the radiologist's job (canonical
+ *      ledger), never the bootstrap's.
+ *   3. Canonical region must match the resolved ReportingStudyContext region.
+ *   4. Protocol disambiguation by explicit markers only:
+ *        contrast / post-contrast / gadolinium / CE-MRI → contrast variant
+ *        epilepsy / seizure → epilepsy-protocol normal
+ *        screening / whole spine → screening variant
+ *        orbit → orbit limited screening
+ *        plain, or no marker → plain variant (clinical convention: contrast
+ *        studies are always explicitly documented; plain is the default)
+ *      A contrast-marked study with no contrast variant → NO bootstrap.
+ *   5. Exactly one survivor after filtering (same-identity duplicates collapse
+ *      deterministically). Anything else → null (manual Start Report / picker).
+ *
+ * Pure functions only — no store, no React, no network.
+ */
+
+import type { ReportFormat } from "./types";
+import {
+  coverageExceeds,
+  formatDocumentedCoverage,
+} from "@workspace/report-quality";
+import { documentedCoverageCeiling } from "@/lib/regionTransition";
+import { canonicalContentRegion } from "@/lib/reportingStudyContext";
+import type { ReportingStudyContext } from "@/lib/reportingStudyContext";
+
+/** Modalities whose studies may auto-bootstrap (MRI / CT / X-ray scope). */
+const BOOTSTRAP_MODALITIES = new Set(["MR", "CT", "XR"]);
+
+/** DICOM / worklist modality codes normalised onto the format catalog codes. */
+export function bootstrapModality(raw: string | null | undefined): string | null {
+  const u = (raw ?? "").toUpperCase().trim();
+  if (!u) return null;
+  if (u === "MR" || u === "MRI") return "MR";
+  if (u === "CT") return "CT";
+  if (u === "XR" || u === "XRAY" || u === "X-RAY" || u === "DX" || u === "CR" || u === "IO") return "XR";
+  return null;
+}
+
+/** Pathology terms that must be DENIED in-sentence for a normal candidate. */
+const ASSERTED_PATHOLOGY_TERMS = [
+  "fazekas", "infarct", "ischemi", "hemorrhage", "haemorrhage", "hematoma",
+  "haematoma", "hydrocephalus", "herniation", "hernia", "bulge", "protrusion",
+  "prolapse", "fracture", "spondylolisthesis", "anterolisthesis", "retrolisthesis",
+  "spondylodiscitis", "discitis", "degenerative", "desiccation", "stenosis",
+  "myelopathy", "demyelination", "plaque", "granuloma", "tumor", "tumour",
+  "glioma", "recurrence", "carcinoma", "nodule", "mass lesion", "space-occupying",
+  "edema", "oedema", "effusion", "consolidation", "pneumothorax", "calculus",
+  "calculi", "cholelithiasis", "listhesis", "gliosis", "compression collapse",
+];
+
+/** Denial words in the same sentence as a pathology term → term is negated. */
+const DENIAL_RE =
+  /\b(no|without|absence of|absent|not identified|not seen|noted\? no|free of|no evidence|no definite|no obvious|no apparent|no focal|no significant|no abnormal|no intra|no extra|none|unremarkable|negative|maintained|patent|preserved|intact|normal|symmetrical|symmetric)\b/i;
+
+/** Marker regexes for protocol disambiguation. */
+const CONTRAST_RE = /contrast|gadolin|gadobutrol|post.?contrast|ce.?mri|c\.?e\.?mri/i;
+const PLAIN_RE = /\bplain\b|non.?contrast|without contrast/i;
+const EPILEPSY_RE = /epilep|seizure/i;
+const STROKE_RE = /stroke|acute.?infarct|dwi.?protocol/i;
+const SCREENING_RE = /screen|whole.?spine|wbv/i;
+const ORBIT_RE = /orbit/i;
+
+/** True when `text` asserts a pathology (term present, not denied in-sentence). */
+function assertsPathology(text: string): boolean {
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/).filter((s) => s.trim());
+  for (const sentence of sentences) {
+    const lower = sentence.toLowerCase();
+    for (const term of ASSERTED_PATHOLOGY_TERMS) {
+      if (!lower.includes(term)) continue;
+      if (DENIAL_RE.test(sentence)) continue; // negated in the same sentence
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a format is a COMPLETE NORMAL report that may auto-apply.
+ * Screening normals are allowed (they ARE complete normal reports) — but only
+ * if their body actually reads normal (the pathological "screening" complete
+ * cases like the degenerative LS+Whole-Spine variant fail the assertion check).
+ *
+ * A Templates-screen row is named after the examination ("MRI LS Spine"), not
+ * after its normality, so the name test is replaced by the completeness test:
+ * both findings and impression must carry prose. Asserted pathology still
+ * disqualifies it — that check is the one that matters.
+ */
+export function isNormalBootstrapCandidate(
+  format: Pick<ReportFormat, "name" | "findings" | "impression" | "diagnosisTags" | "protocolScope" | "structuredTemplateId">,
+): boolean {
+  const name = (format.name ?? "").toLowerCase();
+  const isNormalish = /\bnormal\b/.test(name) || /\bscreening\b/.test(name);
+  if (format.structuredTemplateId != null) {
+    if (!(format.findings ?? "").trim()) return false;
+    if (!(format.impression ?? "").trim()) return false;
+  } else if (!isNormalish) {
+    return false;
+  }
+  const body = `${format.findings ?? ""}\n${format.impression ?? ""}`;
+  if (assertsPathology(body)) return false;
+  return true;
+}
+
+export type NormalBootstrapInput = {
+  /** Resolved study context (region / regions must be resolved, not "unresolved"). */
+  ctx: Pick<ReportingStudyContext, "modality" | "region" | "regions" | "protocolName" | "studyDescription" | "source">;
+  /** Loaded Full Report Format library (store list at call time). */
+  formats: ReportFormat[];
+  /**
+   * ADR-004's recorded region transitions, oldest first — the same provenance that
+   * makes a recorded move outrank a region CARE read by itself (#967) and that puts
+   * the documented region on the paper (#970). Only the LAST readable record is
+   * consulted, and it caps which formats may be chosen: a report moved to one
+   * segment must not open with a template that speaks for the segments it retired.
+   * Absent, empty or unreadable means no recorded decision, so nothing is capped —
+   * and neither is anything capped when `ctx.source` is `override`, which is the
+   * radiologist re-declaring the examination in front of CARE.
+   */
+  records?: readonly { toRegion?: string | null }[] | null;
+};
+
+export type NormalBootstrapDecision =
+  | {
+    status: "apply";
+    format: ReportFormat;
+    /** Human-readable basis, surfaced in the toast / tests. */
+    basis: string;
+  }
+  | {
+    /** Identity resolved but no unique safe candidate — keep manual flow. */
+    status: "no-match" | "ambiguous";
+    reason: string;
+  };
+
+function regionKeys(ctx: Pick<ReportingStudyContext, "region" | "regions">): string[] {
+  const raw = (ctx.regions?.length ? ctx.regions : ctx.region ? [ctx.region] : []).filter(Boolean);
+  return [...new Set(raw.map((r) => canonicalContentRegion(r).toLowerCase()))];
+}
+
+/**
+ * Resolve the one complete-normal format that may auto-apply for this study.
+ * Returns a decision; the caller enforces the NEW + EMPTY one-time guards.
+ *
+ * `null` means "not decidable yet" (identity unresolved or library empty) —
+ * callers may retry when the context / library resolves.
+ */
+/**
+ * The billed exam name is what the radiologist means by "this study".
+ * Fold it into the description the normal-format resolver already reads
+ * (contrast, screening, epilepsy) without changing the resolved region.
+ */
+export function billedStudyContextForNormal<T extends { studyDescription?: string | null }>(
+  ctx: T,
+  billedTestName: string | null | undefined,
+): T {
+  const billed = (billedTestName ?? "").trim();
+  if (!billed) return ctx;
+  const desc = (ctx.studyDescription ?? "").trim();
+  if (desc.toLowerCase().includes(billed.toLowerCase())) return ctx;
+  return { ...ctx, studyDescription: desc ? `${billed}. ${desc}` : billed };
+}
+
+/**
+ * The name the centre billed for this row, as a radiologist would say it.
+ *
+ * The reading-queue filter can hide the open study's row (deep link, filter
+ * change, other-modality study); the by-id detail read always carries the same
+ * identity fields, so it is consulted as the second source. The queue row
+ * wins whenever it is present — the two describe the same study — and each
+ * field falls through independently (testName → billedTestName → description).
+ */
+export function billedNameFromWorklistRow(
+  row: {
+    testName?: string | null;
+    billedTestName?: string | null;
+    studyDescription?: string | null;
+  } | null | undefined,
+  detail?: {
+    testName?: string | null;
+    billedTestName?: string | null;
+    studyDescription?: string | null;
+  } | null | undefined,
+): string | null {
+  const first = (a: string | null | undefined, b: string | null | undefined): string | null =>
+    (a && a.trim()) || (b && b.trim()) || null;
+  const testName = first(row?.testName, detail?.testName);
+  if (testName) return testName;
+  const billed = first(row?.billedTestName, detail?.billedTestName);
+  if (billed) return billed;
+  return first(row?.studyDescription, detail?.studyDescription);
+}
+
+/** Doctor-facing result of pressing Quick Normal. `applied` means a format was chosen. */
+export function quickNormalOutcomeMessage(decision: NormalBootstrapDecision | null): {
+  applied: boolean;
+  title: string;
+  description: string;
+} {
+  if (decision == null) {
+    return {
+      applied: false,
+      title: "This exam is not identified yet",
+      description: "Set the study region, then press Quick Normal again.",
+    };
+  }
+  if (decision.status === "apply") {
+    return {
+      applied: true,
+      title: decision.format.name,
+      description: "Technique, findings, impression, and recommendation now match this exam.",
+    };
+  }
+  if (decision.status === "ambiguous") {
+    return {
+      applied: false,
+      title: "More than one normal report matches",
+      description: "Choose the format in Starting Canvas.",
+    };
+  }
+  return {
+    applied: false,
+    title: "No normal report for this exam",
+    description: "Choose a format in Starting Canvas.",
+  };
+}
+
+export function resolveNormalBootstrapFormat(input: NormalBootstrapInput): NormalBootstrapDecision | null {
+  const { ctx, formats } = input;
+  if (formats.length === 0) return null; // library not loaded yet — caller may retry
+
+  const modality = bootstrapModality(ctx.modality);
+  if (!modality) {
+    return { status: "no-match", reason: `modality ${ctx.modality ?? "?"} not in MR/CT/XR scope` };
+  }
+  const keys = regionKeys(ctx);
+  if (keys.length === 0 || !ctx.region) {
+    return null; // identity not resolved yet — caller may retry when it resolves
+  }
+
+  const hay = `${ctx.protocolName ?? ""} ${ctx.studyDescription ?? ""}`.trim();
+
+  // 1. Modality + canonical region + complete-normal-only candidates.
+  let candidates = formats.filter((f) => {
+    if (bootstrapModality(f.modality) !== modality) return false;
+    const bp = canonicalContentRegion(f.bodyPart).toLowerCase() || (f.bodyPart ?? "").toLowerCase();
+    if (!keys.includes(bp)) return false;
+    return isNormalBootstrapCandidate(f);
+  });
+  if (candidates.length === 0) {
+    return { status: "no-match", reason: "no complete-normal format for this region in the library" };
+  }
+
+  // 1.5 A recorded region move caps what the report may document.
+  //
+  // `candidates` are already limited to the resolved region, but a format's own
+  // sentences can reach further than its region tag: the shipped
+  // "MRI Cervical Spine with Whole Spine Screening" row is a Cervical body part
+  // whose findings speak for the dorsal and lumbosacral spine. That is correct for
+  // the examination it was authored for. It is not correct for a report the
+  // radiologist has recorded as narrowed — those segments were retired, each
+  // retired line named in the transition record — and applying the row would put
+  // them back on the page without anyone deciding they should be there.
+  //
+  // The ceiling is what a human has decided this report documents: for an explicit region
+  // choice, the chosen regions themselves; for an automatic reading, what the current
+  // reading and the last recorded move AGREE on — an intersection, so a record can only
+  // ever narrow. See `documentedCoverageCeiling` for both arms and for why unioning the
+  // two, which is what this rule first did, excluded nothing at all.
+  //
+  // No record, or one CARE cannot read, caps nothing on an automatic reading: the
+  // examination's own declaration (how this resolver has always chosen a screening normal)
+  // stands, and a study nobody has re-regioned resolves exactly as it did before this rule.
+  const recordedRegion = (input.records?.length
+    ? input.records[input.records.length - 1]?.toRegion
+    : "")?.trim() ?? "";
+  const ceiling = documentedCoverageCeiling({
+    source: ctx.source,
+    regions: ctx.regions.length ? ctx.regions : [ctx.region],
+    records: input.records,
+  });
+  if (ceiling) {
+    const withinRecordedRegion = candidates.filter((f) => !coverageExceeds(formatDocumentedCoverage(f), ceiling));
+    if (withinRecordedRegion.length === 0) {
+      // Refusing is the safe answer: the alternative is a report that documents
+      // anatomy this study's own record says it no longer describes.
+      const outside = ctx.source === "override"
+        ? `the region chosen for this report (${(ctx.regions[0] ?? ctx.region ?? "").trim()})`
+        : `the recorded move to ${recordedRegion}`;
+      return {
+        status: "no-match",
+        reason: `every normal format for this region also documents anatomy outside ${outside}`,
+      };
+    }
+    candidates = withinRecordedRegion;
+  }
+
+  // 2. Protocol markers narrow the candidate set.
+  const wantsContrast = CONTRAST_RE.test(hay) && !PLAIN_RE.test(hay);
+  const wantsEpilepsy = EPILEPSY_RE.test(hay);
+  const wantsStroke = STROKE_RE.test(hay);
+  const wantsScreening = SCREENING_RE.test(hay);
+  const wantsOrbit = ORBIT_RE.test(hay);
+
+  const name = (f: ReportFormat) => (f.name ?? "").toLowerCase();
+  const isContrastVariant = (f: ReportFormat) => /contrast/.test(name(f)) || /contrast/i.test(f.protocolScope ?? "");
+  const isScreeningVariant = (f: ReportFormat) => /screening/.test(name(f)) || /screening/i.test(f.protocolScope ?? "");
+  const isEpilepsyVariant = (f: ReportFormat) => /epilep/.test(name(f)) || EPILEPSY_RE.test(f.protocolScope ?? "");
+  const isStrokeVariant = (f: ReportFormat) => /stroke/.test(name(f)) || STROKE_RE.test(f.protocolScope ?? "");
+  const isOrbitVariant = (f: ReportFormat) => /orbit/.test(name(f));
+
+  let pool = candidates;
+
+  // Orbit is its own examination — only when the study says orbit.
+  pool = wantsOrbit ? pool.filter((f) => isOrbitVariant(f)) : pool.filter((f) => !isOrbitVariant(f));
+  if (pool.length === 0) return { status: "no-match", reason: "orbit study but no orbit normal format" };
+
+  // Epilepsy protocol normal is its own complete format.
+  if (wantsEpilepsy) {
+    pool = pool.filter((f) => isEpilepsyVariant(f));
+    if (pool.length === 0) return { status: "no-match", reason: "epilepsy protocol without epilepsy normal format" };
+  } else {
+    pool = pool.filter((f) => !isEpilepsyVariant(f));
+  }
+
+  // Stroke protocol likewise: a Templates row for "MRI Brain Stroke Protocol"
+  // is a different examination, and must not tie with the plain brain normal
+  // and leave the study with no auto-open at all.
+  if (wantsStroke) {
+    const stroke = pool.filter((f) => isStrokeVariant(f));
+    if (stroke.length > 0) pool = stroke;
+  } else {
+    pool = pool.filter((f) => !isStrokeVariant(f));
+  }
+
+  // Plain / contrast identity. A contrast-marked study never takes a plain
+  // format (that would mis-document the technique actually performed).
+  if (wantsContrast) {
+    const contrast = pool.filter((f) => isContrastVariant(f));
+    if (contrast.length === 0) {
+      return { status: "no-match", reason: "contrast study but no contrast normal format" };
+    }
+    pool = contrast;
+  } else {
+    const plain = pool.filter((f) => !isContrastVariant(f));
+    if (plain.length === 0) {
+      return { status: "no-match", reason: "plain study but no plain normal format" };
+    }
+    pool = plain;
+  }
+
+  // Screening identity (e.g. "LS + Whole Spine Screening", "Cervical Screening").
+  if (wantsScreening) {
+    const screening = pool.filter((f) => isScreeningVariant(f));
+    // Prefer the most specific screening variant; a non-screening normal is a
+    // fallback only when no screening variant exists (still a complete normal).
+    if (screening.length > 0) pool = screening;
+    else pool = pool.filter((f) => !isScreeningVariant(f));
+  } else if (pool.some((f) => !isScreeningVariant(f))) {
+    // Non-screening study → prefer the detailed/plain normal variant.
+    pool = pool.filter((f) => !isScreeningVariant(f));
+  }
+
+  // Whole-spine study wording is more specific than a lone regional screening
+  // normal (e.g. LS Screening Normal must not win for "LS + Whole Spine Screening").
+  if (/whole\s*spine/i.test(hay)) {
+    const wholeSpineNamed = pool.filter((f) => /whole\s*spine/i.test(f.name ?? ""));
+    if (wholeSpineNamed.length > 0) pool = wholeSpineNamed;
+  }
+
+  // A Templates-screen row outranks every built-in copy of the same exam: it is
+  // the wording the radiologist edits, so it is the wording that must print.
+  // This runs BEFORE the curated-baseline narrowing, which knows only about
+  // formats authored in code and would otherwise discard the row.
+  //
+  // It only outranks a row that OWNS its anatomy. Measured in the browser three
+  // times on this box's own clinic library: the "MRI Brain Plain" row won this
+  // rule with eight prose sentences and no `baselineManifest`, and the retirement
+  // engine — which suppresses a normal by the ledger row that speaks for it — then
+  // had nothing to attribute those sentences to. Selecting the Fazekas 1 tile left
+  // "No periventricular white matter signal change." and "No focal intraparenchymal
+  // signal abnormality." printed underneath the sentence that says periventricular
+  // lesions exist, in the same Findings block. An un-owned row is still the
+  // radiologist's own wording and still applies when they choose it (Starting
+  // Canvas / Templates); what it may no longer do is take the scaffold away from
+  // an examination whose curated baseline knows which normal each abnormality
+  // falsifies. Ownership travels with the curated baseline's name only when the
+  // row's sentences still match it — see `baselineManifestForFormat`.
+  const onScreen = pool.filter((f) => f.structuredTemplateId != null
+    && f.baselineManifest?.kind === "care.full_report_baseline.v1");
+  if (onScreen.length > 0) pool = onScreen;
+
+  // Within the correctly resolved protocol identity, curated versioned
+  // baselines outrank legacy prose-only normals.
+  const owned = pool.filter((f) => f.baselineManifest?.kind === "care.full_report_baseline.v1");
+  if (owned.length > 0) pool = owned;
+
+  // 3. Exactly one survivor. Same-identity duplicates (local cache + server
+  // copy of one format) collapse deterministically to the first.
+  const dedupe = new Set(pool.map((f) => `${f.name}|${f.modality}|${canonicalContentRegion(f.bodyPart)}`));
+  if (pool.length === 1 || dedupe.size === 1) {
+    const f = pool[0]!;
+    return {
+      status: "apply",
+      format: f,
+      basis: `${f.modality} ${canonicalContentRegion(f.bodyPart) || f.bodyPart} — ${f.name}`,
+    };
+  }
+
+  return { status: "ambiguous", reason: `${pool.length} competing normal formats for this identity` };
+}
+
+// ─── Baseline format identity (save / reopen) ────────────────────────────────
+//
+// `usg-reports` persists the whole composer state; CARE's equivalent for the
+// normal-baseline concept is a small identity record in the structured_json
+// envelope (`careReportFormatIdentity`) so a saved report reopens with its
+// baseline format banner intact and can never be re-bootstrapped.
+
+export const CARE_REPORT_FORMAT_IDENTITY_KIND = "care.report_format_identity.v1";
+
+export type CareReportFormatIdentity = {
+  kind: typeof CARE_REPORT_FORMAT_IDENTITY_KIND;
+  /** Full Report Format name (stable identity across local/server format ids). */
+  name: string;
+  /** Printed exam-identity title from the format, when it carried one. */
+  reportTitle?: string;
+  /** ISO timestamp of when the baseline was applied. */
+  appliedAt: string;
+  /** Server/local row id at apply time (advisory; name remains stable identity). */
+  formatId?: string;
+  /** Deterministic clinical-content revision. */
+  formatRevision?: string;
+  /** Curated baseline ownership contract. */
+  baselineManifestVersion?: number;
+  baselineManifestRevision?: string;
+};
+
+export function buildCareReportFormatIdentity(input: {
+  name: string;
+  reportTitle?: string | null;
+  formatId?: string | null;
+  formatRevision?: string | null;
+  baselineManifestVersion?: number | null;
+  baselineManifestRevision?: string | null;
+}): CareReportFormatIdentity {
+  return {
+    kind: CARE_REPORT_FORMAT_IDENTITY_KIND,
+    name: input.name.trim(),
+    ...(input.reportTitle?.trim() ? { reportTitle: input.reportTitle.trim() } : {}),
+    ...(input.formatId?.trim() ? { formatId: input.formatId.trim() } : {}),
+    ...(input.formatRevision?.trim() ? { formatRevision: input.formatRevision.trim() } : {}),
+    ...(input.baselineManifestVersion != null
+      ? { baselineManifestVersion: input.baselineManifestVersion }
+      : {}),
+    ...(input.baselineManifestRevision?.trim()
+      ? { baselineManifestRevision: input.baselineManifestRevision.trim() }
+      : {}),
+    appliedAt: new Date().toISOString(),
+  };
+}
+
+function isReportFormatIdentity(v: unknown): v is CareReportFormatIdentity {
+  if (typeof v !== "object" || v === null) return false;
+  const rec = v as Record<string, unknown>;
+  return rec.kind === CARE_REPORT_FORMAT_IDENTITY_KIND && typeof rec.name === "string" && rec.name.trim() !== "";
+}
+
+/** Read the persisted baseline format identity from a draft structured_json column. */
+export function extractCareReportFormatIdentity(column: unknown): CareReportFormatIdentity | null {
+  if (!column || typeof column !== "object") return null;
+  const rec = column as Record<string, unknown>;
+  if (isReportFormatIdentity(rec)) return rec;
+  if (isReportFormatIdentity(rec.careReportFormatIdentity)) {
+    return rec.careReportFormatIdentity as CareReportFormatIdentity;
+  }
+  return null;
+}

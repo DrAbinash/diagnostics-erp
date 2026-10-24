@@ -1,0 +1,79 @@
+# =============================================================================
+# Docker build-context exclusions (Synology disk + transfer safety)
+#
+# Keep this list LIMITED to confirmed non-build inputs. The Dockerfile does
+# `COPY . .` then `pnpm install` / package builds / migrations — do NOT exclude
+# workspace packages, lockfiles, migrations/, lib/db/, scripts/, version.json,
+# docker/, tests, or other runtime/build assets.
+#
+# Note: bare globs like *.zip only match the context root in the classic
+# builder; use **/ for nested paths.
+# =============================================================================
+
+**/node_modules
+**/dist
+**/.cache
+**/.turbo
+**/.expo
+**/.expo-shared
+**/.replit-artifact
+
+# Git metadata — but NOT the refs. scripts/build-identity.mjs resolves the commit
+# an image was really built from out of .git/HEAD + .git/refs, because GIT_COMMIT
+# arrives from .env and only deploy-synology.sh refreshes .env, so a Container
+# Manager rebuild re-stamps NEW code with the OLD SHA. Objects, config and index
+# stay excluded: a build needs to name its commit, not to replay its history.
+# `!.git/refs/**` is spelled out beside `!.git/refs` because the two builder
+# generations differ on whether re-including a directory re-includes its children;
+# scripts/buildIdentity.test.mjs pins all four lines, and a context that ends up
+# without refs degrades to `identitySource: "build-arg-declared"` — which
+# verify-deployed-identity.mjs refuses to report as a verified deploy.
+.git/*
+!.git/HEAD
+!.git/refs
+!.git/refs/**
+!.git/packed-refs
+.github
+
+# IDE / local agent noise
+.idea
+.vscode
+.local
+.cursor
+.cache
+
+# Secrets / local env (never bake into images)
+.env
+.env.*
+
+# Logs and OS junk (anywhere in the tree)
+**/*.log
+**/desktop.ini
+**/Thumbs.db
+**/*.bak
+**/*~
+**/*.tmp
+**/*.temp
+**/*.swp
+**/*.swo
+
+# Owner-confirmed non-product MRI report archive (Windows PC only)
+mri-reports/
+
+# Release bundles / exported archives (not pnpm/Docker build inputs)
+releases/
+project.tar.gz
+project.zip
+**/*.tar.gz
+**/*.zip
+
+# Docs already excluded historically (not required for image build)
+attached_assets/screenshots
+README-WINDOWS.md
+DEPLOY.md
+replit.md
+.replit
+
+# Quarantined Super Admin folders to keep docker builds trace-free
+artifacts/super-admin-portal
+__super_admin_quarantine

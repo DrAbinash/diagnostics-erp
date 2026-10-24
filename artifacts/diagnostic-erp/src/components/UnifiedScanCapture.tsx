@@ -1,0 +1,660 @@
+/**
+ * UnifiedScanCapture.tsx — the ONE shared document-capture entry point for
+ * Care Diagnostics, reusable by Form F, Patient Registration, Expenses, and
+ * Banking. This is a UI-unification layer over already-working mechanisms —
+ * it introduces no new scanning logic:
+ *
+ *   - "Scan with TVS PDS 8M" -> getUserMedia against an admin-confirmed
+ *                              preferred deviceId (tvsDeviceProfile.ts),
+ *                              with a fixed-focus placement guide + live
+ *                              blur check. Only shown once an admin has
+ *                              bound a device in Scanner Settings — see the
+ *                              hardware-status note in tvsDeviceProfile.ts:
+ *                              this path has NOT been physically verified
+ *                              against a real TVS PDS 8M yet.
+ *   - "Existing Scanner"  -> scanBridgeClient.ts -> workstation Scanner Bridge
+ *                            (Canon / WIA / SANE flatbed — untouched, unaffected)
+ *   - "Upload Image or PDF" -> the same file-picker/drag-drop pattern used by
+ *                              DocumentScanCapture.tsx and ScanIdButton.tsx
+ *   - "Mobile Scan"        -> the existing /api/scan-sessions QR/phone flow
+ *   - "Webcam"             -> getUserMedia, generic device list, shown only
+ *                              when a camera is actually available (secure-
+ *                              context checked)
+ *
+ * Capture-only: resolves to raw bytes + light metadata, never OCR results.
+ * Each caller keeps calling its own existing OCR/save endpoint with the
+ * returned blob — this component does not know about Form F fields, expense
+ * categories, or any other module-specific shape.
+ */
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link } from "wouter";
+import QRCode from "qrcode";
+import { api } from "@/lib/fetchApi";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { useToast } from "@/hooks/use-toast";
+import { Camera, Scan, Smartphone, Upload, X, RefreshCcw, Loader2, ScanLine } from "lucide-react";
+import { checkScanBridgeHealth, scanBridgeCaptureWithFallback, scanBridgeOpenApp, type ScanBridgeState } from "@/lib/scanBridgeClient";
+import PlacementGuideOverlay from "@/components/PlacementGuideOverlay";
+import { computeBlurScore, getPreferredTvsDeviceId, getPreferredTvsDeviceLabel, BLUR_WARNING_THRESHOLD } from "@/lib/tvsDeviceProfile";
+import { classifyCameraError, isSecureCameraContext as checkSecureCameraContext, watchForDeviceDisconnect, type CameraDiagnostic } from "@/lib/cameraDiagnostics";
+
+export type ScanModule = "form-f" | "patients" | "expenses" | "banking";
+export type ScanDocType = "id-card" | "bill" | "bank-statement" | "photo" | "other";
+export type ScanSource = "bridge" | "upload" | "mobile" | "webcam" | "tvs";
+
+export type ScanSide = "front" | "back";
+
+export interface ScanCaptureResult {
+  file: Blob;
+  mimeType: string;
+  source: ScanSource;
+  deviceLabel?: string;
+  filename?: string;
+  /** Which side of a two-sided document this capture is for. Callers that
+   *  don't distinguish sides can ignore it; it defaults to "front". */
+  side: ScanSide;
+}
+
+export interface UnifiedScanCaptureProps {
+  module: ScanModule;
+  docType: ScanDocType;
+  triggerLabel?: string;
+  className?: string;
+  /** Fixes which side every capture from this trigger targets. Lets a caller
+   *  render one trigger per side (e.g. "Scan Front" / "Scan Back"), each
+   *  offering the full set of capture methods. Defaults to "front". */
+  side?: ScanSide;
+  /** Custom trigger renderer. Receives a `launch` fn — call it to start capture.
+   *  When provided it replaces the default outlined Button, so a caller can
+   *  embed the trigger as a styled card/tile (see IdScanCapturePanel). */
+  renderTrigger?: (launch: () => void) => ReactNode;
+  /** Skip the in-dialog method picker and go straight into one method.
+   *  "upload"/"bridge" need no viewfinder, so they run without opening the
+   *  dialog at all; "webcam"/"tvs"/"mobile" open the dialog on that view. */
+  autoStart?: ScanSource;
+  /** When opening the method chooser, highlight this option first (clinic default). */
+  preferredSource?: ScanSource;
+  onCapture: (result: ScanCaptureResult) => void;
+  onError?: (message: string) => void;
+}
+
+const ACCEPTED_UPLOAD_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "application/pdf"];
+const MOBILE_QR_LABEL: Record<ScanModule, string> = {
+  "form-f": "Form F document",
+  patients: "patient document",
+  expenses: "expense bill",
+  banking: "bank document",
+};
+
+export default function UnifiedScanCapture({
+  module,
+  docType,
+  triggerLabel = "Scan Document",
+  className = "",
+  side = "front",
+  renderTrigger,
+  autoStart,
+  preferredSource,
+  onCapture,
+  onError,
+}: UnifiedScanCaptureProps) {
+  const { toast } = useToast();
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<"select" | "webcam" | "tvs" | "mobile">("select");
+  // Native file pickers steal focus; Radix Dialog would otherwise dismiss itself
+  // before the user chooses a file or cancels. Hold the dialog open until then.
+  const pickingFileRef = useRef(false);
+
+  // ── Scanner Bridge health ──
+  const [bridgeState, setBridgeState] = useState<ScanBridgeState>("not-running");
+  const [bridgeBusy, setBridgeBusy] = useState(false);
+  // Poll bridge health while mounted (Form F bridge tiles + in-dialog status).
+  useEffect(() => {
+    let active = true;
+    async function poll() {
+      const health = await checkScanBridgeHealth();
+      if (active) setBridgeState(health.state);
+    }
+    poll();
+    const t = setInterval(poll, 5000);
+    return () => { active = false; clearInterval(t); };
+  }, [open]);
+
+  async function handleBridgeCapture() {
+    setBridgeBusy(true);
+    try {
+      let raw = await scanBridgeCaptureWithFallback();
+      if (!raw.ok || !raw.imageBase64) {
+        if (raw.fallback === "folder-watch") {
+          const opened = await scanBridgeOpenApp();
+          if (opened.ok) {
+            throw new Error(`${raw.error || "Scan failed"}. Scanner software opened — scan the document, then click again to import.`);
+          }
+        }
+        throw new Error(raw.error || "Scan failed");
+      }
+      const blob = base64ToBlob(raw.imageBase64, raw.mimeType || "image/jpeg");
+      onCapture({ file: blob, mimeType: raw.mimeType || "image/jpeg", source: "bridge", filename: raw.filename, deviceLabel: "Workstation Scanner", side });
+      setOpen(false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Scanner bridge failed";
+      onError?.(msg);
+      toast({ title: "Scanner error", description: msg, variant: "destructive" });
+    } finally {
+      setBridgeBusy(false);
+    }
+  }
+
+  // ── Upload ──
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  function openFilePicker() {
+    pickingFileRef.current = true;
+    // After the OS picker closes (choose or cancel), clear the guard once the
+    // window regains focus. Change events for a chosen file also clear it.
+    const clearGuard = () => {
+      window.setTimeout(() => { pickingFileRef.current = false; }, 400);
+      window.removeEventListener("focus", clearGuard);
+    };
+    window.addEventListener("focus", clearGuard);
+    fileInputRef.current?.click();
+  }
+  function handleFileChosen(file: File | null) {
+    pickingFileRef.current = false;
+    if (!file) return;
+    if (!ACCEPTED_UPLOAD_TYPES.includes(file.type)) {
+      const msg = "Unsupported file type. Use JPEG, PNG, WebP, HEIC, or PDF.";
+      onError?.(msg);
+      toast({ title: "Unsupported file", description: msg, variant: "destructive" });
+      return;
+    }
+    onCapture({ file, mimeType: file.type, source: "upload", filename: file.name, side });
+    setOpen(false);
+  }
+
+  // ── Webcam ──
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const isSecureCameraContext = checkSecureCameraContext();
+
+  // TVS PDS 8M — see tvsDeviceProfile.ts for the hardware-status caveat.
+  // Only shown once an admin has bound a deviceId in Scanner Settings.
+  const [tvsDeviceId] = useState(() => getPreferredTvsDeviceId());
+  const [tvsDeviceLabel] = useState(() => getPreferredTvsDeviceLabel());
+  const [blurScore, setBlurScore] = useState<number | null>(null);
+  const blurIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [cameraDiagnostic, setCameraDiagnostic] = useState<CameraDiagnostic | null>(null);
+  const stopDisconnectWatchRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (!open || !isSecureCameraContext) return;
+    navigator.mediaDevices.enumerateDevices()
+      .then((devices) => setCameras(devices.filter((d) => d.kind === "videoinput")))
+      .catch(() => setCameras([]));
+  }, [open, isSecureCameraContext]);
+
+  function stopWebcam() {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (blurIntervalRef.current) {
+      clearInterval(blurIntervalRef.current);
+      blurIntervalRef.current = null;
+    }
+    stopDisconnectWatchRef.current?.();
+    stopDisconnectWatchRef.current = null;
+    setBlurScore(null);
+  }
+  useEffect(() => () => stopWebcam(), []);
+
+  async function startCameraStream(target: "webcam" | "tvs", deviceId?: string) {
+    setMode(target);
+    setCameraDiagnostic(null);
+    try {
+      // `ideal` (not `exact`) for resolution — the browser picks the closest
+      // mode the device actually supports rather than failing outright.
+      // Without this, getUserMedia() commonly defaults to a low resolution
+      // (often 640x480) even on an 8MP-capable device like the TVS PDS 8M.
+      // See docs/TVS_PDS_8M_VALIDATION.md — actual supported resolutions on
+      // the real device still need confirming via getCapabilities().
+      const constraints: MediaStreamConstraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 3264 }, height: { ideal: 2448 } }
+          : { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      // Surface a mid-session USB unplug — getUserMedia() itself doesn't
+      // reject in this case, the stream just goes quiet, which otherwise
+      // looks like a frozen preview with no explanation.
+      stopDisconnectWatchRef.current = watchForDeviceDisconnect(stream, (diag) => {
+        setCameraDiagnostic(diag);
+        toast({ title: "Camera disconnected", description: diag.message, variant: "destructive" });
+        setMode("select");
+      });
+      // TVS is fixed-focus — sample a live blur score so staff can reposition
+      // before capturing instead of discovering a blurry image afterward.
+      if (target === "tvs" && videoRef.current && canvasRef.current) {
+        blurIntervalRef.current = setInterval(() => {
+          const video = videoRef.current;
+          const canvas = canvasRef.current;
+          if (!video || !canvas || video.videoWidth === 0) return;
+          // Downsample for speed — blur estimation doesn't need full resolution.
+          const sampleWidth = 240;
+          const scale = sampleWidth / video.videoWidth;
+          canvas.width = sampleWidth;
+          canvas.height = Math.round(video.videoHeight * scale);
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          setBlurScore(computeBlurScore(frame));
+        }, 400);
+      }
+    } catch (e) {
+      const diag = classifyCameraError(e);
+      setCameraDiagnostic(diag);
+      onError?.(diag.message);
+      toast({ title: "Camera failed", description: diag.message, variant: "destructive" });
+      setMode("select");
+    }
+  }
+
+  function captureFrame(source: "webcam" | "tvs", deviceLabel?: string) {
+    if (!videoRef.current) return;
+    const video = videoRef.current;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d")?.drawImage(video, 0, 0);
+    const label =
+      deviceLabel ||
+      (source === "tvs" ? tvsDeviceLabel || "TVS PDS 8M" : cameras.find((c) => streamRef.current?.getVideoTracks()[0]?.label === c.label)?.label || "Webcam");
+    stopWebcam();
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        onCapture({ file: blob, mimeType: "image/jpeg", source, deviceLabel: label, filename: `${source}-capture.jpg`, side });
+        setOpen(false);
+      },
+      "image/jpeg",
+      0.9,
+    );
+  }
+
+  // ── Mobile Scan — reuses the existing scan-sessions flow ──
+  // If a phone is already paired (see ScanIdButton.tsx for the original,
+  // working pattern this mirrors), trigger it directly instead of always
+  // falling back to a fresh QR code the staff member has to re-scan.
+  const [pairedPhone, setPairedPhone] = useState<{ paired: boolean; device?: { deviceName: string } } | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    api
+      .get<{ paired: boolean; device?: { deviceName: string } }>("/api/scan-sessions/paired-phone")
+      .then((data) => { if (active) setPairedPhone(data); })
+      .catch(() => { if (active) setPairedPhone(null); });
+    return () => { active = false; };
+  }, [open]);
+
+  const [sessionToken, setSessionToken] = useState("");
+  const [mobileQrUrl, setMobileQrUrl] = useState("");
+  const [sessionStatus, setSessionStatus] = useState<"pending" | "completed" | "expired" | "">("");
+
+  async function startMobileSession() {
+    setMode("mobile");
+    try {
+      const method = pairedPhone?.paired ? "paired_phone" : "qr";
+      const res = await api.post<{ sessionToken: string }>("/api/scan-sessions/create", { method });
+      setSessionToken(res.sessionToken);
+      setSessionStatus("pending");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not start mobile scan session";
+      onError?.(msg);
+      toast({ title: "Mobile scan failed", description: msg, variant: "destructive" });
+      setMode("select");
+    }
+  }
+
+  useEffect(() => {
+    if (!sessionToken) return;
+    const path = `${window.location.origin}/scan-mobile/${sessionToken}`;
+    QRCode.toDataURL(path, { width: 200, margin: 1 }, (err, url) => { if (!err) setMobileQrUrl(url); });
+  }, [sessionToken]);
+
+  useEffect(() => {
+    if (mode !== "mobile" || !sessionToken || sessionStatus !== "pending") return;
+    let active = true;
+    async function poll() {
+      if (!active) return;
+      try {
+        const data = await api.get<{ status?: string; frontImageUrl?: string; backImageUrl?: string }>(`/api/scan-sessions/status/${sessionToken}`);
+        if (data.status === "completed" && active) {
+          setSessionStatus("completed");
+          // The phone's /scan-mobile flow lets staff capture front AND back in
+          // one session and uploads both in a single request — the session can
+          // carry both frontImageUrl and backImageUrl at once. Previously only
+          // frontImageUrl was ever read here, so a back capture the phone had
+          // already uploaded was silently dropped. For Form F (the only caller
+          // that renders separate Front/Back triggers), deliver whichever of
+          // the two the session actually has, each tagged with ITS OWN real
+          // side — not the fixed `side` prop of whichever tile started this
+          // session — so scanning via either tile still fills both slots when
+          // the phone captured both. Other modules (a single photo, no back
+          // concept) keep the original one-image, prop-side behavior.
+          const deliveries: { url: string; side: ScanSide }[] =
+            module === "form-f"
+              ? [
+                  ...(data.frontImageUrl ? [{ url: data.frontImageUrl, side: "front" as const }] : []),
+                  ...(data.backImageUrl ? [{ url: data.backImageUrl, side: "back" as const }] : []),
+                ]
+              : data.frontImageUrl
+                ? [{ url: data.frontImageUrl, side }]
+                : [];
+          for (const d of deliveries) {
+            try {
+              const resp = await fetch(`/uploads/${d.url}`);
+              const blob = await resp.blob();
+              onCapture({ file: blob, mimeType: blob.type || "image/jpeg", source: "mobile", filename: d.url, side: d.side });
+            } catch {
+              // one side failing to fetch shouldn't block delivering the other
+            }
+          }
+          setOpen(false);
+          return;
+        }
+        if (data.status === "expired" && active) {
+          setSessionStatus("expired");
+          return;
+        }
+      } catch {
+        // transient poll failure — try again
+      }
+      if (active) setTimeout(poll, 1500);
+    }
+    poll();
+    return () => { active = false; };
+  }, [mode, sessionToken, sessionStatus]);
+
+  function resetAndClose() {
+    stopWebcam();
+    setMode("select");
+    setSessionToken("");
+    setMobileQrUrl("");
+    setSessionStatus("");
+    setOpen(false);
+  }
+
+  // Start capture. With `autoStart` set, skip the method picker: upload/bridge
+  // need no viewfinder so they run without opening the dialog; the camera/mobile
+  // methods open the dialog and the effect below launches the right view.
+  function launch() {
+    if (autoStart === "upload") { openFilePicker(); return; }
+    if (autoStart === "bridge") { void handleBridgeCapture(); return; }
+    setOpen(true);
+    setMode("select");
+  }
+
+  function handleDialogOpenChange(nextOpen: boolean) {
+    // Stay open while the native file picker is up — do not auto-close.
+    if (!nextOpen && pickingFileRef.current) return;
+    if (!nextOpen) resetAndClose();
+    else setOpen(true);
+  }
+
+  useEffect(() => {
+    if (!open || !autoStart) return;
+    if (autoStart === "webcam") void startCameraStream("webcam");
+    else if (autoStart === "tvs") void startCameraStream("tvs", tvsDeviceId);
+    else if (autoStart === "mobile") void startMobileSession();
+    // Launch once per open; the capture fns manage their own teardown.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  return (
+    <>
+      {/* Hidden file input lives outside the dialog so an `autoStart="upload"`
+          trigger can open the picker without first opening the dialog. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={ACCEPTED_UPLOAD_TYPES.join(",")}
+        className="hidden"
+        onChange={(e) => {
+          handleFileChosen(e.target.files?.[0] ?? null);
+          e.target.value = "";
+        }}
+      />
+
+      {renderTrigger ? (
+        renderTrigger(launch)
+      ) : (
+        <Button type="button" variant="outline" onClick={launch} className={`gap-1.5 ${className}`}>
+          <Scan size={15} /> {triggerLabel}
+        </Button>
+      )}
+
+      <Dialog open={open} onOpenChange={handleDialogOpenChange}>
+        <DialogContent
+          className="max-w-md"
+          onPointerDownOutside={(e) => { if (pickingFileRef.current) e.preventDefault(); }}
+          onInteractOutside={(e) => { if (pickingFileRef.current) e.preventDefault(); }}
+          onFocusOutside={(e) => { if (pickingFileRef.current) e.preventDefault(); }}
+          onEscapeKeyDown={(e) => { if (pickingFileRef.current) e.preventDefault(); }}
+        >
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-1.5">
+              <Scan size={18} className="text-primary" /> {triggerLabel}
+            </DialogTitle>
+          </DialogHeader>
+
+          {mode === "select" && (
+            <div className="grid grid-cols-1 gap-2.5 pt-2">
+              <p className="text-xs text-muted-foreground -mt-1 mb-0.5">
+                Choose how to capture — this stays open until you finish or cancel.
+              </p>
+              {cameraDiagnostic && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {cameraDiagnostic.message}
+                </div>
+              )}
+              {/* Preferred clinic method first when set */}
+              {preferredSource === "bridge" && (
+                <Button
+                  variant="outline"
+                  onClick={handleBridgeCapture}
+                  disabled={bridgeBusy}
+                  className="h-14 justify-start gap-3 border-primary/30 bg-primary/5 hover:bg-primary/10"
+                >
+                  {bridgeBusy ? <Loader2 size={20} className="animate-spin" /> : <Scan size={20} className={bridgeState === "ok" ? "text-green-600" : "text-primary"} />}
+                  <div className="text-left">
+                    <div className="font-semibold text-sm flex items-center gap-1.5">
+                      Flatbed Scanner
+                      <span className="text-[9px] font-medium uppercase tracking-wide text-primary bg-primary/10 px-1.5 py-0.5 rounded">Default</span>
+                      <div className={`w-1.5 h-1.5 rounded-full ${bridgeState === "ok" ? "bg-green-500 animate-pulse" : "bg-gray-400"}`} />
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      {bridgeState === "ok" ? "Ready — Canon / workstation scanner" : bridgeState === "not-running" ? "Not detected — check Scanner Bridge is running" : "Blocked — check Scanner Settings"}
+                    </div>
+                  </div>
+                </Button>
+              )}
+
+              {tvsDeviceId ? (
+                <Button
+                  variant="outline"
+                  onClick={() => startCameraStream("tvs", tvsDeviceId)}
+                  className={`h-14 justify-start gap-3 ${preferredSource === "tvs" || preferredSource === "webcam" ? "border-primary/30 bg-primary/5 hover:bg-primary/10" : "hover:bg-muted/40"}`}
+                >
+                  <ScanLine size={20} className="text-primary shrink-0" />
+                  <div className="text-left">
+                    <div className="font-semibold text-sm">Scan with TVS PDS 8M</div>
+                    <div className="text-[10px] text-muted-foreground">Preferred device — {tvsDeviceLabel || "configured"}</div>
+                  </div>
+                </Button>
+              ) : (
+                <div className="rounded-lg border border-dashed p-3 text-[11px] text-muted-foreground">
+                  TVS PDS 8M not configured on this workstation yet. An admin can bind it in{" "}
+                  <Link href="/settings?tab=scanner#preferred-scanning-source" className="text-primary underline">Scanner Settings</Link>.
+                </div>
+              )}
+
+              {preferredSource !== "bridge" && (
+                <Button
+                  variant="outline"
+                  onClick={handleBridgeCapture}
+                  disabled={bridgeBusy}
+                  className={`h-14 justify-start gap-3 hover:bg-muted/40 ${bridgeState === "ok" ? "border-green-200 bg-green-50/10" : ""}`}
+                >
+                  {bridgeBusy ? <Loader2 size={20} className="animate-spin" /> : <Scan size={20} className={bridgeState === "ok" ? "text-green-600" : "text-muted-foreground"} />}
+                  <div className="text-left">
+                    <div className="font-semibold text-sm flex items-center gap-1.5">
+                      Flatbed Scanner
+                      <div className={`w-1.5 h-1.5 rounded-full ${bridgeState === "ok" ? "bg-green-500 animate-pulse" : "bg-gray-400"}`} />
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      {bridgeState === "ok" ? "Ready — Canon / workstation scanner" : bridgeState === "not-running" ? "Not detected — check Scanner Bridge is running" : "Blocked — check Scanner Settings"}
+                    </div>
+                  </div>
+                </Button>
+              )}
+
+              <Button variant="outline" onClick={openFilePicker} className="h-14 justify-start gap-3 hover:bg-muted/40">
+                <Upload size={20} className="text-muted-foreground shrink-0" />
+                <div className="text-left">
+                  <div className="font-semibold text-sm">Upload Image or PDF</div>
+                  <div className="text-[10px] text-muted-foreground">Stays open until you choose a file or cancel</div>
+                </div>
+              </Button>
+
+              <Button
+                variant="outline"
+                onClick={startMobileSession}
+                className={`h-14 justify-start gap-3 border-dashed hover:bg-muted/40 ${preferredSource === "mobile" ? "border-primary/30 bg-primary/5" : ""}`}
+              >
+                <Smartphone size={20} className="text-muted-foreground shrink-0" />
+                <div className="text-left">
+                  <div className="font-semibold text-sm flex items-center gap-1.5">
+                    Mobile Scan
+                    {preferredSource === "mobile" && (
+                      <span className="text-[9px] font-medium uppercase tracking-wide text-primary bg-primary/10 px-1.5 py-0.5 rounded">Default</span>
+                    )}
+                    {pairedPhone?.paired && <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {pairedPhone?.paired
+                      ? `Instant trigger — ${pairedPhone.device?.deviceName || "paired phone"}`
+                      : `Scan QR with your phone to capture a ${MOBILE_QR_LABEL[module]}`}
+                  </div>
+                </div>
+              </Button>
+
+              {isSecureCameraContext && cameras.length > 0 && (
+                <Button
+                  variant="outline"
+                  onClick={() => startCameraStream("webcam")}
+                  className={`h-14 justify-start gap-3 hover:bg-muted/40 ${preferredSource === "webcam" ? "border-primary/30 bg-primary/5" : ""}`}
+                >
+                  <Camera size={20} className="text-muted-foreground shrink-0" />
+                  <div className="text-left">
+                    <div className="font-semibold text-sm flex items-center gap-1.5">
+                      Webcam
+                      {preferredSource === "webcam" && !tvsDeviceId && (
+                        <span className="text-[9px] font-medium uppercase tracking-wide text-primary bg-primary/10 px-1.5 py-0.5 rounded">Default</span>
+                      )}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">{cameras.length} camera{cameras.length !== 1 ? "s" : ""} detected on this workstation</div>
+                  </div>
+                </Button>
+              )}
+              {!isSecureCameraContext && (
+                <p className="text-[10px] text-muted-foreground px-1">Webcam capture requires HTTPS (or localhost) — not available on this connection.</p>
+              )}
+            </div>
+          )}
+
+          {mode === "webcam" && (
+            <div className="space-y-2 pt-2">
+              <video ref={videoRef} className="w-full rounded-lg bg-black" playsInline muted />
+              <canvas ref={canvasRef} className="hidden" />
+              <div className="flex gap-2">
+                <Button type="button" onClick={() => captureFrame("webcam")} className="flex-1 gap-1.5">
+                  <Camera size={15} /> Capture
+                </Button>
+                <Button type="button" variant="outline" onClick={() => { stopWebcam(); setMode("select"); }}>
+                  <X size={15} />
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {mode === "tvs" && (
+            <div className="space-y-2 pt-2">
+              <div className="relative rounded-lg overflow-hidden bg-black">
+                <video ref={videoRef} className="w-full" playsInline muted />
+                <PlacementGuideOverlay shape={docType === "bill" || docType === "bank-statement" ? "a4" : "id-card"} blurScore={blurScore} />
+              </div>
+              <canvas ref={canvasRef} className="hidden" />
+              <div className="flex gap-2">
+                <Button type="button" onClick={() => captureFrame("tvs")} className="flex-1 gap-1.5">
+                  <Camera size={15} /> Capture{blurScore !== null && blurScore < BLUR_WARNING_THRESHOLD ? " anyway" : ""}
+                </Button>
+                <Button type="button" variant="outline" onClick={() => { stopWebcam(); setMode("select"); }}>
+                  <X size={15} />
+                </Button>
+              </div>
+              <p className="text-[10px] text-muted-foreground text-center">Fixed-focus camera — hold steady until the guide turns green.</p>
+            </div>
+          )}
+
+          {mode === "mobile" && (
+            <div className="space-y-3 pt-2 text-center">
+              {sessionStatus === "pending" && pairedPhone?.paired && (
+                <>
+                  <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-primary/10">
+                    <Smartphone size={28} className="text-primary" />
+                  </div>
+                  <p className="text-sm font-medium">Scan request sent to {pairedPhone.device?.deviceName || "your paired phone"}.</p>
+                  <p className="text-xs text-muted-foreground">Its camera should open automatically — capture the document there.</p>
+                  <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
+                    <Loader2 size={12} className="animate-spin" /> Waiting for phone…
+                  </div>
+                </>
+              )}
+              {sessionStatus === "pending" && !pairedPhone?.paired && mobileQrUrl && (
+                <>
+                  <img src={mobileQrUrl} alt="Scan QR" className="w-48 h-48 mx-auto rounded-lg border" />
+                  <p className="text-xs text-muted-foreground">Scan this code with your phone's camera to open the mobile capture page.</p>
+                  <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
+                    <Loader2 size={12} className="animate-spin" /> Waiting for phone…
+                  </div>
+                </>
+              )}
+              {sessionStatus === "expired" && (
+                <>
+                  <p className="text-sm text-destructive">Session expired.</p>
+                  <Button size="sm" onClick={startMobileSession} className="gap-1.5">
+                    <RefreshCcw size={13} /> {pairedPhone?.paired ? "Resend to Phone" : "New QR Code"}
+                  </Button>
+                </>
+              )}
+              <Button variant="ghost" size="sm" onClick={() => setMode("select")}>Back</Button>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function base64ToBlob(base64: string, mimeType: string): Blob {
+  const byteChars = atob(base64);
+  const byteNumbers = new Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+  return new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
+}

@@ -1,0 +1,143 @@
+import { describe, it, expect } from "vitest";
+import { existsSync, readFileSync } from "fs";
+import { execFileSync } from "child_process";
+import { join } from "node:path";
+import { generateReportPDF, DEFAULT_PRINT_SETTINGS } from "./reportPdfGenerator";
+import { CARE_LETTERHEAD_LOGO_DATA_URL, CARE_LETTERHEAD_LOGO_SIZE } from "./careLetterheadLogo";
+import { resolveArtifactDir, writeTestArtifact } from "../../../../tests/helpers/resolveTestArtifactDir";
+
+describe("letter-pad PDF preview artifact", () => {
+  it("builds a letter-pad style PDF without browser download", () => {
+    const doc = generateReportPDF(
+      {
+        patientName: "Yashpal Ranjan",
+        age: "42 Y",
+        sex: "M",
+        studyDate: "20260804",
+        referringDoctor: "Dr S K Biswas MD FIAMS",
+        clinicalHistory: "Low backache.",
+        technique: "Multiplanar, multisequence MRI of the lumbosacral spine was performed including T1, T2, and STIR sequences.",
+        findings:
+          "ALIGNMENT & CURVATURE: Straightening / loss of normal lumbar lordosis is noted, likely due to muscular spasm.\n\nL5-S1: Reduced IV disc space with disc desiccation. Mild diffuse disc bulge with anterior ventral thecal sac compression.\n\nVERTEBRAL BODIES: Endplate marrow signal changes at L5-S1 (Modic changes).\n\nCORD / CAUDA EQUINA: Cord terminates at L1-L2. Normal signal.",
+        impression:
+          "Straightening / loss of normal lumbar lordosis, likely due to muscular spasm.\nL5-S1 disc desiccation with mild diffuse bulge causing anterior thecal sac compression.\nModic endplate changes at L5-S1.",
+        recommendation: "Please correlate with clinical findings.",
+        reportTitle: "MRI LUMBOSACRAL (LS) SPINE",
+        accessionNumber: "ACC123",
+      },
+      {
+        ...DEFAULT_PRINT_SETTINGS,
+        // Stale clinic/settings logos must NOT replace the letter-pad brand.
+        header: {
+          ...DEFAULT_PRINT_SETTINGS.header,
+          logo: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        },
+      },
+      {
+        name: "CARE DIAGNOSTICS",
+        address: "WRONG ADDRESS THAT MUST NOT PRINT",
+        phone: "0000000000",
+        email: "care.deoghar@gmail.com",
+        logoDataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      },
+      { save: false },
+    );
+    const bytes = Buffer.from(doc.output("arraybuffer"));
+    const out = join(resolveArtifactDir(), "letterpad-sample.pdf");
+    writeTestArtifact("letterpad-sample.pdf", bytes);
+    expect(existsSync(out)).toBe(true);
+    expect(doc.getNumberOfPages()).toBeGreaterThanOrEqual(1);
+
+    // Extract text layer (avoids false hits inside embedded PNG binary).
+    const text = execFileSync("pdftotext", ["-layout", out, "-"], { encoding: "utf8" });
+    expect(text).toContain("DEOGHAR-814 112");
+    expect(text).toContain("75490 99099");
+    expect(text).toContain("St. Francis School Road");
+    expect(text).toMatch(/DEOGHAR-814 112\s*\n\s*\(JHARKHAND\)/);
+    expect(text).toContain("care.deoghar@gmail.com");
+    expect(text).not.toContain("CARE.DEOGHAR@GMAIL.COM");
+    expect(text).toContain("www.caredeoghar.com");
+    expect(text).not.toContain("WRONG ADDRESS");
+    expect(text).not.toContain("0000000000");
+
+    // Bundled brand PNG must be present and sized for letter-pad aspect.
+    expect(CARE_LETTERHEAD_LOGO_SIZE.width).toBe(1556);
+    expect(CARE_LETTERHEAD_LOGO_SIZE.height).toBe(530);
+    expect(CARE_LETTERHEAD_LOGO_DATA_URL.startsWith("data:image/png;base64,")).toBe(true);
+    expect(bytes.length).toBeGreaterThan(80_000);
+
+    // Public PNG and embedded data URL stay in sync.
+    const publicPng = readFileSync(
+      new URL("../../public/care-diagnostics-letterhead-logo.png", import.meta.url),
+    );
+    expect(CARE_LETTERHEAD_LOGO_DATA_URL).toContain(publicPng.toString("base64").slice(0, 80));
+  });
+
+  it("prints the UHID and accession the workspace has, and no label when it has none", () => {
+    // Read off the PDF's own text operators, so this needs no pdftotext binary.
+    const drawn = (report: Parameters<typeof generateReportPDF>[0]) => {
+      const doc = generateReportPDF(report, DEFAULT_PRINT_SETTINGS, null, { save: false });
+      const pdf = Buffer.from(doc.output("arraybuffer")).toString("latin1");
+      return [...pdf.matchAll(/\(((?:[^()]|\([^)]*\))*)\)\s*Tj/g)].map((m) => m[1]).join(" | ");
+    };
+    const base = {
+      patientName: "Premchand Mandal", age: "4 Y", sex: "M", studyDate: "20260818",
+      referringDoctor: "Dr Tushar Jyoti", findings: "Normal.", impression: "Normal.",
+      reportTitle: "MRI LSPINE",
+    };
+    const withIds = drawn({ ...base, uhid: "UH-2026-000457", accessionNumber: "ACC-8891" });
+    expect(withIds).toContain("UHID: UH-2026-000457");
+    expect(withIds).toContain("ACCESSION: ACC-8891");
+    // The demography the clinic already reads is still there, in the same order.
+    expect(withIds.indexOf("NAME:")).toBeLessThan(withIds.indexOf("AGE/SEX:"));
+    expect(withIds).toContain("REFD. BY:");
+
+    const withoutIds = drawn({ ...base, uhid: "", accessionNumber: "" });
+    expect(withoutIds).not.toContain("UHID:");
+    expect(withoutIds).not.toContain("ACCESSION:");
+    expect(withoutIds).toContain("NAME:");
+
+    // Each cell is gated on its own value. A study that has an accession but no
+    // master-index number must not print "UHID:" followed by nothing, and an
+    // `if (uhid && accession)` gate would silently drop the identifier the
+    // clinic does have — which is the whole point of printing them.
+    const accessionOnly = drawn({ ...base, uhid: "", accessionNumber: "ACC-8891" });
+    expect(accessionOnly).toContain("ACCESSION: ACC-8891");
+    expect(accessionOnly).not.toContain("UHID:");
+    const uhidOnly = drawn({ ...base, uhid: "UH-2026-000457", accessionNumber: "" });
+    expect(uhidOnly).toContain("UHID: UH-2026-000457");
+    expect(uhidOnly).not.toContain("ACCESSION:");
+  });
+
+  it("uses presentation-template letterhead copy when provided", () => {
+    const doc = generateReportPDF(
+      {
+        patientName: "Template Patient",
+        age: "30 Y",
+        sex: "F",
+        studyDate: "20260818",
+        referringDoctor: "Dr Test",
+        findings: "Normal.",
+        impression: "Normal.",
+        reportTitle: "MRI BRAIN",
+      },
+      DEFAULT_PRINT_SETTINGS,
+      { name: "IGNORED", address: "WRONG", email: "CARE.DEOGHAR@GMAIL.COM" },
+      {
+        save: false,
+        letterhead: {
+          kind: "care-letterpad",
+          email: "desk@caredeoghar.com",
+          website: "www.example-clinic.in",
+        },
+      },
+    );
+    const out = join(resolveArtifactDir(), "letterpad-template-chrome.pdf");
+    writeTestArtifact("letterpad-template-chrome.pdf", Buffer.from(doc.output("arraybuffer")));
+    const text = execFileSync("pdftotext", ["-layout", out, "-"], { encoding: "utf8" });
+    expect(text).toContain("desk@caredeoghar.com");
+    expect(text).toContain("www.example-clinic.in");
+    expect(text).not.toContain("care.deoghar@gmail.com");
+    expect(text).toContain("St. Francis School Road");
+  });
+});

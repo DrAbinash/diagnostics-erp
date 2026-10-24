@@ -1,0 +1,538 @@
+/**
+ * SpineCanalApBox — disc-level canal AP table under MEASURE for LS / cervical / dorsal MRI.
+ * Persists via /spinal-measurements (vertebraLevel = disc label e.g. L4-L5).
+ * Manual override + pull from viewer_measurements / MEASURE rail by level label.
+ * Provenance enables optional FRAMES jump-back (↗).
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { useToast } from "@/hooks/use-toast";
+import { api } from "@/lib/fetchApi";
+import { useWorkspaceSelector } from "@/lib/zai-workspace/store";
+import { useViewerMeasurements } from "@/components/radiology/ViewerMeasurementsPanel";
+import { formatViewerMeasurementLabel } from "@/lib/formatViewerMeasurementLine";
+import {
+  armCanalCapture,
+  canalSegmentBadge,
+  canalTableTitle,
+  discLevelFromLabel,
+  formatCanalApTableText,
+  isLevelInSegment,
+  levelsForCanalSegment,
+  parseCanalApNumber,
+  pickEligibleCanalCaptureRow,
+  resolveActiveCanalSegment,
+  type CanalApCellProvenance,
+  type CanalCaptureArm,
+  type CanalSegment,
+} from "@/lib/spineCanalAp";
+import { annotationIdFromCoordinates, shouldAutoPopulateCanal } from "@/lib/structuredViewerMeasurements";
+import { ArrowDownToLine, CornerUpRight, RefreshCw, Ruler, Save } from "lucide-react";
+
+export interface SpineCanalApBoxProps {
+  studyId: number;
+  draftId?: number | null;
+  patientId?: number | null;
+  worklistId?: number | null;
+  studyInstanceUID?: string | null;
+  regionHint?: string | null;
+  disabled?: boolean;
+  /** When true, allow showing dorsal even if segment must be activated explicitly. */
+  forceShowDorsal?: boolean;
+  onJumpToProvenance?: (prov: CanalApCellProvenance) => void;
+}
+
+interface SpinalRow {
+  id: number;
+  vertebraLevel: string;
+  canalAP: string | null;
+}
+
+export default function SpineCanalApBox({
+  studyId,
+  draftId,
+  patientId,
+  worklistId,
+  studyInstanceUID,
+  regionHint,
+  disabled,
+  forceShowDorsal,
+  onJumpToProvenance,
+}: SpineCanalApBoxProps) {
+  const { toast } = useToast();
+  const reportingContext = useWorkspaceSelector((s) => s.reportingContext);
+  const railMeasurements = useWorkspaceSelector((s) => s.measurements);
+  const mergeField = useWorkspaceSelector((s) => s.mergeField);
+  const measurementIntent = useWorkspaceSelector((s) => s.measurementIntent);
+  const canalIntentLevel = useWorkspaceSelector((s) => s.canalIntentLevel);
+  const setCanalIntentLevel = useWorkspaceSelector((s) => s.setCanalIntentLevel);
+  const provenance = useWorkspaceSelector((s) => s.canalApProvenance);
+  const recordCanalApViewerValue = useWorkspaceSelector((s) => s.recordCanalApViewerValue);
+  const recordCanalApManualValue = useWorkspaceSelector((s) => s.recordCanalApManualValue);
+
+  const segment: CanalSegment | null = useMemo(() => {
+    return resolveActiveCanalSegment({
+      spineSegment: reportingContext.spineSegment,
+      regionHint,
+      reportingRegion: reportingContext.region,
+      studyDescription: reportingContext.studyDescription,
+      regions: reportingContext.regions,
+      forceDorsal: Boolean(forceShowDorsal),
+    });
+  }, [reportingContext, regionHint, forceShowDorsal]);
+
+  const levels = useMemo(
+    () => (segment ? levelsForCanalSegment(segment) : []),
+    [segment],
+  );
+
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [captureLevel, setCaptureLevel] = useState<string | null>(null);
+  const consumedViewerRowIdsRef = useRef<Set<number>>(new Set());
+  const captureArmRef = useRef<CanalCaptureArm | null>(null);
+
+  const viewerQ = useViewerMeasurements(studyInstanceUID);
+
+  function armCaptureForLevel(level: string | null) {
+    if (!level) {
+      captureArmRef.current = null;
+      setCaptureLevel(null);
+      return;
+    }
+    captureArmRef.current = armCanalCapture(
+      level,
+      viewerQ.data ?? [],
+      annotationIdFromCoordinates,
+    );
+    setCaptureLevel(level);
+  }
+
+  const load = useCallback(async () => {
+    if (!studyId || !segment) return;
+    setLoading(true);
+    try {
+      const rows = await api.get<SpinalRow[]>(
+        `/api/radiology/report-generator/spinal-measurements?studyId=${studyId}`,
+      );
+      const next: Record<string, string> = {};
+      for (const level of levelsForCanalSegment(segment)) {
+        const row = rows.find((r) => r.vertebraLevel === level);
+        if (row?.canalAP) next[level] = row.canalAP;
+      }
+      setValues(next);
+    } catch {
+      /* empty until first save */
+    } finally {
+      setLoading(false);
+    }
+  }, [studyId, segment]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Sync selected canal intent level into capture mode when MEASURE intent is CANAL_AP.
+  useEffect(() => {
+    if (measurementIntent !== "CANAL_AP" || !canalIntentLevel || !segment) return;
+    if (!isLevelInSegment(segment, canalIntentLevel)) return;
+    armCaptureForLevel(canalIntentLevel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- arm from intent bar only when level changes
+  }, [measurementIntent, canalIntentLevel, segment]);
+
+  // When capture mode is on, assign only a row NEWER than the arm watermark.
+  useEffect(() => {
+    if (disabled || !captureLevel || !viewerQ.data?.length || !segment) return;
+    const arm = captureArmRef.current;
+    if (!arm || arm.level !== captureLevel) return;
+    const newest = pickEligibleCanalCaptureRow(
+      arm,
+      viewerQ.data,
+      annotationIdFromCoordinates,
+      consumedViewerRowIdsRef.current,
+    );
+    if (!newest) return;
+    const num = parseCanalApNumber(newest.value);
+    if (!num) return;
+    consumedViewerRowIdsRef.current.add(newest.id);
+    const written = recordCanalApViewerValue({
+      level: captureLevel,
+      viewerValue: Number(num),
+      region: segment,
+      studyInstanceUID: newest.studyInstanceUID ?? studyInstanceUID ?? null,
+      seriesInstanceUID: newest.seriesInstanceUID ?? null,
+      sopInstanceUID: newest.sopInstanceUID ?? null,
+      frameNumber: newest.frameNumber ?? null,
+      viewerName: newest.viewerName ?? "viewer",
+      capturedAt: newest.createdAt ?? new Date().toISOString(),
+      annotationId: annotationIdFromCoordinates(newest.imageCoordinates),
+      viewerMeasurementRowId: newest.id,
+    });
+    // A refusal (the report is signed) is announced by the store itself. Nothing
+    // here may report success when the number did not land.
+    if (!written) {
+      armCaptureForLevel(null);
+      return;
+    }
+    setValues((prev) => ({ ...prev, [written]: num }));
+    // Disarm after one successful consume — re-arm required for another update.
+    armCaptureForLevel(null);
+    toast({
+      title: `Assigned ${written}`,
+      description: `${num} mm from viewer measurement`,
+    });
+  }, [captureLevel, viewerQ.data, toast, segment, studyInstanceUID, disabled, recordCanalApViewerValue]);
+
+  if (!segment || levels.length === 0) return null;
+  const activeSegment: CanalSegment = segment;
+
+  function setLevel(level: string, raw: string) {
+    const cleaned = raw.replace(/[^\d.,\-]/g, "").replace(/,/g, ".");
+    setValues((prev) => ({ ...prev, [level]: cleaned }));
+  }
+
+  function commitLevel(level: string) {
+    const parsed = parseCanalApNumber(values[level] ?? "");
+    if (!parsed) return;
+    const written = recordCanalApManualValue(level, parsed, activeSegment);
+    if (!written) return;
+    setValues((prev) => ({ ...prev, [written]: parsed }));
+  }
+
+  function refreshLevelFromViewer(level: string) {
+    const candidates = [...(viewerQ.data ?? [])]
+      .filter((m) => m.status !== "ignored")
+      .filter((m) => {
+        const label = [m.measurementId, m.measurementType, formatViewerMeasurementLabel(m)]
+          .filter(Boolean)
+          .join(" ");
+        const disc = discLevelFromLabel(label);
+        // Never write a different disc level into this cell.
+        if (disc && disc !== level) return false;
+        if (disc === level) return true;
+        // Unlabeled: only when this level is the active Canal AP target.
+        return (
+          measurementIntent === "CANAL_AP"
+          && (canalIntentLevel === level || captureLevel === level)
+        );
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const newest = candidates[0];
+    if (!newest) {
+      toast({ title: "No viewer measurement for this level" });
+      return;
+    }
+    const num = parseCanalApNumber(newest.value);
+    if (!num) {
+      toast({ title: "No readable measurement for this level" });
+      return;
+    }
+    const written = recordCanalApViewerValue({
+      level,
+      viewerValue: Number(num),
+      region: activeSegment,
+      studyInstanceUID: newest.studyInstanceUID ?? studyInstanceUID ?? null,
+      seriesInstanceUID: newest.seriesInstanceUID ?? null,
+      sopInstanceUID: newest.sopInstanceUID ?? null,
+      frameNumber: newest.frameNumber ?? null,
+      viewerName: newest.viewerName ?? "viewer",
+      capturedAt: newest.createdAt ?? new Date().toISOString(),
+      annotationId: annotationIdFromCoordinates(newest.imageCoordinates),
+      viewerMeasurementRowId: newest.id,
+    });
+    if (!written) return;
+    setValues((prev) => ({ ...prev, [written]: num }));
+    toast({ title: `Refreshed ${written}`, description: `${num} mm` });
+  }
+
+  async function saveAll() {
+    setSaving(true);
+    try {
+      for (const level of levels) {
+        const canalAP = parseCanalApNumber(values[level] ?? "") || values[level]?.trim();
+        if (!canalAP) continue;
+        await api.post("/api/radiology/report-generator/spinal-measurements", {
+          studyId,
+          draftId: draftId ?? undefined,
+          patientId: patientId ?? undefined,
+          worklistId: worklistId ?? undefined,
+          vertebraLevel: level,
+          canalAP,
+          stenosisGrade: "none",
+        });
+      }
+      toast({ title: "Canal AP saved" });
+      await load();
+    } catch (e) {
+      toast({ variant: "destructive", title: "Save failed", description: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /**
+   * Pull every matching viewer / rail measurement onto its level.
+   *
+   * A level the radiologist has typed over is neither skipped nor overwritten:
+   * the caliper's number refreshes beside theirs and their number stays on the
+   * page. Nothing in here may silently change a human answer, which is why
+   * `forceRefresh` no longer exists — refreshing the evidence was never a
+   * licence to replace the conclusion.
+   */
+  function pullFromSources() {
+    const next = { ...values };
+    let n = 0;
+    let held = 0;
+    for (const m of viewerQ.data ?? []) {
+      if (m.status === "ignored") continue;
+      const label = [
+        m.measurementId,
+        m.measurementType,
+        formatViewerMeasurementLabel(m),
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const level = discLevelFromLabel(label);
+      if (!level || !(levels as readonly string[]).includes(level)) continue;
+      if (
+        !shouldAutoPopulateCanal({
+          intent: measurementIntent,
+          spinalLevel: level,
+          measurementId: m.measurementId,
+          label,
+        })
+      ) {
+        continue;
+      }
+      const num = parseCanalApNumber(m.value);
+      if (!num) continue;
+      const written = recordCanalApViewerValue({
+        level,
+        viewerValue: Number(num),
+        region: activeSegment,
+        studyInstanceUID: m.studyInstanceUID ?? studyInstanceUID ?? null,
+        seriesInstanceUID: m.seriesInstanceUID ?? null,
+        sopInstanceUID: m.sopInstanceUID ?? null,
+        frameNumber: m.frameNumber ?? null,
+        viewerName: m.viewerName ?? "viewer",
+        capturedAt: m.createdAt ?? new Date().toISOString(),
+        annotationId: annotationIdFromCoordinates(m.imageCoordinates),
+        viewerMeasurementRowId: m.id,
+      });
+      if (!written) continue;
+      const before = provenance[written];
+      if (before?.manualOverride && before.reportValue != null) {
+        held += 1;
+        next[written] = String(before.reportValue);
+      } else {
+        n += 1;
+        next[written] = num;
+      }
+    }
+    for (const m of railMeasurements) {
+      const level = discLevelFromLabel(m.name);
+      if (!level || !(levels as readonly string[]).includes(level)) continue;
+      if (
+        !shouldAutoPopulateCanal({
+          intent: measurementIntent,
+          spinalLevel: level,
+          label: m.name,
+        })
+      ) {
+        continue;
+      }
+      const num = parseCanalApNumber(String(m.value));
+      if (!num) continue;
+      const written = recordCanalApViewerValue({
+        level,
+        viewerValue: Number(num),
+        region: activeSegment,
+      });
+      if (!written) continue;
+      const before = provenance[written];
+      if (before?.manualOverride && before.reportValue != null) {
+        held += 1;
+        next[written] = String(before.reportValue);
+      } else {
+        n += 1;
+        next[written] = num;
+      }
+    }
+    setValues(next);
+    toast({
+      title: n > 0 ? `Pulled ${n} level(s)` : "No matching levels found",
+      description:
+        held > 0
+          ? `${held} level(s) kept the number you typed; the viewer reading refreshed beside it.`
+          : n > 0
+            ? "Review and Save. Label OHIF calipers with disc levels for auto-match."
+            : "Enter values manually, or label viewer calipers with disc levels then Pull again.",
+    });
+  }
+
+  function insertIntoFindings() {
+    const text = formatCanalApTableText(activeSegment, values);
+    if (!levels.some((l) => values[l]?.trim())) {
+      toast({ variant: "destructive", title: "No values to insert" });
+      return;
+    }
+    mergeField("findings", text, "companion");
+    toast({ title: "Canal AP table inserted into findings" });
+  }
+
+  return (
+    <div
+      className="rounded-lg border border-emerald-300/70 bg-emerald-50/30 p-2.5 space-y-2"
+      data-testid="spine-canal-ap-box"
+      data-segment={activeSegment}
+    >
+      <div className="flex items-start justify-between gap-1">
+        <div>
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700 flex items-center gap-1">
+            <Ruler className="h-3 w-3" />
+            Canal AP
+            <Badge variant="outline" className="text-[9px] h-4 px-1 border-emerald-300 text-emerald-700">
+              {canalSegmentBadge(activeSegment)}
+            </Badge>
+          </div>
+          <p className="text-[9px] text-muted-foreground mt-0.5 leading-snug">
+            {canalTableTitle(activeSegment)}. Enter mm or Pull from labeled viewer calipers.
+            Manual edits are protected from later viewer updates.
+          </p>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-[10px] border-collapse" data-testid="spine-canal-ap-table">
+          <thead>
+            <tr>
+              <th className="border border-border bg-muted/50 px-1 py-0.5 text-left font-semibold">LEVEL</th>
+              {levels.map((l) => (
+                <th key={l} className="border border-border bg-muted/50 px-1 py-0.5 font-semibold whitespace-nowrap">
+                  {l}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-border px-1 py-0.5 font-medium whitespace-nowrap">AP (mm)</td>
+              {levels.map((l) => (
+                <td key={l} className="border border-border p-0.5">
+                  <div className="flex items-center gap-0.5">
+                    <Input
+                      className={`h-7 min-w-[2.75rem] w-full text-[11px] font-mono text-center px-0.5 ${
+                        captureLevel === l ? "ring-2 ring-emerald-500" : ""
+                      } ${provenance[l]?.manualOverride ? "border-amber-400" : ""}`}
+                      value={values[l] ?? ""}
+                      disabled={disabled || loading}
+                      placeholder="—"
+                      inputMode="decimal"
+                      data-testid={`canal-ap-${l}`}
+                      title={provenance[l]?.manualOverride ? "Manually edited — protected" : undefined}
+                      onChange={(e) => setLevel(l, e.target.value)}
+                      onBlur={() => commitLevel(l)}
+                      onClick={() => {
+                        if (captureLevel) armCaptureForLevel(l);
+                        setCanalIntentLevel(l);
+                      }}
+                    />
+                    {provenance[l]?.sopInstanceUID || provenance[l]?.seriesInstanceUID ? (
+                      <button
+                        type="button"
+                        className="shrink-0 p-0.5 text-emerald-700 hover:text-emerald-900"
+                        title="Jump to source image"
+                        data-testid={`canal-jump-${l}`}
+                        disabled={disabled || !onJumpToProvenance}
+                        onClick={() => onJumpToProvenance?.(provenance[l])}
+                      >
+                        <CornerUpRight className="h-3 w-3" />
+                      </button>
+                    ) : null}
+                  </div>
+                </td>
+              ))}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex flex-wrap gap-1">
+        {levels.map((l) => (
+          <button
+            key={`cap-${l}`}
+            type="button"
+            disabled={disabled}
+            title={`Next viewer measurement → ${l}`}
+            className={`rounded px-1.5 py-0.5 text-[9px] font-medium border transition ${
+              captureLevel === l
+                ? "bg-emerald-600 text-white border-emerald-700"
+                : "bg-white border-border text-muted-foreground hover:border-emerald-400"
+            }`}
+            data-testid={`canal-capture-${l}`}
+            onClick={() => {
+              armCaptureForLevel(captureLevel === l ? null : l);
+              setCanalIntentLevel(l);
+            }}
+          >
+            {captureLevel === l ? `Capturing ${l}…` : l}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap gap-1">
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 text-[10px]"
+          disabled={disabled || saving}
+          onClick={() => void pullFromSources()}
+          data-testid="canal-ap-pull"
+        >
+          <ArrowDownToLine className="h-3 w-3 mr-1" />
+          Pull
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 text-[10px]"
+          disabled={disabled || saving}
+          onClick={() => {
+            const level = captureLevel || canalIntentLevel || levels.find((l) => provenance[l]?.manualOverride);
+            if (level) refreshLevelFromViewer(level);
+            else pullFromSources();
+          }}
+          data-testid="canal-ap-refresh"
+          title="Refresh selected/override level from viewer"
+        >
+          <RefreshCw className="h-3 w-3 mr-1" />
+          Refresh from viewer
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 text-[10px]"
+          disabled={disabled || saving}
+          onClick={() => void saveAll()}
+          data-testid="canal-ap-save"
+        >
+          <Save className="h-3 w-3 mr-1" />
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <Button
+          size="sm"
+          className="h-6 text-[10px] bg-emerald-600 hover:bg-emerald-700"
+          disabled={disabled || saving}
+          onClick={insertIntoFindings}
+          data-testid="canal-ap-insert"
+        >
+          Insert into findings
+        </Button>
+      </div>
+    </div>
+  );
+}

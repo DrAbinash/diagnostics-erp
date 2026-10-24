@@ -1,0 +1,250 @@
+/**
+ * Reporting ↔ Viewer pane focus helpers for the Radiology Reporting Workspace.
+ *
+ * Pure math + viewport policy only — no React, no clinical state.
+ * Integrates with existing WorkspaceLayoutMode ("split" = reporting-biased,
+ * "viewerFocus" = viewer-biased) and react-resizable-panels via .resize().
+ */
+
+/** Below this CSS viewport width, enable exclusive accordion + auto 2/3 focus. */
+export const CONSTRAINED_REPORTING_VIEWPORT_MAX_PX = 1366;
+
+/** Very narrow: keep both panes usable rather than crushing either. */
+export const NARROW_REPORTING_VIEWPORT_MAX_PX = 1100;
+
+/** Phone portrait / small mobile — OHIF needs nearly the full width. */
+export const PHONE_REPORTING_VIEWPORT_MAX_PX = 767;
+
+export type ReportingPaneBias = "reporting" | "viewer";
+
+/** Target shares of the OHIF+Report band (queue excluded). ~1/3 : 2/3. */
+export const REPORTING_FOCUS_VIEWER_SHARE = 0.33;
+export const VIEWER_FOCUS_VIEWER_SHARE = 0.67;
+/** Phone: give OHIF almost the full band so images are clinically usable. */
+export const PHONE_VIEWER_FOCUS_VIEWER_SHARE = 0.88;
+export const PHONE_REPORTING_FOCUS_VIEWER_SHARE = 0.72;
+
+export const DEFAULT_QUEUE_EXPANDED_PCT = 18;
+export const DEFAULT_QUEUE_COLLAPSED_PCT = 3;
+
+export function isConstrainedReportingViewport(widthPx: number): boolean {
+  if (!Number.isFinite(widthPx) || widthPx <= 0) return true;
+  return widthPx <= CONSTRAINED_REPORTING_VIEWPORT_MAX_PX;
+}
+
+export function isNarrowReportingViewport(widthPx: number): boolean {
+  if (!Number.isFinite(widthPx) || widthPx <= 0) return true;
+  return widthPx <= NARROW_REPORTING_VIEWPORT_MAX_PX;
+}
+
+export function isPhoneReportingViewport(widthPx: number): boolean {
+  if (!Number.isFinite(widthPx) || widthPx <= 0) return true;
+  return widthPx <= PHONE_REPORTING_VIEWPORT_MAX_PX;
+}
+
+/**
+ * Map radiologist intent → existing WorkspaceLayoutMode without inventing a
+ * parallel mode enum. Dual/reportFocus (viewer hidden) are left alone.
+ */
+export function layoutModeForPaneBias(bias: ReportingPaneBias): "split" | "viewerFocus" {
+  return bias === "viewer" ? "viewerFocus" : "split";
+}
+
+export function paneBiasForLayoutMode(mode: string): ReportingPaneBias | null {
+  if (mode === "viewerFocus") return "viewer";
+  if (mode === "split") return "reporting";
+  return null;
+}
+
+/**
+ * Outer ResizablePanelGroup percents: Queue | Viewer | Report.
+ * Queue stays collapsed during automatic focus so the clinical 2/3 is usable.
+ */
+export function outerPanelPercents(opts: {
+  bias: ReportingPaneBias;
+  queueCollapsed?: boolean;
+  queueExpandedPct?: number;
+  queueCollapsedPct?: number;
+  /** Soften toward 50/50 when the whole window is very narrow. */
+  narrow?: boolean;
+  /** Phone: bias hard toward OHIF so the image is not a thin vertical slit. */
+  phone?: boolean;
+}): { queue: number; viewer: number; report: number } {
+  const queueCollapsed = opts.queueCollapsed !== false;
+  const queue = queueCollapsed
+    ? (opts.queueCollapsedPct ?? DEFAULT_QUEUE_COLLAPSED_PCT)
+    : (opts.queueExpandedPct ?? DEFAULT_QUEUE_EXPANDED_PCT);
+  const remainder = Math.max(1, 100 - queue);
+
+  let viewerShare =
+    opts.bias === "viewer" ? VIEWER_FOCUS_VIEWER_SHARE : REPORTING_FOCUS_VIEWER_SHARE;
+  if (opts.phone) {
+    viewerShare =
+      opts.bias === "viewer"
+        ? PHONE_VIEWER_FOCUS_VIEWER_SHARE
+        : PHONE_REPORTING_FOCUS_VIEWER_SHARE;
+  } else if (opts.narrow) {
+    // Avoid 70/30 when both panes would become clinically awkward.
+    viewerShare = opts.bias === "viewer" ? 0.58 : 0.42;
+  }
+
+  const viewer = Math.round(remainder * viewerShare);
+  const report = Math.max(1, remainder - viewer);
+  return { queue, viewer, report };
+}
+
+/**
+ * CSS shell for the embedded DICOM viewer when enlarged.
+ * Phone uses true edge-to-edge so OHIF can fill the viewport.
+ */
+export function viewerOverlayShellClass(opts: {
+  expanded: boolean;
+  phone: boolean;
+}): string {
+  if (!opts.expanded) return "relative h-full flex flex-col rounded-lg border overflow-hidden min-h-0";
+  if (opts.phone) {
+    return "fixed inset-0 z-[70] flex flex-col bg-background overflow-hidden min-h-0";
+  }
+  return "fixed inset-4 z-50 flex flex-col rounded-lg border overflow-hidden min-h-0 bg-background shadow-2xl";
+}
+
+/**
+ * Inactive accordion rows use single-line compact chrome.
+ *
+ * Always on: comfortable two-line summaries on ultrawide monitors were
+ * starving Findings/Impression of height (clinic feedback 2026-09-26).
+ * Viewport args remain for call-site compatibility / future tuning.
+ */
+export function shouldUseCompactAccordion(_opts: {
+  viewportWidthPx: number;
+  layoutMode: string;
+}): boolean {
+  return true;
+}
+
+/**
+ * Exclusive one-active section (no continuous Findings+Impression).
+ * Always on so the active clinical editor owns remaining height on every
+ * clinic monitor — not only laptops ≤1366px.
+ */
+export function shouldUseExclusiveReportSections(_opts: {
+  viewportWidthPx: number;
+  layoutMode: string;
+}): boolean {
+  return true;
+}
+
+/** Setup rows that live inside the Study details disclosure. */
+export function isStudyDetailsSection(
+  id: string | null | undefined,
+): boolean {
+  return id === "demography" || id === "refDoctor" || id === "region";
+}
+
+/**
+ * When Findings/Impression (or other clinical rows) are active, collapse
+ * Starting Canvas and Study details so the editor can grow.
+ */
+export function shouldCollapseSetupChrome(
+  activeSection: string | null | undefined,
+): boolean {
+  if (!activeSection) return false;
+  if (isStudyDetailsSection(activeSection)) return false;
+  return true;
+}
+
+/**
+ * Collapse a two-line summary into a short inline fragment for compact rows.
+ * Presentation only — does not mutate clinical data.
+ */
+export function compactAccordionSummary(summary: string, maxChars = 42): string {
+  const cleaned = summary
+    .replace(/\s+/g, " ")
+    .replace(/\s*[•·|]\s*/g, " · ")
+    .trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+/**
+ * Whether a pointer target should be ignored for pane-focus switching
+ * (menus, inputs, resize handles, etc.).
+ */
+export function shouldIgnorePaneFocusTarget(target: EventTarget | null): boolean {
+  if (target == null || typeof Element === "undefined") return false;
+  if (!(target instanceof Element)) return false;
+  return !!target.closest(
+    [
+      "[data-pane-focus-ignore]",
+      "[data-panel-resize-handle]",
+      "[data-radix-popper-content-wrapper]",
+      "[role='menu']",
+      "[role='listbox']",
+      "[role='dialog']",
+      "input",
+      "textarea",
+      "select",
+      "button",
+      "a",
+      "[contenteditable='true']",
+    ].join(","),
+  );
+}
+
+/** Modes that participate in Reporting ↔ Viewer auto-focus. */
+export type PaneFocusLayoutMode = "split" | "viewerFocus";
+
+/**
+ * Session-only flags: after a manual splitter drag, automatic 33/67 focus must
+ * not fight the radiologist until they explicitly change/reset that mode.
+ * Not persisted to localStorage — byMode remains manual/intentional memory only.
+ */
+export type PaneManualOverrideState = Partial<Record<PaneFocusLayoutMode, boolean>>;
+
+export function isPaneFocusLayoutMode(mode: string): mode is PaneFocusLayoutMode {
+  return mode === "split" || mode === "viewerFocus";
+}
+
+export function markPaneManualOverride(
+  state: PaneManualOverrideState,
+  mode: string,
+): PaneManualOverrideState {
+  if (!isPaneFocusLayoutMode(mode)) return state;
+  if (state[mode]) return state;
+  return { ...state, [mode]: true };
+}
+
+/** Clear one mode (toolbar mode pick) or all (full reset). */
+export function clearPaneManualOverride(
+  state: PaneManualOverrideState,
+  mode?: string | null,
+): PaneManualOverrideState {
+  if (mode == null) return {};
+  if (!isPaneFocusLayoutMode(mode)) return state;
+  if (!state[mode]) return state;
+  const next = { ...state };
+  delete next[mode];
+  return next;
+}
+
+/**
+ * Automatic laptop focus may resize panels, but only when the viewport is
+ * constrained and the user has not manually overridden that mode this session.
+ */
+export function shouldApplyAutomaticPaneFocus(opts: {
+  constrained: boolean;
+  mode: string;
+  manualOverride: PaneManualOverrideState;
+}): boolean {
+  if (!opts.constrained) return false;
+  if (!isPaneFocusLayoutMode(opts.mode)) return false;
+  return !opts.manualOverride[opts.mode];
+}
+
+/**
+ * Auto focus is transient: it must never produce a byMode viewer/report patch.
+ * Manual drag / explicit save paths are the only writers of remembered sizes.
+ */
+export function autoFocusPersistsByModeSizes(): false {
+  return false;
+}

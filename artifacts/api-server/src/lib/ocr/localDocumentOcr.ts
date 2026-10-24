@@ -1,0 +1,552 @@
+/**
+ * Document OCR: Ollama (primary) → client Tesseract (secondary) →
+ * Gemini (tertiary, only when a key exists and the client asks).
+ */
+import { desc } from "drizzle-orm";
+import { db, clinicSettingsTable } from "@workspace/db";
+import { generateAiForTask, resolveTaskRoute } from "@workspace/ai-providers";
+import { geminiOcrBill, geminiOcrInvoice, geminiParseBankStatement } from "@workspace/integrations-gemini-ai";
+import { getGeminiOcrApiKey, resolveOllamaVisionForOcr } from "./ocrProviderResolver";
+
+/** Per-field OCR provenance for Expense Entry V2 review UI. */
+export type OcrFieldSource = "ocr" | "ai_suggested" | "missing" | "user";
+
+export interface BillOcrFieldMeta {
+  value: string | number | null;
+  confidencePercent: number;
+  source: OcrFieldSource;
+}
+
+export interface BillOcrResult {
+  vendor: string;
+  date: string;
+  amount: number;
+  gstAmount: number;
+  /** Optional GST breakdown when visible on the bill. */
+  cgstAmount?: number;
+  sgstAmount?: number;
+  igstAmount?: number;
+  taxableAmount?: number;
+  invoiceNumber?: string;
+  gstin?: string;
+  category: string;
+  description: string;
+  paymentMode: string;
+  confidence: "high" | "medium" | "low";
+  confidencePercent: number;
+  /** Field-level confidence for review UX (never invent missing values). */
+  fields?: Partial<
+    Record<
+      | "vendor"
+      | "date"
+      | "amount"
+      | "gstAmount"
+      | "cgstAmount"
+      | "sgstAmount"
+      | "igstAmount"
+      | "taxableAmount"
+      | "invoiceNumber"
+      | "gstin"
+      | "category"
+      | "description"
+      | "paymentMode",
+      BillOcrFieldMeta
+    >
+  >;
+  ocrProvider: "ollama" | "gemini" | "none";
+  tesseractFallbackSuggested: boolean;
+  geminiFallbackAvailable?: boolean;
+  /** Why the primary engine produced nothing — `confidencePercent: 0` can't tell an unreachable Ollama from a truncated answer. */
+  failureReason?: string;
+}
+
+export interface BankTransaction {
+  date: string;
+  description: string;
+  debit: number;
+  credit: number;
+  balance: number;
+  reference: string;
+}
+
+export interface InvoiceLineItemOcr {
+  description: string;
+  quantity: number;
+  unitCost: number;
+  lineTotal: number;
+}
+
+export interface InvoiceOcrResult {
+  vendor: string;
+  invoiceNumber: string;
+  date: string;
+  subtotal: number;
+  gstAmount: number;
+  totalAmount: number;
+  lineItems: InvoiceLineItemOcr[];
+  confidence: "high" | "medium" | "low";
+  confidencePercent: number;
+  ocrProvider: "ollama" | "gemini" | "none";
+  tesseractFallbackSuggested: boolean;
+  geminiFallbackAvailable?: boolean;
+}
+
+function parseJsonBlob(raw: string): unknown {
+  const trimmed = (raw ?? "").trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1] : trimmed;
+  const arrayMatch = candidate.match(/\[[\s\S]*\]/);
+  const objectMatch = candidate.match(/\{[\s\S]*\}/);
+  const jsonText = (arrayMatch ? arrayMatch[0] : objectMatch ? objectMatch[0] : candidate).trim();
+  return JSON.parse(jsonText);
+}
+
+function clampPct(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : fallback;
+}
+
+const BILL_PROMPT = `You are an accounting assistant reading a bill / invoice / receipt.
+Extract fields and return ONLY valid JSON. NEVER invent values that are not visible.
+If a field is not printed on the document, return empty string / 0 and confidence 0 for that field.
+paymentMode: only fill when the bill explicitly shows Cash/UPI/Card/Cheque — otherwise "".
+
+{
+  "vendor": "shop / supplier name or empty",
+  "invoiceNumber": "invoice/bill no or empty",
+  "date": "YYYY-MM-DD or empty",
+  "amount": number,
+  "taxableAmount": number,
+  "gstAmount": number,
+  "cgstAmount": number,
+  "sgstAmount": number,
+  "igstAmount": number,
+  "gstin": "15-char GSTIN or empty",
+  "category": "best match from: Salaries, Rent, Utilities, Office Supplies, Medical Supplies, Lab Reagents, Equipment, Maintenance, Travel, Food, Marketing, Professional Fees, Taxes, Insurance, Miscellaneous",
+  "description": "brief 1-line summary of items or empty",
+  "paymentMode": "cash | card | upi | cheque | other | empty",
+  "confidence": "high | medium | low",
+  "confidencePercent": number,
+  "fieldConfidence": {
+    "vendor": 0-100,
+    "invoiceNumber": 0-100,
+    "date": 0-100,
+    "amount": 0-100,
+    "taxableAmount": 0-100,
+    "gstAmount": 0-100,
+    "cgstAmount": 0-100,
+    "sgstAmount": 0-100,
+    "igstAmount": 0-100,
+    "gstin": 0-100,
+    "category": 0-100,
+    "description": 0-100,
+    "paymentMode": 0-100
+  }
+}`;
+
+const BANK_PROMPT = `You are a bank statement parser. Extract every transaction row and return ONLY a JSON array.
+
+Each element:
+{ "date": "YYYY-MM-DD", "description": "narration", "debit": number, "credit": number, "balance": number, "reference": "UTR/cheque or empty" }
+
+Rules: skip headers and totals. Dr = debit, Cr = credit. Convert dates to YYYY-MM-DD.`;
+
+const INVOICE_PROMPT = `You are reading a supplier tax invoice. Return ONLY valid JSON:
+{
+  "vendor": "",
+  "invoiceNumber": "",
+  "date": "YYYY-MM-DD or empty",
+  "subtotal": number,
+  "gstAmount": number,
+  "totalAmount": number,
+  "confidence": "high | medium | low",
+  "confidencePercent": number,
+  "lineItems": [{ "description": "", "quantity": number, "unitCost": number, "lineTotal": number }]
+}`;
+
+async function geminiMissFlags(): Promise<{ geminiFallbackAvailable: boolean }> {
+  return { geminiFallbackAvailable: Boolean(await getGeminiOcrApiKey()) };
+}
+
+export async function ocrBill(
+  imageBase64: string,
+  mimeType: string,
+  opts?: { useGeminiFallback?: boolean },
+): Promise<BillOcrResult> {
+  if (opts?.useGeminiFallback) {
+    const apiKey = await getGeminiOcrApiKey();
+    if (!apiKey) {
+      return {
+        vendor: "", date: "", amount: 0, gstAmount: 0, category: "Miscellaneous",
+        description: "", paymentMode: "cash", confidence: "low", confidencePercent: 0,
+        ocrProvider: "none", tesseractFallbackSuggested: false, geminiFallbackAvailable: false,
+      };
+    }
+    const g = await geminiOcrBill(imageBase64, mimeType, { apiKey });
+    return { ...g, ocrProvider: "gemini", tesseractFallbackSuggested: false, geminiFallbackAvailable: true };
+  }
+  const local = await ollamaOcrBill(imageBase64);
+  if (local.tesseractFallbackSuggested) {
+    return { ...local, ...(await geminiMissFlags()) };
+  }
+  return local;
+}
+
+export async function parseBankStatementLocal(
+  input: { text: string } | { imageBase64: string; mimeType: string },
+  opts?: { useGeminiFallback?: boolean },
+): Promise<{ transactions: BankTransaction[]; ocrProvider: "ollama" | "gemini" | "none"; tesseractFallbackSuggested: boolean; geminiFallbackAvailable?: boolean }> {
+  if (opts?.useGeminiFallback) {
+    const apiKey = await getGeminiOcrApiKey();
+    if (!apiKey) {
+      return { transactions: [], ocrProvider: "none", tesseractFallbackSuggested: false, geminiFallbackAvailable: false };
+    }
+    const geminiInput = "text" in input
+      ? { text: input.text }
+      : { imageBase64: input.imageBase64, mimeType: input.mimeType };
+    const transactions = await geminiParseBankStatement(geminiInput, { apiKey });
+    return { transactions, ocrProvider: "gemini", tesseractFallbackSuggested: false, geminiFallbackAvailable: true };
+  }
+  const local = "text" in input
+    ? await ollamaParseBankStatement({ text: input.text })
+    : await ollamaParseBankStatement({ imageBase64: input.imageBase64 });
+  if (local.tesseractFallbackSuggested) {
+    return { ...local, ...(await geminiMissFlags()) };
+  }
+  return local;
+}
+
+export async function ocrInvoice(
+  imageBase64: string,
+  mimeType: string,
+  opts?: { useGeminiFallback?: boolean },
+): Promise<InvoiceOcrResult> {
+  if (opts?.useGeminiFallback) {
+    const apiKey = await getGeminiOcrApiKey();
+    if (!apiKey) {
+      return {
+        vendor: "", invoiceNumber: "", date: "", subtotal: 0, gstAmount: 0, totalAmount: 0,
+        lineItems: [], confidence: "low", confidencePercent: 0,
+        ocrProvider: "none", tesseractFallbackSuggested: false, geminiFallbackAvailable: false,
+      };
+    }
+    const g = await geminiOcrInvoice(imageBase64, mimeType, { apiKey });
+    return { ...g, ocrProvider: "gemini", tesseractFallbackSuggested: false, geminiFallbackAvailable: true };
+  }
+  const local = await ollamaOcrInvoice(imageBase64);
+  if (local.tesseractFallbackSuggested) {
+    return { ...local, ...(await geminiMissFlags()) };
+  }
+  return local;
+}
+
+/**
+ * The operator's configured Local AI budget, applied to document OCR — this path
+ * used to send no timeout at all (measured: 40 s and 180 s scans). It can only
+ * raise the floor, never lower it: a vision bill reply measures ~45–100 s, so a
+ * 30 s setting would have timed out every scan the day this shipped.
+ */
+const OCR_TIMEOUT_FLOOR_SECONDS = 90;
+
+async function ocrRequestTimeoutMs(): Promise<number> {
+  let seconds = OCR_TIMEOUT_FLOOR_SECONDS;
+  try {
+    const [row] = await db
+      .select({ seconds: clinicSettingsTable.ollamaTimeoutSeconds })
+      .from(clinicSettingsTable)
+      .orderBy(desc(clinicSettingsTable.id))
+      .limit(1);
+    const configured = Number(row?.seconds ?? 0);
+    if (Number.isFinite(configured) && configured > 0) seconds = configured;
+  } catch {
+    // DB unavailable — the floor still bounds the request
+  }
+  return Math.min(300, Math.max(OCR_TIMEOUT_FLOOR_SECONDS, Math.round(seconds))) * 1000;
+}
+
+/**
+ * Honour the model pinned to a task in AI Model Routing. `generateAiForTask`
+ * skips its route lookup whenever the caller pins `provider`, so resolving it
+ * here is the only way that setting reaches document OCR. The provider stays
+ * Ollama either way — a photographed bill never goes to a cloud provider
+ * unless the operator asked for the Gemini pass.
+ */
+async function visionModelForTask(taskKey: string, fallback: string): Promise<string> {
+  const route = await resolveTaskRoute(taskKey).catch(() => null);
+  const model = route?.provider === "ollama" ? (route.model ?? "").trim() : "";
+  return model || fallback;
+}
+
+async function ollamaVisionJson(task: string, prompt: string, imageBase64: string, maxTokens: number): Promise<string> {
+  const ollama = await resolveOllamaVisionForOcr();
+  if (!ollama) {
+    throw new Error("OLLAMA_UNAVAILABLE");
+  }
+  const result = await generateAiForTask(task, prompt, [imageBase64], {
+    provider: "ollama",
+    model: await visionModelForTask(task, ollama.model),
+    endpointUrl: ollama.endpointUrl,
+    maxTokens,
+    timeoutMs: await ocrRequestTimeoutMs(),
+  });
+  if (!result.success) {
+    throw new Error(result.error || "Ollama request failed");
+  }
+  if (!result.text?.trim()) {
+    // A thinking model that spends the whole budget on chain-of-thought answers with an empty `response`.
+    throw new Error("OLLAMA_EMPTY_RESPONSE (model produced no answer text — likely chain-of-thought filled the token budget)");
+  }
+  return result.text;
+}
+
+/** Exported for unit tests — builds per-field OCR provenance. */
+export function buildBillFieldMeta(
+  parsed: Record<string, unknown>,
+  overallFallback: number,
+): NonNullable<BillOcrResult["fields"]> {
+  const fc = (parsed.fieldConfidence && typeof parsed.fieldConfidence === "object"
+    ? (parsed.fieldConfidence as Record<string, unknown>)
+    : {}) as Record<string, unknown>;
+
+  const meta = (
+    key: string,
+    value: string | number | null,
+    opts?: { suggested?: boolean },
+  ): BillOcrFieldMeta => {
+    // Money fields may legitimately be 0; only null/blank count as missing.
+    const isMissing =
+      value === null ||
+      value === "" ||
+      (key === "paymentMode" && !String(value).trim());
+    const pct = clampPct(fc[key], isMissing ? 0 : overallFallback);
+    let source: OcrFieldSource = "ocr";
+    if (isMissing || pct <= 0) source = "missing";
+    else if (opts?.suggested || key === "category") source = "ai_suggested";
+    return { value: isMissing ? null : value, confidencePercent: pct, source };
+  };
+
+  const amount = Number(parsed.amount ?? 0) || 0;
+  const gstAmount = Number(parsed.gstAmount ?? 0) || 0;
+  const cgstAmount = Number(parsed.cgstAmount ?? 0) || 0;
+  const sgstAmount = Number(parsed.sgstAmount ?? 0) || 0;
+  const igstAmount = Number(parsed.igstAmount ?? 0) || 0;
+  const taxableAmount = Number(parsed.taxableAmount ?? 0) || 0;
+  const paymentMode = String(parsed.paymentMode ?? "").trim();
+
+  return {
+    vendor: meta("vendor", String(parsed.vendor ?? "").trim() || null),
+    invoiceNumber: meta("invoiceNumber", String(parsed.invoiceNumber ?? "").trim() || null),
+    date: meta("date", String(parsed.date ?? "").trim() || null),
+    amount: meta("amount", amount > 0 ? amount : null),
+    taxableAmount: meta("taxableAmount", taxableAmount > 0 ? taxableAmount : null),
+    gstAmount: meta("gstAmount", gstAmount > 0 ? gstAmount : null),
+    cgstAmount: meta("cgstAmount", cgstAmount > 0 ? cgstAmount : null),
+    sgstAmount: meta("sgstAmount", sgstAmount > 0 ? sgstAmount : null),
+    igstAmount: meta("igstAmount", igstAmount > 0 ? igstAmount : null),
+    gstin: meta("gstin", String(parsed.gstin ?? "").trim() || null),
+    category: meta("category", String(parsed.category ?? "").trim() || null, { suggested: true }),
+    description: meta("description", String(parsed.description ?? "").trim() || null),
+    paymentMode: meta("paymentMode", paymentMode || null),
+  };
+}
+
+export async function ollamaOcrBill(imageBase64: string): Promise<BillOcrResult> {
+  try {
+    const raw = await ollamaVisionJson("bill_ocr", BILL_PROMPT, imageBase64, 1024);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseJsonBlob(raw) as Record<string, unknown>;
+    } catch (e) {
+      const reply = raw.trim();
+      throw new Error(
+        `BILL_JSON_UNPARSEABLE (${e instanceof Error ? e.message : String(e)}) — ` +
+          `reply ${reply.length} chars, done without a closing brace? tail "${reply.slice(-48)}"`,
+      );
+    }
+    const band =
+      parsed.confidence === "high" || parsed.confidence === "medium" || parsed.confidence === "low"
+        ? (parsed.confidence as "high" | "medium" | "low")
+        : "low";
+    const fallback = { high: 97, medium: 87, low: 55 }[band];
+    const fields = buildBillFieldMeta(parsed, fallback);
+    const paymentMode = String(fields.paymentMode?.value ?? "").trim();
+    return {
+      vendor: String(fields.vendor?.value ?? ""),
+      invoiceNumber: String(fields.invoiceNumber?.value ?? ""),
+      date: String(fields.date?.value ?? ""),
+      amount: Number(fields.amount?.value ?? 0) || 0,
+      taxableAmount: Number(fields.taxableAmount?.value ?? 0) || 0,
+      gstAmount: Number(fields.gstAmount?.value ?? 0) || 0,
+      cgstAmount: Number(fields.cgstAmount?.value ?? 0) || 0,
+      sgstAmount: Number(fields.sgstAmount?.value ?? 0) || 0,
+      igstAmount: Number(fields.igstAmount?.value ?? 0) || 0,
+      gstin: String(fields.gstin?.value ?? ""),
+      category: String(fields.category?.value ?? "Miscellaneous") || "Miscellaneous",
+      description: String(fields.description?.value ?? ""),
+      // Do not invent payment mode — blank means "not on bill"
+      paymentMode: paymentMode || "",
+      confidence: band,
+      confidencePercent: clampPct(parsed.confidencePercent, fallback),
+      fields,
+      ocrProvider: "ollama",
+      tesseractFallbackSuggested: false,
+    };
+  } catch (err) {
+    const failureReason = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+    console.warn(`[ocr] bill OCR fell back to Tesseract: ${failureReason}`);
+    return {
+      vendor: "",
+      date: "",
+      amount: 0,
+      gstAmount: 0,
+      category: "Miscellaneous",
+      description: "",
+      paymentMode: "",
+      confidence: "low",
+      confidencePercent: 0,
+      ocrProvider: "none",
+      tesseractFallbackSuggested: true,
+      failureReason,
+    };
+  }
+}
+
+export async function ollamaParseBankStatement(
+  input: { text: string } | { imageBase64: string },
+): Promise<{ transactions: BankTransaction[]; ocrProvider: "ollama" | "none"; tesseractFallbackSuggested: boolean }> {
+  if ("text" in input) {
+    const fromCsv = parseBankCsvOrText(input.text);
+    if (fromCsv.length > 0) {
+      return { transactions: fromCsv, ocrProvider: "none", tesseractFallbackSuggested: false };
+    }
+    try {
+      const ollama = await resolveOllamaVisionForOcr();
+      if (!ollama) {
+        return { transactions: fromCsv, ocrProvider: "none", tesseractFallbackSuggested: true };
+      }
+      const result = await generateAiForTask("bank_statement_ocr", `${BANK_PROMPT}\n\nStatement text:\n${input.text}`, [], {
+        provider: "ollama",
+        model: ollama.model,
+        endpointUrl: ollama.endpointUrl,
+        maxTokens: 4096,
+      });
+      if (!result.success) throw new Error(result.error || "fail");
+      return {
+        transactions: normalizeTxns(parseJsonBlob(result.text)),
+        ocrProvider: "ollama",
+        tesseractFallbackSuggested: false,
+      };
+    } catch {
+      return { transactions: fromCsv, ocrProvider: "none", tesseractFallbackSuggested: true };
+    }
+  }
+
+  try {
+    const raw = await ollamaVisionJson("bank_statement_ocr", BANK_PROMPT, input.imageBase64, 4096);
+    return {
+      transactions: normalizeTxns(parseJsonBlob(raw)),
+      ocrProvider: "ollama",
+      tesseractFallbackSuggested: false,
+    };
+  } catch {
+    return { transactions: [], ocrProvider: "none", tesseractFallbackSuggested: true };
+  }
+}
+
+export async function ollamaOcrInvoice(imageBase64: string): Promise<InvoiceOcrResult> {
+  try {
+    const raw = await ollamaVisionJson("invoice_ocr", INVOICE_PROMPT, imageBase64, 2048);
+    const parsed = parseJsonBlob(raw) as Partial<InvoiceOcrResult>;
+    const band = parsed.confidence === "high" || parsed.confidence === "medium" ? parsed.confidence : "low";
+    const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
+    return {
+      vendor: String(parsed.vendor ?? ""),
+      invoiceNumber: String(parsed.invoiceNumber ?? ""),
+      date: String(parsed.date ?? ""),
+      subtotal: Number(parsed.subtotal ?? 0) || 0,
+      gstAmount: Number(parsed.gstAmount ?? 0) || 0,
+      totalAmount: Number(parsed.totalAmount ?? 0) || 0,
+      lineItems: lines.map((li) => ({
+        description: String(li.description ?? ""),
+        quantity: Number(li.quantity ?? 0) || 0,
+        unitCost: Number(li.unitCost ?? 0) || 0,
+        lineTotal: Number(li.lineTotal ?? 0) || 0,
+      })),
+      confidence: band,
+      confidencePercent: clampPct(parsed.confidencePercent, { high: 97, medium: 87, low: 55 }[band]),
+      ocrProvider: "ollama",
+      tesseractFallbackSuggested: false,
+    };
+  } catch {
+    return {
+      vendor: "", invoiceNumber: "", date: "", subtotal: 0, gstAmount: 0, totalAmount: 0,
+      lineItems: [], confidence: "low", confidencePercent: 0,
+      ocrProvider: "none", tesseractFallbackSuggested: true,
+    };
+  }
+}
+
+function normalizeTxns(raw: unknown): BankTransaction[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((r) => {
+    const row = r as Partial<BankTransaction>;
+    return {
+      date: String(row.date ?? ""),
+      description: String(row.description ?? ""),
+      debit: Number(row.debit ?? 0) || 0,
+      credit: Number(row.credit ?? 0) || 0,
+      balance: Number(row.balance ?? 0) || 0,
+      reference: String(row.reference ?? ""),
+    };
+  }).filter((t) => t.debit > 0 || t.credit > 0 || t.description);
+}
+
+/** Deterministic CSV / pasted-statement parse — no LLM. */
+export function parseBankCsvOrText(text: string): BankTransaction[] {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const rows: BankTransaction[] = [];
+  for (const line of lines) {
+    if (/^date\b/i.test(line)) continue;
+    if (/opening\s*balance/i.test(line) && !/\d/.test(line)) continue;
+    const parts = line.includes("\t") ? line.split("\t") : line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+    const cells = parts.map((c) => c.replace(/^"|"$/g, "").trim());
+    const dateCell = cells.find((c) => /^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$/.test(c) || /^\d{4}-\d{2}-\d{2}$/.test(c));
+    if (!dateCell) continue;
+    const nums = cells
+      .map((c) => Number(c.replace(/[,₹]/g, "")))
+      .filter((n) => Number.isFinite(n) && n !== 0);
+    const desc = cells.find((c) => /[A-Za-z]{3,}/.test(c) && c !== dateCell) ?? "";
+    const ref = cells.find((c) => /UTR|NEFT|IMPS|CHQ|CHEQUE|\d{6,}/i.test(c) && c !== dateCell) ?? "";
+    let debit = 0, credit = 0, balance = 0;
+    if (nums.length >= 3) {
+      debit = nums[0]; credit = nums[1]; balance = nums[2];
+      if (debit > 0 && credit > 0 && nums.length === 3) {
+        // withdrawal, deposit, balance — keep as-is
+      }
+    } else if (nums.length === 2) {
+      balance = nums[1];
+      if (/cr|credit|deposit|salary/i.test(line)) credit = nums[0];
+      else debit = nums[0];
+    } else if (nums.length === 1) {
+      if (/cr|credit|deposit/i.test(line)) credit = nums[0];
+      else debit = nums[0];
+    }
+    rows.push({
+      date: normalizeDate(dateCell),
+      description: desc,
+      debit, credit, balance, reference: ref,
+    });
+  }
+  return rows.filter((t) => t.debit > 0 || t.credit > 0);
+}
+
+export function normalizeDate(raw: string): string {
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return raw;
+  const dmy = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$/);
+  if (!dmy) return raw;
+  let [, d, m, y] = dmy;
+  if (y.length === 2) y = `20${y}`;
+  return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+}

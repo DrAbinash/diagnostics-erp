@@ -1,0 +1,1758 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/fetchApi";
+import PageHeader from "@/components/PageHeader";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
+import {
+  BrainCircuit, Eye, EyeOff, Save, TestTube2, RefreshCw, ShieldCheck,
+  Key, ChevronDown, ChevronUp, CheckCircle2, XCircle, AlertTriangle,
+  BookOpen, Settings2, Users, FileText, Wifi, WifiOff, Zap, Gauge, Moon,
+} from "lucide-react";
+import OvernightAiSettings from "@/components/ai/OvernightAiSettings";
+import { OllamaAiDraftVerifyPanel } from "@/components/radiology/OllamaAiDraftVerifyPanel";
+import { AiPipelineSelfTestPanel } from "@/components/radiology/AiPipelineSelfTestPanel";
+import { ReportComposerTestPanel, type ComposerRuntimeDiag } from "@/components/ai/ReportComposerTestPanel";
+import {
+  cacheAgeLabel,
+  isKnownModelsCacheFresh,
+  mergeDiscoveredModels,
+  readKnownModelsCache,
+  writeKnownModelsCache,
+} from "@/lib/localAi/knownModelsCache";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface GlobalSettings {
+  enabled: boolean;
+  defaultProvider: string;
+  defaultPrompt: string;
+  defaultPromptTemplate: string;
+  includeDemographics: boolean;
+  anonymize: boolean;
+  cloudTextPhiAllowed: boolean;
+  /**
+   * PR-A2: how strict the AI image-egress policy is. The server normalizes this on
+   * read and re-validates it on write, and only admin / super_admin may change it;
+   * this screen shows and sends the value, it does not decide anything.
+   */
+  aiSecurityMode: "development" | "clinical";
+  allowedRoles: string[];
+}
+
+interface ProviderInfo {
+  provider: string;
+  isEnabled: boolean;
+  isDefault: boolean;
+  hasApiKey: boolean;
+  hasEndpointUrl: boolean;
+  defaultModel: string | null;
+  endpointUrl: string | null;
+  label: string;
+  needsApiKey: boolean;
+  needsEndpointUrl: boolean;
+  defaultModels: string[];
+  placeholder: string;
+  displayName?: string | null;
+  supportsVision?: boolean;
+  supportsText?: boolean;
+  execution?: "LOCAL" | "CLOUD";
+}
+
+interface ProviderDraft {
+  isEnabled: boolean;
+  isDefault: boolean;
+  apiKey: string;
+  endpointUrl: string;
+  defaultModel: string;
+  displayName: string;
+  supportsVision: boolean;
+  showKey: boolean;
+  testStatus: "idle" | "testing" | "ok" | "fail";
+  testMessage: string;
+  textProbe?: "pass" | "fail" | null;
+  visionProbe?: "pass" | "fail" | null;
+}
+
+interface SettingsResponse {
+  global: GlobalSettings;
+  providers: Record<string, ProviderInfo>;
+  promptTemplates: string[];
+}
+
+const PROVIDER_COLORS: Record<string, string> = {
+  openai: "from-green-50 to-emerald-50 dark:from-green-950/20 dark:to-emerald-950/20 border-green-200 dark:border-green-800",
+  gemini: "from-blue-50 to-indigo-50 dark:from-blue-950/20 dark:to-indigo-950/20 border-blue-200 dark:border-blue-800",
+  anthropic: "from-orange-50 to-amber-50 dark:from-orange-950/20 dark:to-amber-950/20 border-orange-200 dark:border-orange-800",
+  ollama: "from-purple-50 to-violet-50 dark:from-purple-950/20 dark:to-violet-950/20 border-purple-200 dark:border-purple-800",
+  deepseek: "from-sky-50 to-cyan-50 dark:from-sky-950/20 dark:to-cyan-950/20 border-sky-200 dark:border-sky-800",
+  qwen: "from-rose-50 to-pink-50 dark:from-rose-950/20 dark:to-pink-950/20 border-rose-200 dark:border-rose-800",
+  local_openai_compatible:
+    "from-teal-50 to-cyan-50 dark:from-teal-950/20 dark:to-cyan-950/20 border-teal-200 dark:border-teal-800",
+};
+
+const ALL_ROLES = ["admin", "super_admin", "doctor", "radiologist", "technician", "receptionist"];
+
+const SECTION_LABELS: Record<string, string> = {
+  admin: "Admin",
+  super_admin: "Super Admin",
+  doctor: "Doctor",
+  radiologist: "Radiologist",
+  technician: "Technician",
+  receptionist: "Receptionist",
+};
+
+/** Admin diagnostics for PaddleOCR worker + Ollama (staff-auth API). */
+function PipelineDiagnosticsPanel() {
+  const { toast } = useToast();
+  const [busy, setBusy] = useState(false);
+  const [health, setHealth] = useState<Record<string, unknown> | null>(null);
+  const [testOut, setTestOut] = useState<Record<string, unknown> | null>(null);
+
+  const refresh = async () => {
+    setBusy(true);
+    try {
+      const h = await api.get<Record<string, unknown>>("/api/ai-pipeline/health");
+      setHealth(h);
+    } catch (e) {
+      toast({ title: "Pipeline health failed", description: String(e), variant: "destructive" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runTest = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post<Record<string, unknown>>("/api/ai-pipeline/test", { dryRun: true, mode: "OCR_ONLY" });
+      setTestOut(r);
+      toast({ title: "Pipeline test complete", description: "Non-PHI OCR-only dry run" });
+    } catch (e) {
+      toast({ title: "Pipeline test failed", description: String(e), variant: "destructive" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ollama = (health?.ollama ?? null) as { reachable?: boolean; installedModels?: string[]; selected?: Record<string, string> } | null;
+  const paddle = (health?.paddle ?? null) as {
+    ok?: boolean; paddle_loaded?: boolean; device_actual?: string; gpu_available?: boolean;
+    profiles_ready?: string[]; active_jobs?: number; last_error?: string | null;
+  } | null;
+
+  return (
+    <div className="rounded-lg border bg-muted/20 p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold">OCR / AI Pipeline Diagnostics</p>
+        <div className="flex gap-1.5">
+          <Button type="button" size="sm" variant="outline" className="h-7 text-[10px]" disabled={busy} onClick={() => void refresh()}>
+            {busy ? <RefreshCw size={10} className="animate-spin" /> : <Wifi size={10} />} Refresh
+          </Button>
+          <Button type="button" size="sm" variant="outline" className="h-7 text-[10px]" disabled={busy} onClick={() => void runTest()}>
+            <TestTube2 size={10} /> Test (OCR only)
+          </Button>
+        </div>
+      </div>
+      {health && (
+        <div className="grid grid-cols-2 gap-2 text-[10px]">
+          <div className={`rounded border px-2 py-1.5 ${ollama?.reachable ? "border-green-300 bg-green-50 dark:bg-green-950/20" : "border-red-300 bg-red-50 dark:bg-red-950/20"}`}>
+            <p className="font-semibold">Ollama</p>
+            <p>{ollama?.reachable ? "reachable" : "unreachable"} · {(ollama?.installedModels ?? []).length} models</p>
+            <p className="font-mono truncate">std: {ollama?.selected?.standard ?? "—"}</p>
+          </div>
+          <div className={`rounded border px-2 py-1.5 ${paddle?.ok ? "border-green-300 bg-green-50 dark:bg-green-950/20" : "border-amber-300 bg-amber-50 dark:bg-amber-950/20"}`}>
+            <p className="font-semibold">PaddleOCR worker</p>
+            <p>{paddle?.paddle_loaded ? "loaded" : "not loaded"} · device {paddle?.device_actual ?? "?"}</p>
+            <p>GPU {paddle?.gpu_available ? "yes" : "no"} · jobs {paddle?.active_jobs ?? 0}</p>
+          </div>
+        </div>
+      )}
+      {testOut && (
+        <pre className="text-[10px] bg-background border rounded p-2 overflow-auto max-h-40">{JSON.stringify(testOut, null, 2)}</pre>
+      )}
+      <p className="text-[10px] text-muted-foreground">
+        AI drafts are never final medical reports — radiologist approval required. Set OCR_WORKER_URL on the Synology API to the Windows PC (:8090).
+      </p>
+    </div>
+  );
+}
+
+// ─── ProviderCard ─────────────────────────────────────────────────────────────
+function ProviderCard({
+  name,
+  meta,
+  draft,
+  onChange,
+  onTest,
+  syncedFromLocalAi = false,
+}: {
+  name: string;
+  meta: ProviderInfo;
+  draft: ProviderDraft;
+  onChange: (d: Partial<ProviderDraft>) => void;
+  onTest: () => void;
+  /** Ollama endpoint/model are owned by Local AI settings — read-only here. */
+  syncedFromLocalAi?: boolean;
+}) {
+  const color = PROVIDER_COLORS[name] ?? "bg-muted/50 border-muted";
+  const models = meta.defaultModels ?? [];
+  const needsApiKey = meta.needsApiKey ?? false;
+  const needsEndpointUrl = meta.needsEndpointUrl ?? false;
+  const isLocalCompat = name === "local_openai_compatible";
+  const readOnly = syncedFromLocalAi || name === "ollama";
+
+  return (
+    <div className={`rounded-xl border bg-gradient-to-br p-5 space-y-4 ${color}`}>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <h3 className="font-semibold text-sm">{meta.label}</h3>
+          {isLocalCompat && (
+            <span className="text-[10px] bg-teal-700 text-white px-1.5 py-0.5 rounded-full font-semibold">LOCAL</span>
+          )}
+          {draft.isDefault && (
+            <span className="text-[10px] bg-primary text-primary-foreground px-1.5 py-0.5 rounded-full font-semibold">DEFAULT</span>
+          )}
+          {readOnly && (
+            <span className="text-[10px] bg-muted text-muted-foreground px-1.5 py-0.5 rounded font-semibold">SYNCED FROM LOCAL AI</span>
+          )}
+        </div>
+        <label className={`flex items-center gap-2 select-none ${readOnly ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}>
+          <span className="text-xs text-muted-foreground">Enable</span>
+          <div
+            className={`relative w-10 h-5 rounded-full transition-colors ${draft.isEnabled ? "bg-primary" : "bg-muted"}`}
+            onClick={() => { if (!readOnly) onChange({ isEnabled: !draft.isEnabled }); }}
+          >
+            <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${draft.isEnabled ? "translate-x-5" : "translate-x-0.5"}`} />
+          </div>
+        </label>
+      </div>
+
+      {readOnly && (
+        <p className="text-[11px] text-muted-foreground">
+          Endpoint and model are configured only under <strong>Local AI</strong>. Saving Local AI syncs this Ollama row for task routing.
+        </p>
+      )}
+
+      {isLocalCompat && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-semibold text-muted-foreground">Display name</label>
+          <input
+            type="text"
+            value={draft.displayName}
+            onChange={(e) => onChange({ displayName: e.target.value })}
+            placeholder="e.g. Bonsai 2 27B"
+            className="w-full h-9 px-3 text-xs rounded-lg border bg-background"
+            data-testid="local-openai-display-name"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Shown in the radiology workspace selector. Provider id stays vendor-neutral.
+          </p>
+        </div>
+      )}
+
+      {/* Endpoint URL — required for Ollama + Local OpenAI-Compatible (+ optional for cloud OpenAI-compat) */}
+      {(needsEndpointUrl || isLocalCompat) && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-semibold text-muted-foreground flex items-center gap-1">
+            <Key size={11} /> Base URL / Endpoint
+          </label>
+          <input
+            type="text"
+            value={draft.endpointUrl}
+            onChange={(e) => { if (!readOnly) onChange({ endpointUrl: e.target.value }); }}
+            readOnly={readOnly}
+            disabled={readOnly}
+            placeholder={meta.placeholder || "http://<host>:8080/v1"}
+            className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono disabled:opacity-70"
+            data-testid={isLocalCompat ? "local-openai-endpoint" : undefined}
+          />
+          {!readOnly && (
+            <p className="text-[10px] text-muted-foreground">
+              {isLocalCompat
+                ? "OpenAI-compatible base URL (include /v1). Leave blank to keep existing."
+                : "Leave blank to keep existing URL. Only updated when you type a new one."}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* API Key — required for cloud; optional for Local OpenAI-Compatible */}
+      {(needsApiKey || isLocalCompat) && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-semibold text-muted-foreground flex items-center gap-1">
+            <Key size={11} /> API Key{isLocalCompat ? " (optional)" : ""}
+          </label>
+          <div className="flex gap-2">
+            <div className="flex-1 relative">
+              <input
+                type={draft.showKey ? "text" : "password"}
+                value={draft.apiKey}
+                onChange={(e) => onChange({ apiKey: e.target.value })}
+                placeholder={
+                  draft.apiKey
+                    ? "••••••••••••••••"
+                    : isLocalCompat
+                      ? "Optional — leave blank if server does not require auth"
+                      : `Enter ${meta.label} API key (${meta.placeholder})`
+                }
+                className="w-full h-9 px-3 pr-9 text-xs rounded-lg border bg-background font-mono"
+              />
+              <button
+                type="button"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+                onClick={() => onChange({ showKey: !draft.showKey })}
+              >
+                {draft.showKey ? <EyeOff size={13} /> : <Eye size={13} />}
+              </button>
+            </div>
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            {isLocalCompat
+              ? "Optional. Secrets are never returned to the UI after save."
+              : "Leave blank to keep existing key. Only updated when you type a new one."}
+          </p>
+        </div>
+      )}
+
+      {/* Default Model */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-semibold text-muted-foreground">Default Model</label>
+        <div className="flex gap-2">
+          <select
+            value={draft.defaultModel}
+            onChange={(e) => { if (!readOnly) onChange({ defaultModel: e.target.value }); }}
+            disabled={readOnly}
+            className="flex-1 h-9 px-3 text-xs rounded-lg border bg-background disabled:opacity-70"
+          >
+            <option value="">-- select model --</option>
+            {models.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+            {draft.defaultModel && !models.includes(draft.defaultModel) && (
+              <option value={draft.defaultModel}>{draft.defaultModel} (custom)</option>
+            )}
+          </select>
+          {!readOnly && (
+            <input
+              type="text"
+              value={draft.defaultModel}
+              onChange={(e) => onChange({ defaultModel: e.target.value })}
+              placeholder="or type custom model name"
+              className="w-48 h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+              data-testid={isLocalCompat ? "local-openai-model" : undefined}
+            />
+          )}
+        </div>
+      </div>
+
+      {isLocalCompat && (
+        <label className="flex items-center gap-2 text-xs cursor-pointer">
+          <input
+            type="checkbox"
+            checked={draft.supportsVision}
+            onChange={(e) => onChange({ supportsVision: e.target.checked })}
+            className="w-3.5 h-3.5"
+            data-testid="local-openai-supports-vision"
+          />
+          <span>Vision capable (selected-image drafts). Uncheck to fail closed on images.</span>
+        </label>
+      )}
+
+      {/* Actions */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 text-xs gap-1"
+          disabled={draft.testStatus === "testing"}
+          onClick={onTest}
+        >
+          {draft.testStatus === "testing" ? (
+            <><RefreshCw size={11} className="animate-spin" /> Testing…</>
+          ) : (
+            <><TestTube2 size={11} /> Test Connection</>
+          )}
+        </Button>
+
+        {draft.testStatus === "ok" && (
+          <span className="flex items-center gap-1 text-xs text-green-600 font-medium">
+            <CheckCircle2 size={13} /> Connected
+          </span>
+        )}
+        {draft.testStatus === "fail" && (
+          <span className="flex items-center gap-1 text-xs text-red-600 font-medium max-w-xs truncate">
+            <XCircle size={13} /> {draft.testMessage || "Connection failed"}
+          </span>
+        )}
+        {isLocalCompat && draft.textProbe && (
+          <span className={`text-[10px] font-semibold ${draft.textProbe === "pass" ? "text-green-600" : "text-red-600"}`}>
+            Text: {draft.textProbe.toUpperCase()}
+          </span>
+        )}
+        {isLocalCompat && draft.visionProbe && (
+          <span className={`text-[10px] font-semibold ${draft.visionProbe === "pass" ? "text-green-600" : "text-red-600"}`}>
+            Vision: {draft.visionProbe.toUpperCase()}
+          </span>
+        )}
+
+        <label className="flex items-center gap-1.5 cursor-pointer ml-auto">
+          <input
+            type="checkbox"
+            checked={draft.isDefault}
+            onChange={(e) => onChange({ isDefault: e.target.checked })}
+            className="w-3.5 h-3.5"
+          />
+          <span className="text-xs text-muted-foreground">Set as default provider</span>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Settings Page ───────────────────────────────────────────────────────
+export function AiReportingPanel() {
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+
+  const [activeSection, setActiveSection] = useState<
+    "general" | "providers" | "prompts" | "permissions" | "local-ai" | "overnight"
+  >("general");
+
+  // Local AI settings state
+  const [localAi, setLocalAi] = useState({
+    primaryUrl: "",
+    fallbackUrl: "",
+    model: "",
+    composerModel: "",
+    composerFallbackModel: "",
+    composerNumCtx: 4096,
+    composerTemperature: 0.1,
+    composerTimeoutSeconds: 45,
+    backgroundEnabled: true,
+    reviewBeforeApply: true,
+    autoCompose: false,
+    concurrency: 1,
+    knownModels: [] as string[],
+    enabled: false,
+    // Must match the server default (`ollama_local_only` is notNull().default(false)
+    // and the GET fallback is false). This screen previously started from `true`,
+    // so on a fresh install the toggle DISPLAYED "Local / LAN mode: ON" while the
+    // database held false and the Composer refused the LAN endpoint. Worse, the
+    // "Test connection" button reads this same local state, so the test PASSED
+    // while real composition was blocked — a settings screen that disagreed with
+    // the thing it configured.
+    localOnly: false,
+    timeoutSeconds: 30,
+    auditEnabled: true,
+  });
+  const [composerDiag, setComposerDiag] = useState<string>("");
+  const [composerTestStatus, setComposerTestStatus] = useState<"idle" | "testing" | "ok" | "fail">("idle");
+  const [composerTestMsg, setComposerTestMsg] = useState("");
+  const [localAiTestStatus, setLocalAiTestStatus] = useState<"idle" | "testing" | "ok" | "fail">("idle");
+  const [localAiTestMsg, setLocalAiTestMsg] = useState("");
+  const [localAiProbing, setLocalAiProbing] = useState(false);
+  const [localAiProbeResult, setLocalAiProbeResult] = useState<{ url: string; reachable: boolean }[]>([]);
+  const [localAiSaving, setLocalAiSaving] = useState(false);
+  /** Persisted clinic_settings values — used to detect unsaved composer edits. */
+  const [persistedComposer, setPersistedComposer] = useState({ model: "", fallback: "" });
+  const [modelsCacheMeta, setModelsCacheMeta] = useState<{
+    status: "idle" | "fresh" | "stale" | "refreshing" | "error";
+    fetchedAt: number | null;
+    message: string;
+  }>({ status: "idle", fetchedAt: null, message: "" });
+  const [composerRuntimeDiag, setComposerRuntimeDiag] = useState<ComposerRuntimeDiag | null>(null);
+  const [composerRuntimeLoading, setComposerRuntimeLoading] = useState(false);
+  const autoDiscoverOnceRef = useRef(false);
+  const lastAutoEndpointRef = useRef<string>("");
+
+  const refreshComposerDiagnostics = useCallback(async () => {
+    setComposerRuntimeLoading(true);
+    try {
+      const r = await api.get<{ ok?: boolean; composer?: ComposerRuntimeDiag }>(
+        "/api/radiology/report-composer/diagnostics",
+      );
+      setComposerRuntimeDiag(r.composer ?? null);
+    } catch {
+      /* soft */
+    } finally {
+      setComposerRuntimeLoading(false);
+    }
+  }, []);
+
+  /**
+   * Discover installed Ollama models via tags-only endpoint.
+   * Never wipes previous knownModels on failure; always preserves selected tags.
+   */
+  const discoverInstalledModels = useCallback(
+    async (opts: { force?: boolean; baseUrl?: string; silent?: boolean } = {}) => {
+      const endpoint = (opts.baseUrl ?? localAi.primaryUrl).trim();
+      if (!endpoint) return;
+      const cached = readKnownModelsCache(endpoint);
+      if (!opts.force && isKnownModelsCacheFresh(cached)) {
+        setLocalAi((s) => ({
+          ...s,
+          knownModels: mergeDiscoveredModels(cached!.models, [
+            s.model,
+            s.composerModel,
+            s.composerFallbackModel,
+            ...(cached!.preserved ?? []),
+          ]),
+        }));
+        setModelsCacheMeta({
+          status: "fresh",
+          fetchedAt: cached!.fetchedAt,
+          message: `Cached models (${cacheAgeLabel(cached!.fetchedAt)})`,
+        });
+        return;
+      }
+
+      setModelsCacheMeta((m) => ({
+        ...m,
+        status: "refreshing",
+        message: "Refreshing installed models from Ollama…",
+      }));
+      try {
+        const r = await api.post<{
+          ok: boolean;
+          error?: string;
+          models?: string[];
+          endpointUsed?: string;
+        }>("/api/radiology-ollama/list-models", {
+          baseUrl: endpoint,
+        });
+        if (r.ok && Array.isArray(r.models)) {
+          setLocalAi((s) => {
+            const merged = mergeDiscoveredModels(r.models ?? [], [
+              s.model,
+              s.composerModel,
+              s.composerFallbackModel,
+              ...(cached?.models ?? []),
+            ]);
+            const preserved = mergeDiscoveredModels([], [
+              s.model,
+              s.composerModel,
+              s.composerFallbackModel,
+            ]).filter((m) => !(r.models ?? []).includes(m));
+            writeKnownModelsCache({
+              endpoint: r.endpointUsed ?? endpoint,
+              models: r.models ?? [],
+              fetchedAt: Date.now(),
+              preserved,
+            });
+            return { ...s, knownModels: merged };
+          });
+          setModelsCacheMeta({
+            status: "fresh",
+            fetchedAt: Date.now(),
+            message: `${r.models.length} model(s) from Ollama`,
+          });
+          if (!opts.silent) {
+            toast({ title: `${r.models.length} model(s) from Ollama`, description: r.endpointUsed ?? endpoint });
+          }
+        } else {
+          // Preserve existing / cached list — never wipe on failure
+          if (cached?.models?.length) {
+            setLocalAi((s) => ({
+              ...s,
+              knownModels: mergeDiscoveredModels(cached.models, [
+                s.model,
+                s.composerModel,
+                s.composerFallbackModel,
+                ...(cached.preserved ?? []),
+              ]),
+            }));
+          }
+          setModelsCacheMeta({
+            status: cached ? "stale" : "error",
+            fetchedAt: cached?.fetchedAt ?? null,
+            message: r.error ?? "Could not list models — keeping previous cache",
+          });
+          if (!opts.silent) {
+            toast({
+              title: "Could not list models",
+              description: r.error ?? "Keeping previously cached models",
+              variant: "destructive",
+            });
+          }
+        }
+      } catch (e: unknown) {
+        if (cached?.models?.length) {
+          setLocalAi((s) => ({
+            ...s,
+            knownModels: mergeDiscoveredModels(cached.models, [
+              s.model,
+              s.composerModel,
+              s.composerFallbackModel,
+              ...(cached.preserved ?? []),
+            ]),
+          }));
+        }
+        setModelsCacheMeta({
+          status: cached ? "stale" : "error",
+          fetchedAt: cached?.fetchedAt ?? null,
+          message: e instanceof Error ? e.message : "Discovery failed — keeping previous cache",
+        });
+        if (!opts.silent) {
+          toast({
+            title: "Could not list models",
+            description: e instanceof Error ? e.message : "Failed",
+            variant: "destructive",
+          });
+        }
+      }
+    },
+    [localAi.primaryUrl, toast],
+  );
+
+  async function handleLocalAiProbe() {
+    setLocalAiProbing(true);
+    try {
+      const r = await api.post<{ results: { url: string; reachable: boolean }[]; recommendedUrl: string | null }>(
+        "/api/radiology-ollama/probe", {}
+      );
+      setLocalAiProbeResult(r.results);
+      if (r.recommendedUrl) {
+        const prev = localAi.primaryUrl;
+        setLocalAi((s) => ({ ...s, primaryUrl: r.recommendedUrl! }));
+        toast({ title: `Auto-detected: ${r.recommendedUrl}` });
+        if (r.recommendedUrl !== prev) {
+          await discoverInstalledModels({ force: true, baseUrl: r.recommendedUrl, silent: true });
+        }
+      } else {
+        toast({ title: "No Ollama endpoint reachable", description: "Ensure Ollama is running on the Windows PC.", variant: "destructive" });
+      }
+    } catch { toast({ title: "Probe failed", variant: "destructive" }); }
+    setLocalAiProbing(false);
+  }
+
+  async function handleLocalAiTest() {
+    setLocalAiTestStatus("testing"); setLocalAiTestMsg("");
+    try {
+      const r = await api.post<{
+        ok: boolean;
+        error?: string;
+        models?: string[];
+        model?: string;
+        endpointUsed?: string;
+        message?: string;
+      }>(
+        "/api/radiology-ollama/test",
+        { baseUrl: localAi.primaryUrl, model: localAi.model, allowLocal: localAi.localOnly }
+      );
+      if (r.ok) {
+        setLocalAiTestStatus("ok");
+        setLocalAiTestMsg(
+          `Connected to ${r.endpointUsed ?? localAi.primaryUrl} · model ${r.model ?? localAi.model} · ${r.models?.length ?? 0} models available.`,
+        );
+        if (r.models?.length) {
+          setLocalAi((s) => ({
+            ...s,
+            knownModels: mergeDiscoveredModels(r.models!, [
+              s.model,
+              s.composerModel,
+              s.composerFallbackModel,
+            ]),
+          }));
+          writeKnownModelsCache({
+            endpoint: r.endpointUsed ?? localAi.primaryUrl,
+            models: r.models,
+            fetchedAt: Date.now(),
+            preserved: mergeDiscoveredModels([], [
+              localAi.model,
+              localAi.composerModel,
+              localAi.composerFallbackModel,
+            ]).filter((m) => !r.models!.includes(m)),
+          });
+          setModelsCacheMeta({
+            status: "fresh",
+            fetchedAt: Date.now(),
+            message: `${r.models.length} model(s) from Test Primary`,
+          });
+        }
+      } else {
+        setLocalAiTestStatus("fail"); setLocalAiTestMsg(r.error ?? r.message ?? "Failed");
+      }
+    } catch (e: unknown) {
+      setLocalAiTestStatus("fail"); setLocalAiTestMsg(e instanceof Error ? e.message : "Failed");
+    }
+  }
+
+  /** Fill the Composer / Vision dropdowns from Ollama /api/tags (tags-only). */
+  async function handleRefreshInstalledModels() {
+    setLocalAiProbing(true);
+    try {
+      await discoverInstalledModels({ force: true, silent: false });
+    } finally {
+      setLocalAiProbing(false);
+    }
+  }
+
+  async function handleComposerTest() {
+    setComposerTestStatus("testing");
+    setComposerTestMsg("");
+    const unsaved =
+      (localAi.composerModel || "") !== (persistedComposer.model || "") ||
+      (localAi.composerFallbackModel || "") !== (persistedComposer.fallback || "");
+    if (unsaved) {
+      setComposerTestStatus("fail");
+      setComposerTestMsg("Unsaved changes — Save Local AI Settings before testing.");
+      return;
+    }
+    try {
+      const r = await api.post<{
+        ok: boolean;
+        error?: string;
+        compose?: { model?: string; latencyMs?: number; displayStatus?: string; fallbackUsed?: boolean };
+        runtime?: { model?: string; statusMessage?: string | null };
+      }>("/api/radiology/report-composer/test", {
+        studyType: "MRI LS Spine",
+        region: "LS_SPINE",
+        modality: "MR",
+      });
+      if (r.ok) {
+        setComposerTestStatus("ok");
+        setComposerTestMsg(
+          `${r.compose?.displayStatus ?? "ok"} · ${r.compose?.latencyMs ?? 0}ms · model ${r.compose?.model ?? r.runtime?.model ?? "(none)"}`,
+        );
+      } else {
+        setComposerTestStatus("fail");
+        setComposerTestMsg(
+          r.error ?? r.runtime?.statusMessage ?? r.compose?.displayStatus ?? "Test failed",
+        );
+      }
+      void refreshComposerDiagnostics();
+    } catch (e: unknown) {
+      setComposerTestStatus("fail");
+      setComposerTestMsg(e instanceof Error ? e.message : "Test failed");
+    }
+  }
+
+  async function handleLocalAiSave() {
+    setLocalAiSaving(true);
+    try {
+      await api.post("/api/clinic-settings/ollama", {
+        ollamaEnabled: localAi.enabled,
+        ollamaBaseUrl: localAi.primaryUrl,
+        ollamaFallbackUrl: localAi.fallbackUrl,
+        ollamaModel: localAi.model,
+        ollamaLocalOnly: localAi.localOnly,
+        ollamaTimeoutSeconds: localAi.timeoutSeconds,
+        ollamaAuditEnabled: localAi.auditEnabled,
+        ollamaComposerModel: localAi.composerModel || null,
+        ollamaComposerFallbackModel: localAi.composerFallbackModel || null,
+        ollamaComposerNumCtx: localAi.composerNumCtx,
+        ollamaComposerTemperature: localAi.composerTemperature,
+        ollamaComposerTimeoutSeconds: localAi.composerTimeoutSeconds,
+        reportComposerBackgroundEnabled: localAi.backgroundEnabled,
+        reportComposerReviewBeforeApply: localAi.reviewBeforeApply,
+        reportComposerAutoCompose: localAi.autoCompose,
+        reportComposerConcurrency: localAi.concurrency,
+        ollamaKnownModels: JSON.stringify(localAi.knownModels ?? []),
+      });
+      setPersistedComposer({
+        model: localAi.composerModel || "",
+        fallback: localAi.composerFallbackModel || "",
+      });
+      void queryClient.invalidateQueries({ queryKey: ["clinic-settings"] });
+      void queryClient.invalidateQueries({ queryKey: ["voice-composer-config"] });
+      await refreshComposerDiagnostics();
+      toast({ title: "Local AI settings saved" });
+    } catch (e: unknown) {
+      toast({ title: "Save failed", description: e instanceof Error ? e.message : "Error", variant: "destructive" });
+    }
+    setLocalAiSaving(false);
+  }
+
+  const { data, isLoading } = useQuery<SettingsResponse>({
+    queryKey: ["ai-reporting-settings"],
+    queryFn: () => api.get("/api/ai-reporting/settings"),
+  });
+
+  // Clinic settings — the Local AI tab is the ONE place Ollama endpoint/model/
+  // timeout/enabled config lives, so it must reflect what's actually saved
+  // (clinic_settings.ollama_*), not just UI defaults. Shares the ["clinic-settings"]
+  // query cache with RadiologySettingsCenter (same key), so no extra fetch when
+  // this panel is embedded there.
+  const { data: clinicSettingsData } = useQuery<Record<string, unknown>>({
+    queryKey: ["clinic-settings"],
+    queryFn: () => api.get("/api/clinic-settings"),
+  });
+  const [localAiHydrated, setLocalAiHydrated] = useState(false);
+
+  // Local state
+  const [globalDraft, setGlobalDraft] = useState<GlobalSettings>({
+    enabled: false,
+    defaultProvider: "gemini",
+    defaultPrompt: "",
+    defaultPromptTemplate: "",
+    includeDemographics: false,
+    anonymize: true,
+    cloudTextPhiAllowed: false,
+    aiSecurityMode: "clinical",
+    allowedRoles: ["admin", "super_admin", "doctor", "radiologist"],
+  });
+
+  const [providerDrafts, setProviderDrafts] = useState<Record<string, ProviderDraft>>({});
+  const [hydrated, setHydrated] = useState(false);
+
+  // Hydrate form from API data when it arrives
+  if (data && !hydrated) {
+    setHydrated(true);
+    setGlobalDraft({ ...globalDraft, ...data.global });
+    const newDrafts: Record<string, ProviderDraft> = {};
+    for (const p of Object.keys(data.providers)) {
+      const pd = data.providers[p];
+      const defaultModel = pd.defaultModel ?? (pd.defaultModels?.[0] ?? "");
+      newDrafts[p] = {
+        isEnabled: pd.isEnabled,
+        isDefault: pd.isDefault,
+        apiKey: "",
+        endpointUrl: pd.endpointUrl ?? "",
+        defaultModel,
+        displayName: pd.displayName ?? (p === "local_openai_compatible" ? "Bonsai 2 27B" : ""),
+        supportsVision: pd.supportsVision !== false,
+        showKey: false,
+        testStatus: "idle",
+        testMessage: "",
+        textProbe: null,
+        visionProbe: null,
+      };
+    }
+    setProviderDrafts(newDrafts);
+  }
+
+  // Hydrate Local AI (Ollama) state from clinic_settings when it arrives —
+  // without this, the tab always showed hardcoded placeholder values, so
+  // opening it and clicking Save could silently overwrite real production
+  // endpoints with UI defaults.
+  if (clinicSettingsData && !localAiHydrated) {
+    setLocalAiHydrated(true);
+    const cs = clinicSettingsData as {
+      ollamaBaseUrl?: string | null; ollamaFallbackUrl?: string | null; ollamaModel?: string | null;
+      ollamaEnabled?: boolean; ollamaLocalOnly?: boolean; ollamaTimeoutSeconds?: number; ollamaAuditEnabled?: boolean;
+      ollamaKnownModels?: string;
+      ollamaComposerModel?: string | null;
+      ollamaComposerFallbackModel?: string | null;
+      ollamaComposerNumCtx?: number;
+      ollamaComposerTemperature?: string | number;
+      ollamaComposerTimeoutSeconds?: number;
+      reportComposerBackgroundEnabled?: boolean;
+      reportComposerReviewBeforeApply?: boolean;
+      reportComposerAutoCompose?: boolean;
+      reportComposerConcurrency?: number;
+    };
+    const rawModel = (cs.ollamaModel ?? localAi.model ?? "").trim();
+    // Keep saved clinic value as-is (legacy aliases are normalized only on server save).
+    const model = rawModel;
+    setLocalAi((s) => ({
+      ...s,
+      primaryUrl: cs.ollamaBaseUrl ?? s.primaryUrl,
+      fallbackUrl: cs.ollamaFallbackUrl ?? s.fallbackUrl,
+      model,
+      composerModel: cs.ollamaComposerModel ?? "",
+      composerFallbackModel: cs.ollamaComposerFallbackModel ?? "",
+      composerNumCtx: cs.ollamaComposerNumCtx ?? s.composerNumCtx,
+      composerTemperature: Number(cs.ollamaComposerTemperature ?? s.composerTemperature),
+      composerTimeoutSeconds: cs.ollamaComposerTimeoutSeconds ?? s.composerTimeoutSeconds,
+      backgroundEnabled: cs.reportComposerBackgroundEnabled ?? s.backgroundEnabled,
+      reviewBeforeApply: cs.reportComposerReviewBeforeApply ?? s.reviewBeforeApply,
+      autoCompose: cs.reportComposerAutoCompose ?? s.autoCompose,
+      concurrency: cs.reportComposerConcurrency ?? s.concurrency,
+      knownModels: (() => {
+        try {
+          const parsed = JSON.parse(cs.ollamaKnownModels ?? "[]");
+          return Array.isArray(parsed) ? parsed.map(String) : s.knownModels;
+        } catch {
+          return s.knownModels;
+        }
+      })(),
+      enabled: cs.ollamaEnabled ?? s.enabled,
+      localOnly: cs.ollamaLocalOnly ?? s.localOnly,
+      timeoutSeconds: cs.ollamaTimeoutSeconds ?? s.timeoutSeconds,
+      auditEnabled: cs.ollamaAuditEnabled ?? s.auditEnabled,
+    }));
+    setPersistedComposer({
+      model: cs.ollamaComposerModel ?? "",
+      fallback: cs.ollamaComposerFallbackModel ?? "",
+    });
+  }
+
+  const saveMutation = useMutation({
+    mutationFn: (payload: { global: GlobalSettings; providers: Record<string, Omit<ProviderDraft, "showKey" | "testStatus" | "testMessage">> }) =>
+      api.post("/api/ai-reporting/settings", payload),
+    onSuccess: () => {
+      toast({ title: "AI Reporting settings saved" });
+      void queryClient.invalidateQueries({ queryKey: ["ai-reporting-settings"] });
+      void queryClient.invalidateQueries({ queryKey: ["feature-flags"] });
+      window.dispatchEvent(new Event("featureFlagsChanged"));
+    },
+    onError: (e: Error) => toast({ title: "Save failed", description: e.message, variant: "destructive" }),
+  });
+
+  // Auto-discover installed models when Local AI tab is open (respect 4h cache).
+  useEffect(() => {
+    if (activeSection !== "local-ai") return;
+    if (!localAiHydrated) return;
+    const endpoint = localAi.primaryUrl.trim();
+    if (!endpoint) return;
+    void refreshComposerDiagnostics();
+    if (lastAutoEndpointRef.current && lastAutoEndpointRef.current !== endpoint) {
+      // Endpoint changed since last auto-run — force refresh.
+      lastAutoEndpointRef.current = endpoint;
+      void discoverInstalledModels({ force: true, silent: true });
+      return;
+    }
+    if (autoDiscoverOnceRef.current && lastAutoEndpointRef.current === endpoint) return;
+    autoDiscoverOnceRef.current = true;
+    lastAutoEndpointRef.current = endpoint;
+    void discoverInstalledModels({ force: false, silent: true });
+  }, [
+    activeSection,
+    localAiHydrated,
+    localAi.primaryUrl,
+    discoverInstalledModels,
+    refreshComposerDiagnostics,
+  ]);
+
+  const hasUnsavedComposerChanges =
+    (localAi.composerModel || "") !== (persistedComposer.model || "") ||
+    (localAi.composerFallbackModel || "") !== (persistedComposer.fallback || "");
+
+  // Tags typed manually / cloud that are not in the last successful Ollama /api/tags list
+  const lastDiscoveredTags = readKnownModelsCache(localAi.primaryUrl)?.models ?? [];
+  const configuredExtraTags = mergeDiscoveredModels([], [
+    localAi.composerModel,
+    localAi.composerFallbackModel,
+  ]).filter((m) => !lastDiscoveredTags.includes(m));
+
+  function handleSave() {
+    const providers: Record<
+      string,
+      Omit<ProviderDraft, "showKey" | "testStatus" | "testMessage" | "textProbe" | "visionProbe">
+    > = {};
+    for (const p of Object.keys(providerDrafts)) {
+      // Ollama endpoint/model are owned by Local AI (clinic_settings) and synced
+      // server-side — never overwrite them from the multi-provider form.
+      if (p === "ollama") continue;
+      const d = providerDrafts[p];
+      providers[p] = {
+        isEnabled: d.isEnabled,
+        isDefault: d.isDefault,
+        apiKey: d.apiKey,
+        endpointUrl: d.endpointUrl,
+        defaultModel: d.defaultModel,
+        displayName: d.displayName,
+        supportsVision: d.supportsVision,
+      };
+    }
+    saveMutation.mutate({ global: globalDraft, providers });
+  }
+
+  async function handleTestProvider(name: string) {
+    setProviderDrafts((prev) => ({
+      ...prev,
+      [name]: {
+        ...prev[name],
+        testStatus: "testing",
+        testMessage: "",
+        textProbe: null,
+        visionProbe: null,
+      },
+    }));
+    try {
+      const payload: Record<string, unknown> = {
+        provider: name,
+        model: providerDrafts[name].defaultModel,
+      };
+      if (name === "ollama") {
+        payload.endpointUrl = providerDrafts[name].endpointUrl || undefined;
+      } else {
+        payload.apiKey = providerDrafts[name].apiKey || undefined;
+        if (providerDrafts[name].endpointUrl?.trim()) {
+          payload.endpointUrl = providerDrafts[name].endpointUrl.trim();
+        }
+      }
+      if (name === "local_openai_compatible") {
+        payload.probeVision = true;
+      }
+      const res = await api.post<{
+        success: boolean;
+        response?: string;
+        error?: string;
+        availableModels?: string[];
+        text?: "pass" | "fail";
+        vision?: "pass" | "fail" | "skipped";
+      }>("/api/ai-reporting/test-provider", payload);
+      setProviderDrafts((prev) => ({
+        ...prev,
+        [name]: {
+          ...prev[name],
+          testStatus: res.success ? "ok" : "fail",
+          testMessage: res.error ?? res.response ?? "",
+          textProbe: res.text ?? (res.success ? "pass" : "fail"),
+          visionProbe:
+            res.vision === "pass" || res.vision === "fail" ? res.vision : null,
+        },
+      }));
+    } catch (e: unknown) {
+      setProviderDrafts((prev) => ({
+        ...prev,
+        [name]: {
+          ...prev[name],
+          testStatus: "fail",
+          testMessage: e instanceof Error ? e.message : "Connection failed",
+          textProbe: "fail",
+        },
+      }));
+    }
+  }
+
+  const SECTIONS = [
+    { id: "general", icon: Settings2, label: "General" },
+    { id: "providers", icon: Key, label: "AI Providers" },
+    { id: "local-ai", icon: Zap, label: "Local AI" },
+    { id: "overnight", icon: Moon, label: "Draft automation" },
+    { id: "prompts", icon: BookOpen, label: "Prompt Templates" },
+    { id: "permissions", icon: Users, label: "Permissions" },
+  ] as const;
+
+  if (isLoading) {
+    return (
+      <div className="p-6 flex items-center justify-center h-64">
+        <RefreshCw size={24} className="animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 max-w-4xl">
+      <div className="flex justify-end">
+        <Button onClick={handleSave} disabled={saveMutation.isPending} className="gap-2">
+          {saveMutation.isPending ? <RefreshCw size={14} className="animate-spin" /> : <Save size={14} />}
+          Save Settings
+        </Button>
+      </div>
+
+      {/* AI Enabled master toggle */}
+      <div className={`rounded-xl border p-5 flex items-center justify-between ${globalDraft.enabled ? "bg-green-50 border-green-200 dark:bg-green-950/20 dark:border-green-800" : "bg-muted/30"}`}>
+        <div className="flex items-center gap-3">
+          <BrainCircuit size={22} className={globalDraft.enabled ? "text-green-600" : "text-muted-foreground"} />
+          <div>
+            <p className="font-semibold text-sm">{globalDraft.enabled ? "AI Reporting is ENABLED" : "AI Reporting is DISABLED"}</p>
+            <p className="text-xs text-muted-foreground">Toggle to allow or restrict AI assistance across all radiology workflows</p>
+          </div>
+        </div>
+        <div
+          className={`relative w-12 h-6 rounded-full cursor-pointer transition-colors ${globalDraft.enabled ? "bg-green-500" : "bg-muted-foreground/30"}`}
+          onClick={() => setGlobalDraft((g) => ({ ...g, enabled: !g.enabled }))}
+        >
+          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow transition-transform ${globalDraft.enabled ? "translate-x-7" : "translate-x-1"}`} />
+        </div>
+      </div>
+
+      {/* Section tabs */}
+      <div className="flex gap-1 rounded-xl bg-muted/50 p-1">
+        {SECTIONS.map(({ id, icon: Icon, label }) => (
+          <button
+            key={id}
+            onClick={() => setActiveSection(id)}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${activeSection === id ? "bg-background shadow text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+          >
+            <Icon size={13} />
+            <span className="hidden sm:inline">{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* ── General Settings ── */}
+      {activeSection === "general" && (
+        <div className="space-y-5">
+          <div className="rounded-xl border bg-card p-5 space-y-4">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><Settings2 size={14} /> General Settings</h3>
+
+            {/* Default Provider */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground">Default AI Provider</label>
+              <select
+                value={globalDraft.defaultProvider}
+                onChange={(e) => setGlobalDraft((g) => ({ ...g, defaultProvider: e.target.value }))}
+                className="w-full h-9 px-3 text-sm rounded-lg border bg-background"
+              >
+                {data && Object.values(data.providers).map((p) => (
+                  <option key={p.provider} value={p.provider}>{p.label}</option>
+                ))}
+                {!data && <option value={globalDraft.defaultProvider}>{globalDraft.defaultProvider}</option>}
+              </select>
+            </div>
+
+            {/* Privacy toggles */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <label className="flex items-center justify-between gap-3 p-3 rounded-lg border bg-background cursor-pointer select-none">
+                <div>
+                  <p className="text-xs font-semibold">Ask AI Not To Repeat Identifiers</p>
+                  <p className="text-[10px] text-muted-foreground">Adds a privacy instruction to the prompt. Does not remove identifiers from the images.</p>
+                </div>
+                <div
+                  className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${globalDraft.anonymize ? "bg-primary" : "bg-muted"}`}
+                  onClick={() => setGlobalDraft((g) => ({ ...g, anonymize: !g.anonymize }))}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${globalDraft.anonymize ? "translate-x-5" : "translate-x-0.5"}`} />
+                </div>
+              </label>
+
+              <label className="flex items-center justify-between gap-3 p-3 rounded-lg border bg-background cursor-pointer select-none">
+                <div>
+                  <p className="text-xs font-semibold">Include Patient Demographics</p>
+                  <p className="text-[10px] text-muted-foreground">Append the patient&apos;s name, age and gender to the AI prompt</p>
+                </div>
+                <div
+                  className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${globalDraft.includeDemographics ? "bg-primary" : "bg-muted"}`}
+                  onClick={() => setGlobalDraft((g) => ({ ...g, includeDemographics: !g.includeDemographics }))}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${globalDraft.includeDemographics ? "translate-x-5" : "translate-x-0.5"}`} />
+                </div>
+              </label>
+
+              <label className="flex items-center justify-between gap-3 p-3 rounded-lg border bg-background cursor-pointer select-none">
+                <div>
+                  <p className="text-xs font-semibold">Allow Identifiers In Cloud Text</p>
+                  <p className="text-[10px] text-muted-foreground">Off by default: a prompt that names a patient is blocked from cloud providers. When on, names, IDs and dates of birth are redacted before sending.</p>
+                </div>
+                <div
+                  className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${globalDraft.cloudTextPhiAllowed ? "bg-primary" : "bg-muted"}`}
+                  onClick={() => setGlobalDraft((g) => ({ ...g, cloudTextPhiAllowed: !g.cloudTextPhiAllowed }))}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${globalDraft.cloudTextPhiAllowed ? "translate-x-5" : "translate-x-0.5"}`} />
+                </div>
+              </label>
+
+              {/*
+                PR-A2. The server is the authority: it normalizes this value on read,
+                re-validates it on write, and refuses the write unless the session is
+                admin or super_admin. This control changes a number in one row of
+                `ai_provider_settings` — no redeploy, no environment variable — and the
+                next AI send reads it. The sentence below states what each mode means;
+                the live, effective answer is the egress inspector's, not this label.
+              */}
+              <div className="p-3 rounded-lg border bg-background">
+                <p className="text-xs font-semibold">AI Security Mode</p>
+                <p className="text-[10px] text-muted-foreground mb-2">
+                  Development / Testing is for evaluating models with your own data: cloud vision runs when it is
+                  enabled, and no per-request attestation is demanded. Clinical / Controlled keeps a patient's images
+                  on local models unless a clinician attests that specific request. Changing either mode takes effect
+                  on the next AI call — no restart. Administrators only.
+                </p>
+                <select
+                  data-testid="ai-security-mode"
+                  className="text-xs border rounded-md px-2 py-1 bg-background"
+                  value={globalDraft.aiSecurityMode}
+                  onChange={(e) =>
+                    setGlobalDraft((g) => ({
+                      ...g,
+                      aiSecurityMode: e.target.value as GlobalSettings["aiSecurityMode"],
+                    }))
+                  }
+                >
+                  <option value="clinical">Clinical / Controlled (default)</option>
+                  <option value="development">Development / Testing</option>
+                </select>
+                <p className="text-[10px] text-muted-foreground mt-2" data-testid="ai-security-mode-meaning">
+                  Clinical: attestation required for cloud patient images, and an unrecorded cloud image send is
+                  refused. Development: no attestation, audit is best-effort. Local Ollama inference and every
+                  patient/study ownership check are the same in both.
+                </p>
+              </div>
+            </div>
+
+            {globalDraft.anonymize && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 p-3 flex gap-2 text-xs">
+                <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+                <p className="text-amber-800 dark:text-amber-300">
+                  <strong>No identifiers are removed before sending.</strong> The images leave as the scanner stored them — the viewer render carries no DICOM tags, but anything the machine burned into the picture, which is routine on ultrasound, still shows the patient&apos;s name. The prompt carries whichever demographics you enable below. This switch only adds an instruction asking the model not to repeat identifiers. Keep imaging on a local model until de-identification is built.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Security notice */}
+          <div className="rounded-xl border bg-muted/30 p-5 space-y-2">
+            <h3 className="text-xs font-semibold flex items-center gap-2 text-muted-foreground">
+              <ShieldCheck size={13} /> Security
+            </h3>
+            <ul className="text-xs text-muted-foreground space-y-1 list-disc list-inside">
+              <li>API keys are AES-256 encrypted at rest and never exposed to the browser.</li>
+              <li>All AI queries are routed through the ERP backend — never directly from the browser.</li>
+              <li>Only users with the <code className="bg-muted px-1 rounded">ai_reporting.use</code> permission can query AI.</li>
+              <li>Only admins can configure API keys (<code className="bg-muted px-1 rounded">ai_reporting.configure</code> permission).</li>
+              <li>Every AI reporting query is audit-logged with user, study, provider, and whether identifiers were actually removed from what was sent.</li>
+              <li>AI responses are draft-only — a doctor/radiologist must review and approve before final signing.</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* ── Local AI / Ollama Settings ── */}
+      {activeSection === "local-ai" && (
+        <div className="space-y-4">
+          <div className="rounded-xl border bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800 p-4 flex gap-3 text-xs">
+            <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+            <div className="text-amber-800 dark:text-amber-300 space-y-1">
+              <p><strong>Local AI runs entirely on-premise.</strong> Patient data never leaves your network.</p>
+              <p>Requires Ollama running on the Windows PC (192.168.1.250) with models downloaded. See <code className="bg-amber-200 dark:bg-amber-900 px-1 rounded">docs/OLLAMA_SETUP.md</code> for full setup guide.</p>
+            </div>
+          </div>
+
+          {/* Master enable */}
+          <div className={`rounded-xl border p-4 flex items-center justify-between ${localAi.enabled ? "bg-green-50 border-green-200 dark:bg-green-950/20 dark:border-green-800" : "bg-muted/30"}`}>
+            <div className="flex items-center gap-3">
+              <Zap size={20} className={localAi.enabled ? "text-orange-500" : "text-muted-foreground"} />
+              <div>
+                <p className="font-semibold text-sm">Local AI Assistant {localAi.enabled ? "ENABLED" : "DISABLED"}</p>
+                <p className="text-xs text-muted-foreground">Shows AI tab in Radiology Command Center</p>
+              </div>
+            </div>
+            <div
+              className={`relative w-12 h-6 rounded-full cursor-pointer transition-colors ${localAi.enabled ? "bg-orange-500" : "bg-muted-foreground/30"}`}
+              onClick={() => setLocalAi((s) => ({ ...s, enabled: !s.enabled }))}
+            >
+              <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow transition-transform ${localAi.enabled ? "translate-x-7" : "translate-x-1"}`} />
+            </div>
+          </div>
+
+          {/* URL Configuration */}
+          <div className="rounded-xl border bg-card p-5 space-y-4">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><Wifi size={14} /> Ollama Endpoint URLs</h3>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground">Primary URL (Windows PC LAN IP)</label>
+              <input
+                type="text"
+                value={localAi.primaryUrl}
+                onChange={(e) => setLocalAi((s) => ({ ...s, primaryUrl: e.target.value }))}
+                placeholder="http://&lt;AI PC address&gt;:11434"
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground">Fallback URL (optional secondary NIC / IP)</label>
+              <input
+                type="text"
+                value={localAi.fallbackUrl}
+                onChange={(e) => setLocalAi((s) => ({ ...s, fallbackUrl: e.target.value }))}
+                placeholder="(optional)"
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+              />
+              <p className="text-[10px] text-muted-foreground">Backend probes primary first, switches to fallback if primary doesn't respond. Cached for 5 minutes.</p>
+            </div>
+
+            <div className="flex gap-2 flex-wrap">
+              <Button size="sm" variant="outline" className="h-7 text-xs gap-1" disabled={localAiProbing} onClick={handleLocalAiProbe}>
+                {localAiProbing ? <RefreshCw size={11} className="animate-spin" /> : <Wifi size={11} />}
+                Auto-Detect
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs gap-1" disabled={localAiTestStatus === "testing"} onClick={handleLocalAiTest}>
+                {localAiTestStatus === "testing" ? <RefreshCw size={11} className="animate-spin" /> : <TestTube2 size={11} />}
+                Test Primary
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1"
+                disabled={localAiProbing}
+                onClick={() => void handleRefreshInstalledModels()}
+                data-testid="refresh-ollama-models"
+              >
+                {localAiProbing ? <RefreshCw size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                Refresh installed models
+              </Button>
+              {localAiTestStatus === "ok" && <span className="flex items-center gap-1 text-xs text-green-600"><CheckCircle2 size={12} /> {localAiTestMsg}</span>}
+              {localAiTestStatus === "fail" && <span className="flex items-center gap-1 text-xs text-red-600"><XCircle size={12} /> {localAiTestMsg}</span>}
+            </div>
+            {modelsCacheMeta.message && (
+              <p
+                className={`text-[10px] ${
+                  modelsCacheMeta.status === "error"
+                    ? "text-red-600"
+                    : modelsCacheMeta.status === "stale"
+                      ? "text-amber-700"
+                      : "text-muted-foreground"
+                }`}
+                data-testid="models-cache-status"
+              >
+                Models cache: {modelsCacheMeta.message}
+                {modelsCacheMeta.status === "stale" ? " (showing previous list)" : ""}
+                {modelsCacheMeta.status === "fresh" && modelsCacheMeta.fetchedAt
+                  ? ` · ${cacheAgeLabel(modelsCacheMeta.fetchedAt)}`
+                  : ""}
+              </p>
+            )}
+            {localAi.knownModels.length > 0 && (
+              <p className="text-[10px] text-muted-foreground">
+                {localAi.knownModels.length} installed model(s) loaded for the dropdowns below (from Ollama, not hard-coded).
+              </p>
+            )}
+
+            {localAiProbeResult.length > 0 && (
+              <div className="space-y-1">
+                {localAiProbeResult.map((r) => (
+                  <div key={r.url} className={`flex items-center gap-2 text-[10px] px-2 py-1 rounded border ${r.reachable ? "border-green-300 bg-green-50 dark:bg-green-950/20 text-green-700" : "border-red-300 bg-red-50 dark:bg-red-950/20 text-red-600"}`}>
+                    {r.reachable ? <Wifi size={10} /> : <WifiOff size={10} />}
+                    <code className="font-mono">{r.url}</code>
+                    <span className="ml-auto">{r.reachable ? "✓ reachable" : "✗ unreachable"}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Model & Options */}
+          <div className="rounded-xl border bg-card p-5 space-y-4">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><BrainCircuit size={14} /> Model & Options</h3>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground">Vision / image model (overnight MRI, OCR vision)</label>
+              <select
+                value={localAi.model}
+                onChange={(e) => setLocalAi((s) => ({ ...s, model: e.target.value }))}
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+              >
+                <option value="">— Select installed model —</option>
+                {Array.from(new Set([
+                  ...localAi.knownModels,
+                  ...(localAi.model ? [localAi.model] : []),
+                ])).sort().map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={localAi.model}
+                onChange={(e) => setLocalAi((s) => ({ ...s, model: e.target.value }))}
+                placeholder="Installed Ollama vision model name"
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+              />
+              <p className="text-[10px] text-muted-foreground">
+                Overnight MRI, OCR vision, and Local AI panel use this model via <code className="bg-muted px-1 rounded">resolveLocalAiRuntime()</code>.
+                Does not change Report Composer. Options come from Refresh installed models / Test Primary.
+              </p>
+            </div>
+
+            <div className="space-y-1.5 border-t pt-4" data-testid="report-composer-model-section">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs font-semibold text-muted-foreground">
+                  Report Composer model (text report generation)
+                </label>
+                {hasUnsavedComposerChanges && (
+                  <span
+                    className="rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-950"
+                    data-testid="composer-unsaved-badge"
+                  >
+                    Unsaved changes
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] text-muted-foreground -mt-0.5">
+                Used by <strong>Draft from Observations</strong> and voice-assisted report composition.
+                Separate from image/vision model. Persists to <code className="bg-muted px-1 rounded">ollama_composer_model</code>.
+              </p>
+              <p className="text-[10px] text-muted-foreground">
+                Saved runtime: <code className="bg-muted px-1 rounded">{persistedComposer.model || "(not configured)"}</code>
+                {persistedComposer.fallback ? (
+                  <> · fallback <code className="bg-muted px-1 rounded">{persistedComposer.fallback}</code></>
+                ) : null}
+              </p>
+              <select
+                value={localAi.composerModel}
+                onChange={(e) => setLocalAi((s) => ({ ...s, composerModel: e.target.value }))}
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+                data-testid="composer-model-select"
+              >
+                <option value="">— Select installed model —</option>
+                <optgroup label="LOCAL OLLAMA">
+                  {Array.from(new Set([
+                    ...localAi.knownModels,
+                    ...(localAi.composerModel ? [localAi.composerModel] : []),
+                  ])).sort().map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </optgroup>
+              </select>
+              <input
+                type="text"
+                value={localAi.composerModel}
+                onChange={(e) => setLocalAi((s) => ({ ...s, composerModel: e.target.value }))}
+                placeholder="Type any Ollama text model or cloud tag (preserved on refresh)"
+                className="w-full h-9 px-3 text-xs rounded-lg border bg-background font-mono"
+                data-testid="composer-model-input"
+              />
+              <div className="rounded-md border border-dashed bg-muted/20 p-2 space-y-1" data-testid="composer-cloud-tags">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  OLLAMA CLOUD / configured tags
+                </p>
+                <p className="text-[10px] text-muted-foreground">
+                  DeepSeek V4.1 is <strong>not</strong> wired into Report Composer (adapter stub only; provider hard-wires Ollama).
+                  Manual / cloud tags typed here are preserved when refreshing local <code className="bg-muted px-1 rounded">/api/tags</code>
+                  and are sent to the configured Ollama endpoint if that instance serves them.
+                </p>
+                {configuredExtraTags.length > 0 ? (
+                  <ul className="text-[10px] font-mono list-disc pl-4">
+                    {configuredExtraTags.map((t) => (
+                      <li key={t}>{t}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-[10px] text-muted-foreground">No extra manual tags beyond the local list.</p>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-[10px] text-muted-foreground">Fallback model</label>
+                  <input
+                    type="text"
+                    value={localAi.composerFallbackModel}
+                    onChange={(e) => setLocalAi((s) => ({ ...s, composerFallbackModel: e.target.value }))}
+                    placeholder="(none)"
+                    className="w-full h-8 px-2 text-xs rounded border bg-background font-mono"
+                    data-testid="composer-fallback-input"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-muted-foreground">Context (num_ctx) — composer only</label>
+                  <input
+                    type="number"
+                    min={2048}
+                    max={8192}
+                    step={512}
+                    value={localAi.composerNumCtx}
+                    onChange={(e) => setLocalAi((s) => ({ ...s, composerNumCtx: Number(e.target.value) }))}
+                    className="w-full h-8 px-2 text-xs rounded border bg-background"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-muted-foreground">Temperature</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={localAi.composerTemperature}
+                    onChange={(e) => setLocalAi((s) => ({ ...s, composerTemperature: Number(e.target.value) }))}
+                    className="w-full h-8 px-2 text-xs rounded border bg-background"
+                    data-testid="composer-temperature"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-muted-foreground">Timeout (sec)</label>
+                  <input
+                    type="number"
+                    min={10}
+                    max={120}
+                    step={5}
+                    value={localAi.composerTimeoutSeconds}
+                    onChange={(e) => setLocalAi((s) => ({ ...s, composerTimeoutSeconds: Number(e.target.value) }))}
+                    className="w-full h-8 px-2 text-xs rounded border bg-background"
+                    data-testid="composer-timeout"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1"
+                  disabled={hasUnsavedComposerChanges}
+                  onClick={() => void handleComposerTest()}
+                  title={hasUnsavedComposerChanges ? "Save Local AI Settings first" : undefined}
+                >
+                  <TestTube2 size={12} /> Quick Composer Test
+                </Button>
+                {composerTestStatus === "ok" && <span className="text-xs text-green-600 flex items-center gap-1"><CheckCircle2 size={12} /> {composerTestMsg}</span>}
+                {composerTestStatus === "fail" && <span className="text-xs text-red-600 flex items-center gap-1"><XCircle size={12} /> {composerTestMsg}</span>}
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Text-only report composition for <strong>Draft from Observations</strong> and voice. Does not use vision model.
+                Composer num_ctx does not change global OLLAMA_NUM_CTX.
+                Example clinic text models: <code className="bg-muted px-1 rounded">gemma3:12b</code>,{" "}
+                <code className="bg-muted px-1 rounded">qwen3:14b</code> (select — not hard-coded).
+              </p>
+            </div>
+
+            <div className="space-y-2 border-t pt-4" data-testid="background-composer-settings">
+              <p className="text-xs font-semibold">Background Report Composer</p>
+              <p className="text-[11px] text-muted-foreground">
+                Radiologist-guided text composition. Separate from overnight vision AI. Auto Compose stays OFF until clinic trusts the workflow.
+              </p>
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={localAi.backgroundEnabled} onChange={(e) => setLocalAi((s) => ({ ...s, backgroundEnabled: e.target.checked }))} />
+                Background composer enabled
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={localAi.reviewBeforeApply} onChange={(e) => setLocalAi((s) => ({ ...s, reviewBeforeApply: e.target.checked }))} />
+                Review before apply (recommended ON)
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={localAi.autoCompose} onChange={(e) => setLocalAi((s) => ({ ...s, autoCompose: e.target.checked }))} />
+                Auto compose (default OFF)
+              </label>
+              <div className="flex items-center gap-2">
+                <label className="text-[10px] text-muted-foreground">Concurrency</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={3}
+                  value={localAi.concurrency}
+                  onChange={(e) => setLocalAi((s) => ({ ...s, concurrency: Number(e.target.value) }))}
+                  className="w-16 h-8 px-2 text-xs rounded border bg-background"
+                />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        const r = await api.post<Record<string, unknown>>("/api/radiology/report-composer/test", {});
+                        setComposerDiag(JSON.stringify(r, null, 2));
+                        toast({ title: r.ok ? "Composer self-test OK" : "Composer self-test issues", variant: r.ok ? undefined : "destructive" });
+                      } catch (e: unknown) {
+                        toast({ title: "Self-test failed", description: e instanceof Error ? e.message : String(e), variant: "destructive" });
+                      }
+                    })();
+                  }}
+                >
+                  Run Report Composer Test
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        const r = await api.get<Record<string, unknown>>("/api/radiology/report-composer/diagnostics");
+                        const text = JSON.stringify(r, null, 2);
+                        setComposerDiag(text);
+                        await navigator.clipboard.writeText(text);
+                        toast({ title: "Diagnostic report copied (PHI-safe)" });
+                      } catch (e: unknown) {
+                        toast({ title: "Diagnostics failed", description: e instanceof Error ? e.message : String(e), variant: "destructive" });
+                      }
+                    })();
+                  }}
+                >
+                  Copy Diagnostic Report
+                </Button>
+              </div>
+              {composerDiag && (
+                <pre className="max-h-40 overflow-auto rounded border bg-muted/30 p-2 text-[10px] font-mono whitespace-pre-wrap">{composerDiag}</pre>
+              )}
+            </div>
+
+            <PipelineDiagnosticsPanel />
+
+            <AiPipelineSelfTestPanel />
+
+            <OllamaAiDraftVerifyPanel />
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground flex items-center gap-1"><Gauge size={11} /> Timeout: {localAi.timeoutSeconds}s</label>
+              <input
+                type="range" min={10} max={120} step={5}
+                value={localAi.timeoutSeconds}
+                onChange={(e) => setLocalAi((s) => ({ ...s, timeoutSeconds: Number(e.target.value) }))}
+                className="w-full"
+              />
+              <p className="text-[10px] text-muted-foreground">Per-action timeout. 30s for impression; 60–120s for full draft generation.</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <label className="flex items-center justify-between gap-3 p-3 rounded-lg border bg-background cursor-pointer">
+                <div>
+                  <p className="text-xs font-semibold">LAN Mode</p>
+                  <p className="text-[10px] text-muted-foreground">Allow private IP addresses</p>
+                </div>
+                <div
+                  className={`relative w-10 h-5 rounded-full cursor-pointer transition-colors shrink-0 ${localAi.localOnly ? "bg-primary" : "bg-muted"}`}
+                  onClick={() => setLocalAi((s) => ({ ...s, localOnly: !s.localOnly }))}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${localAi.localOnly ? "translate-x-5" : "translate-x-0.5"}`} />
+                </div>
+              </label>
+              <label className="flex items-center justify-between gap-3 p-3 rounded-lg border bg-background cursor-pointer">
+                <div>
+                  <p className="text-xs font-semibold">Audit Logging</p>
+                  <p className="text-[10px] text-muted-foreground">Log all AI actions to DB</p>
+                </div>
+                <div
+                  className={`relative w-10 h-5 rounded-full cursor-pointer transition-colors shrink-0 ${localAi.auditEnabled ? "bg-primary" : "bg-muted"}`}
+                  onClick={() => setLocalAi((s) => ({ ...s, auditEnabled: !s.auditEnabled }))}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${localAi.auditEnabled ? "translate-x-5" : "translate-x-0.5"}`} />
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <ReportComposerTestPanel
+            diagnostics={composerRuntimeDiag}
+            diagnosticsLoading={composerRuntimeLoading}
+            onRefreshDiagnostics={() => void refreshComposerDiagnostics()}
+            hasUnsavedComposerChanges={hasUnsavedComposerChanges}
+            disabled={localAiSaving}
+          />
+
+          <Button onClick={handleLocalAiSave} disabled={localAiSaving} className="gap-2 w-full">
+            {localAiSaving ? <RefreshCw size={14} className="animate-spin" /> : <Save size={14} />}
+            Save Local AI Settings
+          </Button>
+        </div>
+      )}
+
+      {/* ── Overnight DICOM → Ollama drafts ── */}
+      {activeSection === "overnight" && (
+        <div className="space-y-4">
+          <AiPipelineSelfTestPanel />
+          <OllamaAiDraftVerifyPanel />
+          <OvernightAiSettings />
+        </div>
+      )}
+
+      {/* ── AI Providers ── */}
+      {activeSection === "providers" && (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-amber-200 bg-amber-50 dark:bg-amber-950/20 p-4 flex gap-3 text-xs">
+            <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+            <div className="text-amber-800 dark:text-amber-300 space-y-1">
+              <p><strong>API Keys are stored encrypted.</strong> Enter a new key to update it; leave blank to keep the existing key.</p>
+              <p>Enable at least one provider and set a default model before using AI reporting.</p>
+            </div>
+          </div>
+          {data && Object.values(data.providers).map((p) => (
+            <ProviderCard
+              key={p.provider}
+              name={p.provider}
+              meta={p}
+              draft={providerDrafts[p.provider]}
+              onChange={(d) => setProviderDrafts((prev) => ({ ...prev, [p.provider]: { ...prev[p.provider], ...d } }))}
+              onTest={() => void handleTestProvider(p.provider)}
+              syncedFromLocalAi={p.provider === "ollama"}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* ── Prompt Templates ── */}
+      {activeSection === "prompts" && (
+        <div className="space-y-5">
+          <div className="rounded-xl border bg-card p-5 space-y-4">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><BookOpen size={14} /> Default Prompt</h3>
+            <p className="text-xs text-muted-foreground">
+              Used when no template is selected in the AI drawer. Leave blank for a generic radiology report prompt.
+            </p>
+            <textarea
+              value={globalDraft.defaultPrompt}
+              onChange={(e) => setGlobalDraft((g) => ({ ...g, defaultPrompt: e.target.value }))}
+              placeholder="e.g. Provide a detailed, structured radiology report for the images provided. Include findings, impression and clinical recommendations."
+              className="w-full h-28 p-3 text-sm rounded-lg border bg-background resize-none"
+            />
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground">Default Template</label>
+              <select
+                value={globalDraft.defaultPromptTemplate}
+                onChange={(e) => setGlobalDraft((g) => ({ ...g, defaultPromptTemplate: e.target.value }))}
+                className="w-full h-9 px-3 text-sm rounded-lg border bg-background"
+              >
+                <option value="">-- No default template (use custom prompt above) --</option>
+                {(data?.promptTemplates ?? []).map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Preset templates reference */}
+          <div className="rounded-xl border bg-card p-5 space-y-3">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><FileText size={14} /> Built-in Preset Templates</h3>
+            <p className="text-xs text-muted-foreground">These are available in the AI viewer drawer. They cannot be edited here but you can add a custom default prompt above.</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {(data?.promptTemplates ?? []).map((t) => (
+                <div key={t} className="flex items-center gap-2 p-2 rounded-lg border bg-background text-xs">
+                  <CheckCircle2 size={12} className="text-green-500 shrink-0" />
+                  {t}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Permissions ── */}
+      {activeSection === "permissions" && (
+        <div className="space-y-5">
+          <div className="rounded-xl border bg-card p-5 space-y-4">
+            <h3 className="text-sm font-semibold flex items-center gap-2"><Users size={14} /> Role Permissions</h3>
+            <p className="text-xs text-muted-foreground">
+              Select which roles can use AI reporting. Admins and Super Admins always have access.
+              Staff must also have the <code className="bg-muted px-1 rounded">ai_reporting.use</code> permission in their profile.
+            </p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {ALL_ROLES.map((role) => {
+                const isAlwaysOn = role === "admin" || role === "super_admin";
+                const checked = isAlwaysOn || globalDraft.allowedRoles.includes(role);
+                return (
+                  <label
+                    key={role}
+                    className={`flex items-center gap-2.5 p-3 rounded-lg border cursor-pointer select-none text-xs ${checked ? "bg-primary/10 border-primary/30" : "bg-background"} ${isAlwaysOn ? "opacity-70 cursor-not-allowed" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={isAlwaysOn}
+                      onChange={(e) => {
+                        if (isAlwaysOn) return;
+                        setGlobalDraft((g) => ({
+                          ...g,
+                          allowedRoles: e.target.checked
+                            ? [...g.allowedRoles, role]
+                            : g.allowedRoles.filter((r) => r !== role),
+                        }));
+                      }}
+                      className="w-3.5 h-3.5"
+                    />
+                    <span className="font-medium">{SECTION_LABELS[role]}</span>
+                    {isAlwaysOn && <span className="text-[10px] text-muted-foreground ml-auto">(always)</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-muted/30 p-5 space-y-3">
+            <h3 className="text-xs font-semibold text-muted-foreground">Permission Reference</h3>
+            <div className="space-y-2 text-xs">
+              <div className="flex gap-3 p-2 rounded border bg-background">
+                <code className="bg-muted px-1.5 py-0.5 rounded font-mono text-xs shrink-0">ai_reporting.use</code>
+                <p className="text-muted-foreground">Send images/queries to AI, view responses, save and insert drafts. Grant to doctors, radiologists, or any role above.</p>
+              </div>
+              <div className="flex gap-3 p-2 rounded border bg-background">
+                <code className="bg-muted px-1.5 py-0.5 rounded font-mono text-xs shrink-0">ai_reporting.configure</code>
+                <p className="text-muted-foreground">Manage API keys, enable/disable providers, view audit logs. Admin and Super Admin only.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function AiReportingSettings() {
+  return (
+    <div className="p-4 md:p-6 space-y-6">
+      <PageHeader title="AI Reporting Integration" subtitle="Configure AI providers for DICOM/radiology study analysis and report generation" />
+      <AiReportingPanel />
+    </div>
+  );
+}

@@ -1,0 +1,258 @@
+/**
+ * A spine report is authored as sub-headed sections; it must PRINT as
+ * sub-headed sections.
+ *
+ * Before this, every non-structured path emitted ONE `<p>` for the whole
+ * findings field, so a radiologist's "Alignment / Vertebral Body / Disc Level
+ * Analysis / Facets & Ligaments / Thecal Sac & Neural Structures / Posterior
+ * Structures / Canal Diameter" document arrived at the printer as a single
+ * run-on block — which is the complaint that made the workspace unusable for
+ * spine reporting.
+ *
+ * These are HTML-shape assertions on the real builders, not source greps: the
+ * artefact under test is the markup that reaches the print stylesheet.
+ */
+import { describe, expect, it } from "vitest";
+import { buildSignedReportBodyHtml } from "./radiologyReportPrintLiveMerge";
+import { renderFindingsDocumentHtml } from "./radiologyReportPreviewHtml";
+
+/** The exact heading set the clinic reports spine on, with a canal table. */
+const SPINE = [
+  "Alignment:",
+  "Normal lumbar lordosis maintained. No scoliosis or listhesis.",
+  "",
+  "Vertebral Body:",
+  "Normal height, signal and morphology throughout.",
+  "",
+  "Disc Level Analysis:",
+  "L1-L2: Normal disc height and signal. No disc herniation. Neural foramen patent.",
+  "L2-L3: Normal disc height and signal. No disc herniation. Neural foramen patent.",
+  "",
+  "Facets & Ligaments:",
+  "Facet joints unremarkable. No ligamentum flavum hypertrophy.",
+  "",
+  "Thecal Sac & Neural Structures:",
+  "Thecal sac of adequate calibre. Cauda equina nerve roots appear normal.",
+  "",
+  "Posterior Structures:",
+  "Posterior elements and paraspinal soft tissues unremarkable.",
+  "",
+  "Canal Diameter:",
+  "| Level | AP Canal (mm) |",
+  "| L1-L2 | 14 |",
+  "| L2-L3 | 13 |",
+].join("\n");
+
+function signed(findingsText: string, extra: Record<string, unknown> = {}): string {
+  return buildSignedReportBodyHtml({
+    clinicalHistory: "Headache with radiating left leg pain.",
+    technique: "MRI Lumbo-sacral Spine: T1W and T2W sagittal, T2W axial at disc levels.",
+    findingsText,
+    impressionText: "Normal MRI Lumbo-sacral Spine.",
+    recommendationText: "",
+    useStructured: false,
+    ...extra,
+  } as Parameters<typeof buildSignedReportBodyHtml>[0]);
+}
+
+describe("the signed body renders spine sub-headings", () => {
+  it("emits one section heading per authored sub-heading", () => {
+    const html = signed(SPINE);
+    for (const heading of ["ALIGNMENT", "VERTEBRAL BODY", "DISC LEVEL ANALYSIS",
+      "FACETS &amp; LIGAMENTS", "THECAL SAC &amp; NEURAL STRUCTURES", "POSTERIOR STRUCTURES",
+      "CANAL DIAMETER"]) {
+      expect(html, heading).toContain(`<div class="section-heading">${heading}</div>`);
+    }
+  });
+
+  it("keeps Findings as the parent section instead of dropping the heading", () => {
+    expect(signed(SPINE)).toContain(`<div class="section-heading">FINDINGS</div>`);
+  });
+
+  it("renders the canal measurement as a table, not as pipe-delimited prose", () => {
+    const html = signed(SPINE);
+    expect(html).toContain('<table class="findings-table"');
+    expect(html).toContain("<th");
+    // Table cells are data, not report headings — they keep the wording the
+    // radiologist chose instead of being upper-cased with the section titles.
+    expect(html).toContain("AP Canal (mm)");
+    const rows = (html.match(/<tr>/g) ?? []).length;
+    expect(rows).toBe(3); // header + L1-L2 + L2-L3
+    expect(html).not.toContain("<p>| Level |");
+  });
+
+  it("puts each disc level on its own line under the section", () => {
+    const html = signed(SPINE);
+    expect(html).toContain(
+      "L1-L2: Normal disc height and signal. No disc herniation. Neural foramen patent.<br/>"
+      + "L2-L3: Normal disc height and signal. No disc herniation. Neural foramen patent.",
+    );
+  });
+
+  it("does not regress free text typed without any markers", () => {
+    const free = "Lumbar lordosis preserved. Disc heights maintained at all levels.";
+    const html = signed(free);
+    expect(html).toContain(`<div class="section-heading">FINDINGS</div>`);
+    expect(html).toContain(`<p style="margin:0 0 12px;">${free}</p>`);
+    expect(html).not.toContain("findings-table");
+  });
+
+  it("honours title_case headings when that presentation is chosen", () => {
+    const html = signed(SPINE, { headingCase: "title_case" });
+    expect(html).toContain(`<div class="section-heading">Alignment</div>`);
+    expect(html).not.toContain(`<div class="section-heading">ALIGNMENT</div>`);
+  });
+});
+
+describe("renderFindingsDocumentHtml on the screen preview", () => {
+  it("uses caller-supplied heading markup so the preview stays styled", () => {
+    const html = renderFindingsDocumentHtml("Alignment:\nNormal lordosis.", {
+      headingCase: "all_caps",
+      renderHeading: (label) => `<p class="preview-h">${label}</p>`,
+    });
+    expect(html).toContain('<p class="preview-h">ALIGNMENT</p>');
+    expect(html).not.toContain("section-heading");
+  });
+
+  it("routes paragraph bodies through the caller's renderer, keeping provenance tinting", () => {
+    const html = renderFindingsDocumentHtml("Alignment:\nNormal lordosis.", {
+      renderBody: (t) => `<span class="prov">${t}</span>`,
+    });
+    expect(html).toContain('<span class="prov">Normal lordosis.</span>');
+  });
+});
+
+/** One click on the "Disc herniation L4-L5" box, in the section it belongs to. */
+const MIXED_SPINE = SPINE.replace(
+  "L2-L3: Normal disc height and signal. No disc herniation. Neural foramen patent.",
+  "L2-L3: Normal disc height and signal. No disc herniation. Neural foramen patent.\n"
+  + "L4-L5: Broad-based disc bulge indenting the thecal sac.",
+);
+
+describe("abnormal lines are bold in the printed document", () => {
+  const ABNORMAL_LINE = "L4-L5: Broad-based disc bulge indenting the thecal sac.";
+
+  it("bolds the abnormal level and leaves its normal neighbours in plain type", () => {
+    const html = renderFindingsDocumentHtml(MIXED_SPINE, { renderBody: (t) => t });
+    expect(html).toContain(`<strong>${ABNORMAL_LINE}</strong>`);
+    expect(html).not.toContain("<strong>L1-L2: Normal disc height");
+    expect(html).not.toContain("<strong>Normal lumbar lordosis");
+  });
+
+  it("reaches the signed print body through the same rule as the preview", () => {
+    const html = signed(MIXED_SPINE);
+    expect(html).toContain(`<strong>${ABNORMAL_LINE}</strong>`);
+    // The canal table is data, not prose: no row is bolded on a measurement.
+    expect(html).not.toMatch(/<td[^>]*><strong>/);
+  });
+
+  it("adds nothing to a report that is entirely normal", () => {
+    const html = signed(SPINE);
+    expect(html).not.toContain("<strong>L1-L2:");
+    expect(html).not.toMatch(/<p[^>]*><strong>[A-Z][a-z]/);
+  });
+
+  it("stays switchable for a caller that wants the text exactly as authored", () => {
+    const html = renderFindingsDocumentHtml(MIXED_SPINE, {
+      renderBody: (t) => t,
+      emphasizeAbnormal: false,
+    });
+    expect(html).not.toContain("<strong>");
+    expect(html).toContain(ABNORMAL_LINE);
+  });
+});
+
+/**
+ * The "Generate Professional Report" contract, measured where it lands.
+ *
+ * The composer prompt tells the model to author findings with exactly two pieces
+ * of markup — a section line that is only `Label:` and a pipe table for a
+ * per-level series — and to write no markdown emphasis. Those are claims about
+ * this printer, so they are tested against the real builders rather than against
+ * the prompt text: a normal line stays plain, an abnormal line is bolded WITHOUT
+ * the model asking for it, and asterisks the model was told not to write would
+ * have reached the page.
+ */
+const AI_AUTHORED = [
+  "Alignment:",
+  "Normal lumbar lordosis maintained.",
+  "",
+  "Canal Diameter:",
+  "| Level | AP Canal (mm) |",
+  "| L3-L4 | 12 |",
+  "| L4-L5 | 9 |",
+  "",
+  "L4-L5: Central disc herniation compressing the traversing left L5 root.",
+].join("\n");
+
+describe("the AI-authored report shape prints as intended", () => {
+  it("the two conventions the prompt teaches are the two the printer parses", () => {
+    const html = signed(AI_AUTHORED);
+    expect(html).toContain(`<div class="section-heading">ALIGNMENT</div>`);
+    expect(html).toContain(`<div class="section-heading">CANAL DIAMETER</div>`);
+    expect(html).toContain('<table class="findings-table"');
+    expect(html).toContain("AP Canal (mm)");
+    expect(html).toContain(">12<");
+    expect(html).toContain(">9<");
+    // …and the numbers arrive as table cells, not as a stray paragraph of pipes.
+    expect(html).not.toContain("<p>| Level |");
+  });
+
+  it("bolds the abnormal sentence the model wrote, without the model asking for it", () => {
+    const html = signed(AI_AUTHORED);
+    expect(html).toContain(
+      "<strong>L4-L5: Central disc herniation compressing the traversing left L5 root.</strong>",
+    );
+    expect(html).not.toContain("<strong>Normal lumbar lordosis");
+  });
+
+  it("markdown emphasis WOULD reach the page, which is why the prompt forbids it", () => {
+    const withStars = "L4-L5: **Central disc herniation** compressing the traversing left L5 root.";
+    // The screen/Word body escapes HTML and has no markdown pass: the asterisks
+    // are content, and the patient's report would carry them.
+    const screen = renderFindingsDocumentHtml(withStars);
+    expect(screen).toContain("**Central disc herniation**");
+    // The derived emphasis rule bolds the same line on its own, so writing stars
+    // gains the model nothing and risks literal ones.
+    expect(renderFindingsDocumentHtml(withStars, { renderBody: (t) => t })).toContain("<strong>");
+  });
+});
+
+/**
+ * Verbatim FINDINGS from a real model answering "Organise the findings by anatomical
+ * level and add the canal measurement table" (gemma3:12b on the clinic's LAN host,
+ * 21.9 s). Two things only live output shows: the model repeats the value in prose AND
+ * puts it in a table, and it writes the Markdown separator row the clinic's own template
+ * never emits. Neither may break the printed report, and the number may not be lost.
+ */
+describe("live model output prints as the clinic's own table", () => {
+  const LIVE = [
+    "Loss of lumbar lordosis is present.",
+    "",
+    "L2-L3: Disc desiccation is noted.",
+    "L3-L4: Disc desiccation is noted.",
+    "",
+    "L4-L5: A broad-based disc bulge is present, resulting in bilateral lateral recess narrowing. The AP canal diameter measures 9 mm at this level.",
+    "",
+    "L5-S1: Disc desiccation is noted. Bilateral facet arthropathy is present at L5-S1.",
+    "",
+    "| Level | AP Canal (mm) |",
+    "|---|--- |",
+    "| L4-L5 | 9 |",
+  ].join("\n");
+
+  it("drops the separator row and keeps the header and the value", () => {
+    const screen = renderFindingsDocumentHtml(LIVE);
+    expect(screen).toContain("findings-table");
+    expect(screen).toContain("AP Canal");
+    expect(screen).not.toMatch(/---/);
+    expect(screen.match(/<td[^>]*>\s*9\s*<\/td>/g) ?? []).toHaveLength(1);
+  });
+
+  it("reaches the signed print body the same way", () => {
+    const html = signed(LIVE);
+    expect(html).toContain("AP Canal");
+    expect(html).not.toMatch(/---/);
+    expect(html).toContain("9");
+  });
+});

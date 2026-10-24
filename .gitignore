@@ -1,0 +1,146 @@
+# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# compiled output
+dist
+tmp
+out-tsc
+*.tsbuildinfo
+.expo
+.expo-shared
+
+# dependencies
+node_modules
+
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# misc
+/.sass-cache
+/connect.lock
+/coverage
+/libpeerconnection.log
+npm-debug.log
+yarn-error.log
+testem.log
+/typings
+
+# System Files
+.DS_Store
+Thumbs.db
+
+.cursor/rules/nx-rules.mdc
+.github/instructions/nx.instructions.md
+
+# Replit
+.cache/
+.local/
+
+# Local environment files — NEVER COMMIT THESE
+.env
+.env.local
+.env.*.local
+env
+env_my_temp.txt
+env_my_temp*
+*.env.backup
+
+# Per-box operator evidence read by scripts/ops-preflight.mjs. Kept untracked on
+# purpose: deploy-synology.sh runs `git reset --hard origin/main`, which would
+# erase a tracked record of what was actually proven on this machine.
+ops-evidence.json
+*---delete*
+superadmin.key
+
+# Runtime upload storage — REAL PATIENT DATA. The API writes these at
+# <cwd-ancestor>/data/uploads, which resolves differently per launch
+# directory, so the pattern is depth-independent on purpose: it covers
+# data/uploads/, artifacts/data/uploads/ and artifacts/api-server/data/uploads/.
+# These hold radiology key images (DICOM renders of named studies) and expense
+# bill/receipt photographs. Nothing under any data/uploads path is tracked, so
+# this excludes runtime data only and no application file. The leading **/ is
+# required: a pattern containing a middle separator is anchored to this file's
+# directory, so "data/uploads/" alone would miss artifacts/data/uploads/.
+**/data/uploads/
+
+# Large binary / database dumps — cause mmap errors on Windows git
+*.dump
+*.sql.gz
+current_*.sql
+current_*.dump
+*_backup.sql
+*_backup.dump
+
+# Scratch / temp files
+scratch/*.js
+query_db*.js
+query_db*.cjs
+run-test*.js
+test_icici_endpoints.js
+e2e-*.spec.ts
+bill_preview.html
+diff.txt
+counts*.sql
+counts_raw*.sql
+table_list.txt
+*.spec.ts.bak
+
+# Screenshots and exports (large, not needed in git)
+screenshots/
+exports/
+test-results/
+
+# MRI report archive — owner keeps copies on Windows PC; not used by CARE/Synology/Docker
+mri-reports/
+
+# Attached assets (uploaded text files, large)
+attached_assets/
+
+# Synology NAS system folders (thumbnail cache, metadata)
+@eaDir/
+@SynoResource/
+@tmp/
+.DS_Store
+Thumbs.db
+
+# Local test Postgres data directory (created by the DB test harness)
+.pgtest/
+.pnpm-store/
+.schema-verify-results.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+ocr-worker/.venv/
+ocr-worker/.env
+
+legacy-reference/
+
+# Written by scripts/build-identity.mjs during a build, and by the identity tests.
+# It names a commit, so a stray copy in a checkout must never be committable.
+build-info.json
+
+# Backup artifacts, wherever a drill happens to write them. The document archives are
+# patient data by construction — an uploaded bill or referral letter is the file, and its
+# name often carries the patient's name — so an artifact must never be one `git add -A`
+# away from GitHub. `.partial` is the interrupted-write shape of the same file.
+backup_*.tar.gz
+backup_*.tar.gz.enc
+backup_*.tar.gz.meta
+backup_*.tar.gz.enc.meta
+.backup_*.partial
+.SynologyWorkingDirectory/
+__super_admin_quarantine/

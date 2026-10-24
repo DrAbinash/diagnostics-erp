@@ -1,0 +1,453 @@
+/**
+ * Shared OpenAI-compatible chat transport.
+ * Used by DeepSeek, Qwen (DashScope), and OpenAI — one implementation, thin configs.
+ *
+ * SECURITY: When `enforceLocalBinding` is set, the transport uses a hardened
+ * fetch that pre-resolves DNS, validates all IPs are private/LAN, binds the
+ * connection to the validated IP, and disables redirect following. This closes
+ * the TOCTOU gap between URL validation and actual connection.
+ */
+import OpenAI from "openai";
+import { createHardenedLocalFetch, hardenedLocalRequest } from "./hardenedTransport";
+
+export type CompatibleImagePart = {
+  mimeType: "image/jpeg" | "image/png" | "image/webp";
+  base64: string;
+};
+
+export type CompatibleChatRequest = {
+  provider: string;
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  systemPrompt?: string;
+  userPrompt: string;
+  images?: CompatibleImagePart[];
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  jsonMode?: boolean;
+  /**
+   * When true, an empty apiKey is allowed and a non-secret placeholder is
+   * sent to the OpenAI SDK (required by the client). Used ONLY by local
+   * OpenAI-compatible servers that do not require auth. Cloud providers
+   * must leave this unset/false.
+   */
+  allowEmptyApiKey?: boolean;
+  /** Provider-specific body extras (e.g. Qwen enable_thinking:false). */
+  extraBody?: Record<string, unknown>;
+  /**
+   * SECURITY: When true, the transport uses a hardened fetch that:
+   * 1. Pre-resolves DNS and validates ALL IPs are private/LAN
+   * 2. Binds the connection to the validated IP (eliminates DNS rebinding)
+   * 3. Disables redirect following (3xx = error)
+   *
+   * MUST be set for all local provider connections (ollama, local_openai_compatible).
+   * MUST NOT be set for cloud providers (DNS binding only works for private IPs).
+   */
+  enforceLocalBinding?: boolean;
+};
+
+export type CompatibleUsage = {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+};
+
+export type CompatibleChatResult =
+  | {
+      ok: true;
+      text: string;
+      provider: string;
+      model: string;
+      latencyMs: number;
+      usage: CompatibleUsage;
+    }
+  | {
+      ok: false;
+      provider: string;
+      model: string;
+      safeError: string;
+      latencyMs: number;
+      usage: CompatibleUsage;
+    };
+
+function emptyUsage(): CompatibleUsage {
+  return { promptTokens: null, completionTokens: null, totalTokens: null };
+}
+
+/**
+ * Single shared OpenAI-compatible /chat/completions call.
+ * Do not duplicate SDK clients in composer adapters.
+ */
+export async function openAiCompatibleChat(
+  req: CompatibleChatRequest,
+): Promise<CompatibleChatResult> {
+  const started = Date.now();
+  const provider = req.provider;
+  const model = (req.model || "").trim();
+  const imageCount = req.images?.length ?? 0;
+
+  const apiKeyTrimmed = (req.apiKey ?? "").trim();
+  if (!apiKeyTrimmed && !req.allowEmptyApiKey) {
+    return {
+      ok: false,
+      provider,
+      model,
+      safeError: `${provider}_api_key_not_configured`,
+      latencyMs: Date.now() - started,
+      usage: emptyUsage(),
+    };
+  }
+  if (!req.baseURL?.trim()) {
+    return {
+      ok: false,
+      provider,
+      model,
+      safeError: `${provider}_base_url_missing`,
+      latencyMs: Date.now() - started,
+      usage: emptyUsage(),
+    };
+  }
+
+  // OpenAI SDK requires a non-empty apiKey string even when the server ignores it.
+  const sdkApiKey = apiKeyTrimmed || "not-needed";
+
+  // SECURITY: For local providers, use a hardened fetch that binds to validated
+  // IPs and disables redirects. This closes the TOCTOU gap between URL validation
+  // and actual connection (DNS rebinding, redirect-based SSRF).
+  const sdkFetch = req.enforceLocalBinding
+    ? createHardenedLocalFetch({ enforceBinding: true })
+    : undefined;
+
+  const client = new OpenAI({
+    apiKey: sdkApiKey,
+    baseURL: req.baseURL.replace(/\/$/, ""),
+    timeout: req.timeoutMs ?? 120_000,
+    // The SDK's own default is 2 SILENT retries. With a 45 s composer budget a
+    // failing call holds the job for ~3x that budget (each retry is a full
+    // timeout window) and no layer above can see or cancel the retries. The
+    // Ollama lane already runs exactly one attempt per model; the cloud lanes
+    // must match — a retry, when wanted, is the caller's decision (the engine's
+    // fallback ladder), never the SDK's.
+    maxRetries: 0,
+    ...(sdkFetch ? { fetch: sdkFetch } : {}),
+  });
+
+  try {
+    type ContentPart =
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } };
+
+    const userContent: ContentPart[] = [{ type: "text", text: req.userPrompt }];
+    for (const img of req.images ?? []) {
+      userContent.push({
+        type: "image_url",
+        image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+      });
+    }
+
+    const messages: Array<{ role: "system" | "user"; content: string | ContentPart[] }> = [];
+    if (req.systemPrompt?.trim()) {
+      messages.push({ role: "system", content: req.systemPrompt });
+    }
+    messages.push({
+      role: "user",
+      content: imageCount > 0 ? userContent : req.userPrompt,
+    });
+
+    const body: Record<string, unknown> = {
+      model,
+      temperature: req.temperature ?? 0.1,
+      messages,
+      ...(req.maxTokens != null ? { max_tokens: req.maxTokens } : {}),
+      ...(req.jsonMode !== false ? { response_format: { type: "json_object" } } : {}),
+      ...(req.extraBody ?? {}),
+    };
+
+    const resp = await client.chat.completions.create(
+      body as unknown as Parameters<typeof client.chat.completions.create>[0],
+    );
+
+    const usageRaw = "usage" in resp ? resp.usage : undefined;
+    const latencyMs = Date.now() - started;
+    const usage: CompatibleUsage = {
+      promptTokens: usageRaw?.prompt_tokens ?? null,
+      completionTokens: usageRaw?.completion_tokens ?? null,
+      totalTokens: usageRaw?.total_tokens ?? null,
+    };
+
+    // Fail closed on the FINAL answer only. A server can answer 200 with the
+    // visible `message.content` null, empty or whitespace while it spent the
+    // whole budget on `reasoning_content` (measured with Gemma-4 12B QAT via
+    // LM Studio, 2026-10-05: ~88 % of the output was reasoning and `content`
+    // stayed empty until max_tokens ≈ 420). Chain-of-thought is never a
+    // radiology answer, so it is deliberately not read, not substituted and not
+    // retained here — an empty final content is a provider FAILURE, not a draft.
+    // Only a non-empty string counts as an answer: an absent choice, a null
+    // message, and a non-string `content` (an object/array would stringify to
+    // something useless yet "non-blank") all fail the same way.
+    const choices = "choices" in resp && Array.isArray(resp.choices) ? resp.choices : [];
+    const rawContent = (choices[0] as { message?: { content?: unknown } } | undefined)?.message
+      ?.content;
+    const text = typeof rawContent === "string" ? rawContent : "";
+
+    if (!text.trim()) {
+      return {
+        ok: false,
+        provider,
+        model,
+        safeError: "empty_final_content",
+        latencyMs,
+        usage,
+      };
+    }
+
+    return { ok: true, text, provider, model, latencyMs, usage };
+  } catch (err: unknown) {
+    const latencyMs = Date.now() - started;
+    // PHI-safe failure classification — the same contract the Ollama lane
+    // established (ComposerProviderError, PR #1131): only reason codes leave
+    // the transport. The caught message is deliberately NOT embedded: an
+    // OpenAI-compatible endpoint's error body can echo request content (a
+    // local server quoting the JSON it refused, a vendor message repeating
+    // the prompt), and safeError is persisted (ai_report_compose_jobs.safeError)
+    // and displayed to operators. The SDK puts the HTTP status on the error
+    // object; connection and timeout failures carry none.
+    const status = (err as { status?: unknown } | null | undefined)?.status;
+    let reason: string;
+    if (typeof status === "number" && Number.isFinite(status)) {
+      reason = status === 404 ? "model_not_found" : `http_${status}`;
+    } else {
+      const name = err instanceof Error ? err.name : "";
+      reason =
+        name === "APIConnectionTimeoutError" || name === "TimeoutError" || name === "AbortError"
+          ? "timeout"
+          : "network";
+    }
+    return {
+      ok: false,
+      provider,
+      model,
+      safeError: `${provider}_request_failed:${reason}`,
+      latencyMs,
+      usage: emptyUsage(),
+    };
+  }
+}
+
+/** Official defaults — verified against vendor docs (not guessed). */
+export const COMPATIBLE_PROVIDER_DEFAULTS: Record<
+  string,
+  {
+    baseURL: string;
+    envKey: string[];
+    envBaseUrl?: string;
+    defaultModel: string;
+    /** LOCAL OpenAI-compatible servers may omit API keys. */
+    allowEmptyApiKey?: boolean;
+    /** Execution classification — LOCAL must never be treated as cloud. */
+    execution?: "LOCAL" | "CLOUD";
+  }
+> = {
+  deepseek: {
+    baseURL: "https://api.deepseek.com",
+    envKey: ["DEEPSEEK_API_KEY"],
+    envBaseUrl: "DEEPSEEK_BASE_URL",
+    defaultModel: "deepseek-v4-pro",
+    execution: "CLOUD",
+  },
+  qwen: {
+    // Alibaba Model Studio international OpenAI-compatible endpoint
+    baseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    envKey: ["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+    envBaseUrl: "QWEN_BASE_URL",
+    defaultModel: "qwen3.7-plus",
+    execution: "CLOUD",
+  },
+  openai: {
+    baseURL: "https://api.openai.com/v1",
+    envKey: ["OPENAI_API_KEY"],
+    envBaseUrl: "OPENAI_BASE_URL",
+    defaultModel: "gpt-4o",
+    execution: "CLOUD",
+  },
+  /**
+   * Vendor-neutral local OpenAI-compatible server (llama.cpp, vLLM, etc.).
+   * Initial clinic config points at PrismML Bonsai — but the provider id is
+   * NOT Bonsai-specific. Empty baseURL means "must be configured in Settings".
+   */
+  local_openai_compatible: {
+    baseURL: "",
+    envKey: ["LOCAL_OPENAI_COMPATIBLE_API_KEY"],
+    envBaseUrl: "LOCAL_OPENAI_COMPATIBLE_BASE_URL",
+    defaultModel: "bonsai",
+    allowEmptyApiKey: true,
+    execution: "LOCAL",
+  },
+};
+
+/** Providers that use OpenAI wire format but run on clinic/local hardware. */
+export const LOCAL_OPENAI_COMPATIBLE_PROVIDER = "local_openai_compatible" as const;
+
+export function isLocalOpenAiCompatibleProvider(provider: string): boolean {
+  return provider === LOCAL_OPENAI_COMPATIBLE_PROVIDER;
+}
+
+/** True for Ollama + local OpenAI-compatible — never subject to cloud vision gates. */
+export function isLocalExecutionProvider(provider: string): boolean {
+  return provider === "ollama" || isLocalOpenAiCompatibleProvider(provider);
+}
+
+export function readEnvApiKey(provider: string): string | null {
+  const cfg = COMPATIBLE_PROVIDER_DEFAULTS[provider];
+  if (!cfg) return null;
+  for (const name of cfg.envKey) {
+    const v = (process.env[name] ?? "").trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+export function readEnvBaseUrl(provider: string): string | null {
+  const cfg = COMPATIBLE_PROVIDER_DEFAULTS[provider];
+  if (!cfg) return null;
+  if (cfg.envBaseUrl) {
+    const v = (process.env[cfg.envBaseUrl] ?? "").trim().replace(/\/$/, "");
+    if (v) return v;
+  }
+  const fallback = (cfg.baseURL ?? "").trim().replace(/\/$/, "");
+  return fallback || null;
+}
+
+export function isCompatibleProviderConfigured(provider: string): boolean {
+  if (isLocalOpenAiCompatibleProvider(provider)) {
+    // Local servers are "configured" when a base URL is available (env).
+    // DB endpoint is checked by higher layers (createAiProviderFromDb).
+    return Boolean(readEnvBaseUrl(provider)?.trim());
+  }
+  return readEnvApiKey(provider) != null;
+}
+
+// ─── Local OpenAI-compatible reachability probe ──────────────────────────────
+// Ollama answers GET /api/tags; an OpenAI-compatible server (llama.cpp, vLLM,
+// LM Studio, PrismML …) answers GET <baseURL>/models. Nothing in this codebase
+// could ask the latter whether it was alive, so a down local-compat provider
+// looked identical to a loaded-but-slow one. Cheap, bounded, and never used on
+// the Ollama path — probeOllamaReachable() still owns that.
+
+export type OpenAiModelsProbeResult = {
+  reachable: boolean;
+  httpStatus: number | null;
+  latencyMs: number;
+  /** Served model ids, in server order. Empty when the server reports none. */
+  models: string[];
+  /** Safe to show an operator: never contains the API key or a response body. */
+  error: string | null;
+};
+
+function scrubProbeError(raw: string, apiKey: string): string {
+  const withoutKey = (apiKey ? raw.split(apiKey).join("[REDACTED]") : raw)
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[^a-zA-Z0-9_.: /()-]/g, "");
+  return withoutKey.trim().slice(0, 160) || "request_failed";
+}
+
+/**
+ * GET <baseUrl>/models for an OpenAI-compatible server.
+ *
+ * `baseUrl` is the *versioned* base the SDK is given (…/v1), matching
+ * openAiCompatibleChat(). An empty API key is valid — local servers commonly
+ * require no auth, so the Authorization header is only sent when a key exists.
+ * Never throws: transport, timeout, HTTP and parse failures all come back as
+ * `reachable: false` with a safe `error`.
+ *
+ * SECURITY: When `enforceLocalBinding` is true, DNS is pre-resolved and the
+ * connection is bound to the validated IP. Redirects are not followed.
+ */
+export async function probeOpenAiCompatibleModels(
+  baseUrl: string | null | undefined,
+  opts: { apiKey?: string | null; timeoutMs?: number; enforceLocalBinding?: boolean } = {},
+): Promise<OpenAiModelsProbeResult> {
+  const started = Date.now();
+  const base = (baseUrl ?? "").trim().replace(/\/$/, "");
+  const apiKey = (opts.apiKey ?? "").trim();
+  const timeoutMs = opts.timeoutMs ?? 3000;
+
+  if (!base) {
+    return {
+      reachable: false,
+      httpStatus: null,
+      latencyMs: 0,
+      models: [],
+      error: "endpoint_not_configured",
+    };
+  }
+
+  try {
+    const requestUrl = `${base}/models`;
+    const headers: Record<string, string> = apiKey
+      ? { Authorization: `Bearer ${apiKey}`, Accept: "application/json" }
+      : { Accept: "application/json" };
+
+    // SECURITY: When enforceLocalBinding, use hardened transport (DNS-pinned,
+    // redirect-rejecting, works for both HTTP and HTTPS). Otherwise plain fetch.
+    let resp: Response;
+    if (opts.enforceLocalBinding) {
+      const r = await hardenedLocalRequest(requestUrl, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      resp = r.response;
+    } else {
+      resp = await fetch(requestUrl, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "follow",
+      });
+    }
+
+    if (!resp.ok) {
+      return {
+        reachable: false,
+        httpStatus: resp.status,
+        latencyMs: Date.now() - started,
+        models: [],
+        error:
+          resp.status === 401 || resp.status === 403
+            ? `auth_required (HTTP ${resp.status})`
+            : `HTTP ${resp.status}`,
+      };
+    }
+    const data = (await resp.json().catch(() => null)) as {
+      data?: Array<{ id?: unknown; name?: unknown }>;
+      models?: Array<{ id?: unknown; name?: unknown }>;
+    } | null;
+    const rows = data?.data ?? data?.models ?? [];
+    const models = rows
+      .map((m) => String(m?.id ?? m?.name ?? "").trim())
+      .filter(Boolean);
+    return {
+      reachable: true,
+      httpStatus: resp.status,
+      latencyMs: Date.now() - started,
+      models,
+      error: null,
+    };
+  } catch (err: unknown) {
+    const aborted =
+      err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+    return {
+      reachable: false,
+      httpStatus: null,
+      latencyMs: Date.now() - started,
+      models: [],
+      error: scrubProbeError(
+        aborted ? `timed_out_after_${timeoutMs}ms` : err instanceof Error ? err.message : String(err),
+        apiKey,
+      ),
+    };
+  }
+}

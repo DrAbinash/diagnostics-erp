@@ -1,0 +1,2413 @@
+import { Router } from "express";
+import { db, paymentsTable, dayClosuresTable, userDayClosuresTable, billsTable, usersTable, expensesTable, orderTestsTable, testsTable } from "@workspace/db";
+import {
+  drawerAuditLogTable,
+  patientsTable,
+  doctorsTable,
+  ordersTable,
+  billAuditsTable,
+  voucherAuditsTable,
+  expensePaymentsTable,
+} from "@workspace/db/schema";
+import { eq, and, gt, lte, desc, sql, inArray, notInArray, isNull } from "drizzle-orm";
+import { z } from "zod";
+import type { Response, NextFunction } from "express";
+import type { StaffAuthRequest } from "../middleware/requireStaffAuth";
+import { classifyPaymentMethod, isPhysicalCash } from "../lib/paymentMethodClassifier";
+import { lastOverallClosureBoundary } from "../lib/closureBoundary";
+import { BILL_AUDIT_OPERATIONAL_CHANGE_TYPES } from "../lib/staffActivityAttribution";
+import { isCollectiblePayment } from "../lib/financialIntegrity";
+import { loadPostClosureActivity } from "../lib/postClosureActivity";
+import type { StaffPrintActivity } from "../lib/postClosureActivityTypes";
+import { isSameDayAfterClose, summarizeSameDayBills } from "../lib/sameDayAfterClose";
+import { computeDueReceivedForWindow, computeStaffSlipFormula } from "../lib/staffSlipFormula";
+import {
+  computeGrossRestoreForTestCancelRefunds,
+  computeRefundsExcludedFromCollectible,
+  computeTestCancelRefundsAmount,
+  TEST_CANCEL_REFUND_NOTES_PREFIX,
+} from "../lib/dailySummaryCollectible";
+import { sendStaffDayCloseEmail, type StaffDayCloseEmailResult } from "../email";
+import { clinicSettingsTable } from "@workspace/db/schema";
+import { todayIST, clinicDateOf, clinicDayBoundsIST } from "../lib/istDate";
+import {
+  buildHandoverBoard,
+  type BoardLiveRow,
+  type BoardSlipRow,
+} from "../lib/handoverBoard";
+
+// Inline super-admin gate that works on the regular ERP staff session
+// (req.staffSession.role === "super_admin"). The site-wide
+// `requireSuperAdmin` middleware uses the X-SA-Token header issued by
+// the Super Admin Portal — that is not in scope here because the reopen
+// button lives inside the regular ERP UI.
+function requireSuperAdminStaff(req: StaffAuthRequest, res: Response, next: NextFunction): void {
+  if (req.staffSession?.role !== "super_admin") {
+    res.status(403).json({ error: "Super-admin role required" });
+    return;
+  }
+  next();
+}
+
+function requireOwnerOrAdmin(req: StaffAuthRequest, res: Response, next: NextFunction): void {
+  const role = req.staffSession?.role ?? "";
+  if (!OWNER_ROLES.has(role)) {
+    res.status(403).json({ error: "Owner/admin access required" });
+    return;
+  }
+  next();
+}
+
+export const dayCloseRouter = Router();
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function n(v: unknown): number {
+  return Number(v ?? 0) || 0;
+}
+
+// Compute the coverage window for the next close: from the latest existing
+// closure's `coveredToTs` (exclusive) up to "now" (inclusive). Returns null
+// from when no prior closure exists — the SQL builder uses gt(ts, null) by
+// just omitting the lower bound.
+// Delegates to the shared helper (../lib/closureBoundary.ts) — also used by
+// bills.ts to warn staff refunding against an already-closed period.
+const lastClosureBoundary = lastOverallClosureBoundary;
+
+type MethodTotals = { cash: number; upi: number; card: number; cheque: number; other: number; total: number; count: number };
+
+function emptyTotals(): MethodTotals {
+  return { cash: 0, upi: 0, card: 0, cheque: 0, other: 0, total: 0, count: 0 };
+}
+
+// Delegates to the shared classifier (../lib/paymentMethodClassifier.ts) —
+// the single source of truth also used by daily-summary.ts and
+// my-daily-summary.ts (Approved Fix #3: no more independently-drifted
+// classifiers). Categories not represented by a dedicated day-close column
+// ("online", "insurance") fold into "other", same as before — they were
+// never counted as cash here. Genuinely UNKNOWN methods are intentionally
+// excluded from every bucket (including "other") and are surfaced
+// separately via the suspense total — see summarizeWindow().
+function bucketMethod(method: string): keyof Omit<MethodTotals, "total" | "count"> {
+  const c = classifyPaymentMethod(method);
+  if (c.category === "cash") return "cash";
+  if (c.category === "upi") return "upi";
+  if (c.category === "card") return "card";
+  if (c.category === "cheque") return "cheque";
+  // online, insurance, and known-but-uncategorized methods → "other" (never cash).
+  // "unknown" is handled by the caller before bucketMethod is invoked.
+  return "other";
+}
+
+type TestSummary = { testId: number; testName: string; category: string; count: number; total: number; grossTotal: number };
+
+// ── Pure, exported, unit-testable core logic ────────────────────────────────
+// Extracted so the critical business rules (cash-only physical drawer, no
+// silent unknown→cash/other fallback, cash-expense subtraction) can be
+// verified without a database connection. summarizeWindow() below is a thin
+// DB-fetching wrapper around these two functions — the arithmetic lives
+// here exactly once.
+
+export type PaymentLike = { id: number; amount: string | number; method: string | null; recordedByName?: string | null };
+export type ExpenseLike = {
+  amount: string | number;
+  paymentMode: string | null;
+  approvedBy?: string | null;
+  createdBy?: string | null;
+};
+
+export type SuspenseItem = { id: number; amount: number; rawMethod: string; recordedByName: string | null };
+
+export interface ClassifiedPayments {
+  overall: MethodTotals;
+  byStaff: Map<string, MethodTotals & { userId: number | null; userName: string }>;
+  suspenseItems: SuspenseItem[];
+  totalSuspense: number;
+}
+
+/**
+ * Classify a window's payment rows into cash/upi/card/cheque/other buckets
+ * (overall + per-staff), isolating unrecognized methods into a suspense list
+ * instead of ever letting them join a bucket (LOCKED BUSINESS RULE #6).
+ * Pure — no DB access, no expense subtraction (see applyCashExpenses below).
+ */
+export function classifyAndBucketPayments(payRows: PaymentLike[]): ClassifiedPayments {
+  const overall = emptyTotals();
+  const byStaff = new Map<string, MethodTotals & { userId: number | null; userName: string }>();
+  const suspenseItems: SuspenseItem[] = [];
+
+  for (const r of payRows) {
+    const amt = n(r.amount);
+    const classified = classifyPaymentMethod(r.method);
+    if (!classified.isKnown) {
+      suspenseItems.push({ id: r.id, amount: amt, rawMethod: r.method ?? "", recordedByName: r.recordedByName ?? null });
+      continue;
+    }
+    const bucket = bucketMethod(r.method ?? "");
+    overall[bucket] += amt;
+    overall.total += amt;
+    overall.count += 1;
+
+    const name = (r.recordedByName ?? "").trim() || "Unassigned";
+    if (!byStaff.has(name)) {
+      byStaff.set(name, { ...emptyTotals(), userId: null, userName: name });
+    }
+    const s = byStaff.get(name)!;
+    s[bucket] += amt;
+    s.total += amt;
+    s.count += 1;
+  }
+  const totalSuspense = suspenseItems.reduce((s, x) => s + x.amount, 0);
+
+  return { overall, byStaff, suspenseItems, totalSuspense };
+}
+
+/**
+ * Split a window's expense rows into cash vs non-cash, overall and by
+ * approver. LOCKED BUSINESS RULE #5: only expenses recorded with
+ * payment_mode = "cash" ever reduce physical drawer cash; everything else
+ * is informational only. Pure — no DB access.
+ */
+export function splitCashExpenses(expRows: ExpenseLike[]): {
+  cashExpenses: number;
+  digitalExpenses: number;
+  cashExpensesByApprover: Map<string, number>;
+} {
+  // Delegates to the shared payment-method classifier's cash check for
+  // consistency with payments.method classification (Approved Fix #5),
+  // with one explicit difference preserved: expenses.payment_mode is a
+  // NOT NULL column with a DEFAULT of 'cash' in the schema, so a missing/
+  // blank value here means "cash" (matching the DB default), NOT "unknown"
+  // (which is what the classifier would say for an empty payments.method —
+  // that field has no such default). Swapping this to the classifier's
+  // blanket unknown-handling would silently exclude such an expense from
+  // both cash and digital totals, which is not what "expenses.payment_mode
+  // defaults to cash" means.
+  const isCashExpense = (mode: string | null | undefined) => {
+    const trimmed = (mode ?? "").trim();
+    if (!trimmed) return true;
+    return isPhysicalCash(trimmed);
+  };
+  const totalExpenses = expRows.reduce((s, e) => s + n(e.amount), 0);
+  const cashExpenses = expRows.filter((e) => isCashExpense(e.paymentMode)).reduce((s, e) => s + n(e.amount), 0);
+  const digitalExpenses = totalExpenses - cashExpenses;
+
+  const cashExpensesByApprover = new Map<string, number>();
+  for (const e of expRows) {
+    if (!isCashExpense(e.paymentMode)) continue;
+    // Prefer approved_by; fall back to created_by (legacy blank Approved By).
+    const approver = (e.approvedBy ?? "").trim() || (e.createdBy ?? "").trim();
+    if (!approver) continue;
+    cashExpensesByApprover.set(approver, (cashExpensesByApprover.get(approver) ?? 0) + n(e.amount));
+  }
+  return { cashExpenses, digitalExpenses, cashExpensesByApprover };
+}
+
+/**
+ * CRITICAL FIX (Expected Physical Cash = Cash In − Cash Refunded − Cash
+ * Expenses, LOCKED BUSINESS RULE #4): mutates `classified` in place,
+ * subtracting cash expenses from the overall cash bucket and from each
+ * approving staff member's own cash bucket (Cash Attribution Rule — an
+ * expense reduces the physical cash of whoever approved it, not the whole
+ * clinic indiscriminately). A staff who approved cash expenses but recorded
+ * no payments in this window still gets a byStaff row created, so their
+ * liability isn't silently absorbed into the overall total only.
+ */
+export function applyCashExpenses(classified: ClassifiedPayments, cashExpensesByApprover: Map<string, number>): void {
+  const totalCashExpenses = Array.from(cashExpensesByApprover.values()).reduce((s, x) => s + x, 0);
+  classified.overall.cash -= totalCashExpenses;
+  classified.overall.total -= totalCashExpenses;
+
+  for (const [approver, amt] of cashExpensesByApprover) {
+    if (!classified.byStaff.has(approver)) {
+      classified.byStaff.set(approver, { ...emptyTotals(), userId: null, userName: approver });
+    }
+    const s = classified.byStaff.get(approver)!;
+    s.cash -= amt;
+    s.total -= amt;
+  }
+}
+
+// Aggregate payments, bills, expenses, and tests in the window (from, to].
+async function summarizeWindow(from: Date | null, to: Date) {
+  const paymentWhere = from
+    ? and(gt(paymentsTable.createdAt, from), lte(paymentsTable.createdAt, to))
+    : lte(paymentsTable.createdAt, to);
+
+  const billWhere = from
+    ? and(gt(billsTable.createdAt, from), lte(billsTable.createdAt, to))
+    : lte(billsTable.createdAt, to);
+
+  const expensePaymentWhere = from
+    ? and(
+        gt(expensePaymentsTable.createdAt, from),
+        lte(expensePaymentsTable.createdAt, to),
+        isNull(expensePaymentsTable.reversedAt),
+      )
+    : and(lte(expensePaymentsTable.createdAt, to), isNull(expensePaymentsTable.reversedAt));
+
+  // Payments
+  const payRows = await db
+    .select({
+      id: paymentsTable.id,
+      amount: paymentsTable.amount,
+      method: paymentsTable.method,
+      createdAt: paymentsTable.createdAt,
+      recordedByName: paymentsTable.recordedByName,
+      billId: paymentsTable.billId,
+      settlementStatus: paymentsTable.settlementStatus,
+    })
+    .from(paymentsTable)
+    .where(paymentWhere);
+
+  // Bills
+  const billRows = await db
+    .select({
+      id: billsTable.id,
+      billNumber: billsTable.billNumber,
+      totalAmount: billsTable.totalAmount,
+      subtotal: billsTable.subtotal,
+      paidAmount: billsTable.paidAmount,
+      balanceAmount: billsTable.balanceAmount,
+      refundAmount: billsTable.refundAmount,
+      status: billsTable.status,
+      orderId: billsTable.orderId,
+      patientName: sql<string>`COALESCE(${patientsTable.firstName} || ' ' || COALESCE(${patientsTable.lastName}, ''), 'Unknown')`,
+      createdAt: billsTable.createdAt,
+    })
+    .from(billsTable)
+    .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+    .where(billWhere);
+
+  // Expense money-out rows (V2): cash/day-close uses expense_payments, not bill headers.
+  const expRows = await db
+    .select({
+      id: expensePaymentsTable.id,
+      amount: expensePaymentsTable.amount,
+      category: expensesTable.category,
+      description: expensesTable.description,
+      createdAt: expensePaymentsTable.createdAt,
+      paymentMode: expensePaymentsTable.paymentMode,
+      approvedBy: expensesTable.approvedBy,
+      createdBy: expensesTable.createdBy,
+    })
+    .from(expensePaymentsTable)
+    .innerJoin(expensesTable, eq(expensePaymentsTable.expenseId, expensesTable.id))
+    .where(
+      and(expensePaymentWhere, sql`${expensesTable.paymentStatus} <> 'VOID'`),
+    );
+
+  // Aggregate payments — exclude non-collectible settlement statuses, then
+  // delegate to the pure, unit-tested classifier above.
+  const classified = classifyAndBucketPayments(payRows.filter(isCollectiblePayment));
+  const { overall, byStaff, suspenseItems, totalSuspense } = classified;
+
+  // Aggregate bills
+  const totalBilled = billRows.reduce((s, b) => s + n(b.totalAmount), 0);
+  const totalRefunds = billRows.reduce((s, b) => s + n(b.refundAmount), 0);
+  const totalDue = billRows.reduce((s, b) => s + n(b.balanceAmount), 0);
+  const billsCount = billRows.length;
+  const cancelledBills = billRows.filter((b) => b.status === "cancelled");
+  const sameDayAfterPriorClose = summarizeSameDayBills(
+    billRows.map((b) => ({
+      createdAt: b.createdAt,
+      totalAmount: n(b.totalAmount),
+    })),
+    from,
+  );
+
+  // Aggregate expenses
+  const totalExpenses = expRows.reduce((s, e) => s + n(e.amount), 0);
+  const expensesByCategory = new Map<string, number>();
+  const expenseDetails = expRows.map((e) => ({
+    id: e.id,
+    amount: n(e.amount),
+    category: e.category ?? "General",
+    description: e.description ?? "",
+  }));
+  for (const e of expRows) {
+    const cat = e.category ?? "General";
+    expensesByCategory.set(cat, (expensesByCategory.get(cat) ?? 0) + n(e.amount));
+  }
+
+  // ── CRITICAL FIX: Expected Physical Cash = Cash In − Cash Refunded − Cash
+  // Expenses (LOCKED BUSINESS RULE #4). `overall.cash` above was previously
+  // only Cash In minus Cash Refunded — it never subtracted cash expenses, so
+  // a staff physically counting their drawer would be compared against an
+  // inflated "expected" figure. Only expenses recorded with payment_mode =
+  // "cash" reduce the drawer; digital/bank expenses must not (LOCKED RULE
+  // #5) — they stay informational only via totalExpenses/expensesByCategory.
+  const { cashExpenses, digitalExpenses, cashExpensesByApprover } = splitCashExpenses(expRows);
+  applyCashExpenses(classified, cashExpensesByApprover);
+
+  // Aggregate test-wise collections
+  //
+  // DISCOUNT ALLOCATION FIX: order_tests.price is the GROSS catalog line
+  // price and never reflects a bill-level discount, so summing it directly
+  // (as this used to do) always overstated testSummary vs. what was actually
+  // billed/collected — e.g. a ₹1,000 test with a ₹200 bill discount showed
+  // ₹1,000 here while the bill (and daily-summary totalBilling) recorded
+  // ₹800. Each bill's discount (+ tax) is now allocated proportionally
+  // across its own line items via scale = totalAmount / subtotal, so
+  // Σ testSummary[].total reconciles with Σ billRows[].totalAmount for the
+  // same window. grossTotal (pre-discount) is kept alongside for transparency.
+  const testMap = new Map<number, TestSummary>();
+  const activeBills = billRows.filter((b) => b.status !== "cancelled");
+  const activeBillIds = activeBills.map((b) => b.id);
+  const billScaleByOrderId = new Map<number, number>();
+  for (const b of activeBills) {
+    if (b.orderId == null) continue;
+    const subtotal = n(b.subtotal);
+    const scale = subtotal > 0.0001 ? n(b.totalAmount) / subtotal : 1;
+    billScaleByOrderId.set(b.orderId, scale);
+  }
+  if (activeBillIds.length > 0) {
+    const orderIds = new Set<number>();
+    for (const b of billRows) {
+      if (b.status !== "cancelled" && b.orderId != null) orderIds.add(b.orderId);
+    }
+    if (orderIds.size > 0) {
+      const testRows = await db
+        .select({
+          testId: orderTestsTable.testId,
+          testName: sql<string>`COALESCE(${orderTestsTable.displayName}, ${testsTable.name}, 'Unknown')`,
+          category: sql<string>`COALESCE(${testsTable.category}, 'General')`,
+          price: orderTestsTable.price,
+          orderId: orderTestsTable.orderId,
+        })
+        .from(orderTestsTable)
+        .leftJoin(testsTable, eq(orderTestsTable.testId, testsTable.id))
+        .where(and(
+          inArray(orderTestsTable.orderId, Array.from(orderIds)),
+          sql`${orderTestsTable.status} != 'cancelled'`,
+        ));
+
+      for (const t of testRows) {
+        const id = n(t.testId);
+        if (!testMap.has(id)) {
+          testMap.set(id, { testId: id, testName: t.testName, category: t.category, count: 0, total: 0, grossTotal: 0 });
+        }
+        const ts = testMap.get(id)!;
+        const grossPrice = n(t.price);
+        const scale = billScaleByOrderId.get(t.orderId) ?? 1;
+        ts.count += 1;
+        ts.grossTotal += grossPrice;
+        ts.total += grossPrice * scale;
+      }
+    }
+  }
+
+  return {
+    overall,
+    byStaff: Array.from(byStaff.values()).sort((a, b) => b.total - a.total),
+    billsCount,
+    paymentsCount: overall.count,
+    totalBilled,
+    totalRefunds,
+    totalDue,
+    cancelledBills,
+    totalExpenses,
+    cashExpenses,
+    digitalExpenses,
+    expensesByCategory: Array.from(expensesByCategory.entries()).map(([category, total]) => ({ category, total })),
+    expenseDetails,
+    testSummary: Array.from(testMap.values()).sort((a, b) => b.total - a.total),
+    // Suspense/exception bucket — see LOCKED BUSINESS RULE #6. Already
+    // excluded from `overall`/`byStaff` above; exposed here for admin
+    // visibility and correction.
+    totalSuspense,
+    suspenseItems,
+    sameDayAfterPriorClose,
+    sameDayAfterPriorCloseBills: billRows
+      .filter((b) => isSameDayAfterClose(b.createdAt, from) && b.status !== "cancelled")
+      .slice(0, 40)
+      .map((b) => ({
+        id: b.id,
+        billNumber: b.billNumber ?? String(b.id),
+        patientName: b.patientName,
+        totalAmount: n(b.totalAmount),
+        paidAmount: n(b.paidAmount),
+        createdAt: b.createdAt ? new Date(b.createdAt).toISOString() : "",
+        sameDayAfterPriorClose: true as const,
+      })),
+  };
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────
+
+// Preview what closing the day right now would look like.
+dayCloseRouter.get("/preview", requireOwnerOrAdmin, async (_req, res) => {
+  const from = await lastClosureBoundary();
+  const to = new Date();
+  const summary = await summarizeWindow(from, to);
+  res.json({
+    coveredFromTs: from,
+    coveredToTs: to,
+    expected: summary.overall,
+    byStaff: summary.byStaff,
+    billsCount: summary.billsCount,
+    paymentsCount: summary.overall.count,
+    cashExpenses: summary.cashExpenses,
+    digitalExpenses: summary.digitalExpenses,
+    // Suspense/exception bucket — unrecognized payment methods, excluded
+    // from `expected` above. See LOCKED BUSINESS RULE #6.
+    suspenseTotal: summary.totalSuspense,
+    suspenseCount: summary.suspenseItems.length,
+    suspenseItems: summary.suspenseItems,
+    sameDayAfterPriorClose: summary.sameDayAfterPriorClose,
+    sameDayAfterPriorCloseBills: summary.sameDayAfterPriorCloseBills,
+  });
+});
+
+const CreateBody = z.object({
+  actuals: z.object({
+    cash: z.coerce.number().min(0).default(0),
+    upi: z.coerce.number().min(0).default(0),
+    card: z.coerce.number().min(0).default(0),
+    cheque: z.coerce.number().min(0).default(0),
+    other: z.coerce.number().min(0).default(0),
+  }),
+  varianceNote: z.string().max(2000).default(""),
+});
+
+// Close the day.
+dayCloseRouter.post("/", requireOwnerOrAdmin, async (req, res) => {
+  const parsed = CreateBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid request", details: parsed.error.format() });
+    return;
+  }
+  const { actuals, varianceNote } = parsed.data;
+
+  const inserted = await db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(7390021)`);
+
+    const [last] = await tx
+      .select({ coveredToTs: dayClosuresTable.coveredToTs })
+      .from(dayClosuresTable)
+      .where(eq(dayClosuresTable.status, "closed"))
+      .orderBy(desc(dayClosuresTable.coveredToTs))
+      .limit(1);
+    const from = last?.coveredToTs ? new Date(last.coveredToTs) : null;
+    const to = new Date();
+    const summary = await summarizeWindow(from, to);
+
+    const totalExpected = summary.overall.total;
+    const totalActual = actuals.cash + actuals.upi + actuals.card + actuals.cheque + actuals.other;
+    const variance = totalActual - totalExpected;
+
+    const istDateLabel = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(to);
+    const session = (req as StaffAuthRequest).staffSession;
+    const closedByName = session?.subjectName || "Unknown";
+
+    const [row] = await tx
+      .insert(dayClosuresTable)
+      .values({
+        closureDate: istDateLabel,
+        closedAt: to,
+        closedByUserId: session?.subjectId ?? null,
+        closedByName,
+        coveredFromTs: from,
+        coveredToTs: to,
+        expectedCash: String(summary.overall.cash),
+        expectedUpi: String(summary.overall.upi),
+        expectedCard: String(summary.overall.card),
+        expectedCheque: String(summary.overall.cheque),
+        expectedOther: String(summary.overall.other),
+        actualCash: String(actuals.cash),
+        actualUpi: String(actuals.upi),
+        actualCard: String(actuals.card),
+        actualCheque: String(actuals.cheque),
+        actualOther: String(actuals.other),
+        variance: String(variance),
+        varianceNote,
+        billsCount: summary.billsCount,
+        paymentsCount: summary.overall.count,
+        totalExpected: String(totalExpected),
+        totalActual: String(totalActual),
+        staffBreakdown: summary.byStaff,
+        totalBilled: String(summary.totalBilled),
+        totalRefunds: String(summary.totalRefunds),
+        totalExpenses: String(summary.totalExpenses),
+        totalDue: String(summary.totalDue),
+        testSummary: summary.testSummary,
+        expenseDetails: summary.expenseDetails,
+        refundDetails: summary.cancelledBills.map((b) => ({
+          id: b.id,
+          billNumber: b.billNumber ?? String(b.id),
+          patientName: b.patientName ?? "Unknown",
+          totalAmount: b.totalAmount,
+          refundAmount: b.refundAmount,
+        })),
+        status: "closed",
+      })
+      .returning();
+    return {
+      row,
+      cashExpenses: summary.cashExpenses,
+      digitalExpenses: summary.digitalExpenses,
+      suspenseTotal: summary.totalSuspense,
+      suspenseItems: summary.suspenseItems,
+    };
+  });
+
+  req.log?.info({ closureId: inserted.row.id, totalExpected: inserted.row.totalExpected, totalActual: inserted.row.totalActual, variance: inserted.row.variance }, "Day closed");
+  if (inserted.suspenseItems.length > 0) {
+    req.log?.warn(
+      { closureId: inserted.row.id, suspenseCount: inserted.suspenseItems.length, suspenseTotal: inserted.suspenseTotal },
+      "Day closed with unrecognized-method payments excluded from totals — needs admin correction",
+    );
+  }
+  res.status(201).json({
+    ...inserted.row,
+    // Additive, not persisted as separate columns — see LOCKED BUSINESS
+    // RULE #4/#5 (cash-expense split of the already-persisted totalExpenses)
+    // and RULE #6 (suspense/exception bucket, never folded into any total).
+    cashExpenses: inserted.cashExpenses,
+    digitalExpenses: inserted.digitalExpenses,
+    suspenseTotal: inserted.suspenseTotal,
+    suspenseCount: inserted.suspenseItems.length,
+    suspenseItems: inserted.suspenseItems,
+  });
+});
+
+// List all closures, newest first.
+dayCloseRouter.get("/", requireOwnerOrAdmin, async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+  const rows = await db
+    .select()
+    .from(dayClosuresTable)
+    .orderBy(desc(dayClosuresTable.closedAt))
+    .limit(limit);
+  res.json(rows);
+});
+
+// Single closure detail (enriched with report data if missing from DB).
+// IMPORTANT: this parametric route is registered before /my-preview,
+// /my-drawer-status, /my-list, etc. Non-numeric ids must fall through with
+// next("route") — otherwise cashiers get 403 from requireOwnerOrAdmin when
+// calling their own My Day Close endpoints (Express matches /:id first).
+dayCloseRouter.get("/:id", (req, res, next) => {
+  if (!Number.isInteger(Number(req.params.id))) return next("route");
+  return requireOwnerOrAdmin(req, res, next);
+}, async (req, res) => {
+  const id = Number(req.params.id);
+  const [row] = await db.select().from(dayClosuresTable).where(eq(dayClosuresTable.id, id)).limit(1);
+  if (!row) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+
+  const existing = row as Record<string, unknown>;
+  const hasReport = n(existing.totalBilled) !== 0 || n(existing.totalRefunds) !== 0 || n(existing.totalExpenses) !== 0 || (Array.isArray(existing.testSummary) && (existing.testSummary as unknown[]).length > 0);
+
+  // Bills made inside this closure's window — shown in the detail dialog so
+  // the owner can see exactly which bills a close covered.
+  const billFrom = row.coveredFromTs ? new Date(row.coveredFromTs) : null;
+  const billTo = new Date(row.coveredToTs);
+  const windowBills = await db
+    .select({
+      id: billsTable.id,
+      billNumber: billsTable.billNumber,
+      totalAmount: billsTable.totalAmount,
+      paidAmount: billsTable.paidAmount,
+      balanceAmount: billsTable.balanceAmount,
+      status: billsTable.status,
+      createdAt: billsTable.createdAt,
+      createdByName: billsTable.createdByName,
+      patientName: sql<string>`COALESCE(${patientsTable.firstName} || ' ' || COALESCE(${patientsTable.lastName}, ''), 'Unknown')`,
+    })
+    .from(billsTable)
+    .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+    .where(
+      billFrom
+        ? and(gt(billsTable.createdAt, billFrom), lte(billsTable.createdAt, billTo))
+        : lte(billsTable.createdAt, billTo),
+    )
+    .orderBy(desc(billsTable.createdAt))
+    .limit(300);
+
+  const bills = windowBills.map((b) => ({
+    id: b.id,
+    billNumber: b.billNumber ?? String(b.id),
+    patientName: b.patientName,
+    totalAmount: n(b.totalAmount),
+    paidAmount: n(b.paidAmount),
+    balanceAmount: n(b.balanceAmount),
+    status: b.status ?? "pending",
+    createdByName: b.createdByName ?? "",
+    createdAt: b.createdAt ? new Date(b.createdAt).toISOString() : "",
+  }));
+
+  if (hasReport) {
+    res.json({ ...row, bills });
+    return;
+  }
+
+  // Re-compute report data for legacy closures
+  const from = row.coveredFromTs ? new Date(row.coveredFromTs) : null;
+  const to = new Date(row.coveredToTs);
+  const summary = await summarizeWindow(from, to);
+
+  const enriched = {
+    ...row,
+    totalBilled: String(summary.totalBilled),
+    totalRefunds: String(summary.totalRefunds),
+    totalExpenses: String(summary.totalExpenses),
+    totalDue: String(summary.totalDue),
+    testSummary: summary.testSummary,
+    expenseDetails: summary.expenseDetails,
+    refundDetails: summary.cancelledBills.map((b) => ({
+      id: b.id,
+      billNumber: b.billNumber ?? String(b.id),
+      patientName: b.patientName ?? "Unknown",
+      totalAmount: b.totalAmount,
+      refundAmount: b.refundAmount,
+    })),
+    bills,
+  };
+
+  res.json(enriched);
+});
+
+// Re-open a closed day. SUPER-ADMIN role (regular ERP staff session) ONLY.
+const ReopenBody = z.object({ reason: z.string().min(3).max(2000) });
+dayCloseRouter.post("/:id/reopen", (req, res, next) => {
+  if (!Number.isInteger(Number(req.params.id))) return next("route");
+  return requireSuperAdminStaff(req, res, next);
+}, async (req, res) => {
+  const id = Number(req.params.id);
+  const parsed = ReopenBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Reason is required (min 3 chars)" });
+    return;
+  }
+  const session = (req as StaffAuthRequest).staffSession;
+  const reopenedByName = session?.subjectName || "Super-admin";
+  const [updated] = await db
+    .update(dayClosuresTable)
+    .set({
+      status: "reopened",
+      reopenedAt: new Date(),
+      reopenedByUserId: session?.subjectId ?? null,
+      reopenedByName,
+      reopenReason: parsed.data.reason,
+    })
+    .where(and(eq(dayClosuresTable.id, id), eq(dayClosuresTable.status, "closed")))
+    .returning();
+  if (!updated) {
+    res.status(409).json({ error: "Closure not found or already reopened" });
+    return;
+  }
+  req.log?.warn({ closureId: id, reopenedBy: reopenedByName }, "Day closure RE-OPENED");
+  res.json(updated);
+});
+
+// ── Per-user helpers ────────────────────────────────────────────────────────
+
+const OWNER_ROLES = new Set(["admin", "super_admin", "owner"]);
+
+// Find the open-window start for a specific user:
+// MAX(last overall day close, last user's own close).
+/**
+ * CARRY-FORWARD RULE (LOCKED BUSINESS RULE #10/#11): the open window for a
+ * staff member's next close starts at MAX(last overall day close, last
+ * user's own close) — never before either boundary, so a closed day's
+ * totals can never silently change, and nothing later requires owner
+ * approval to "reopen" — new entries simply belong to the next window by
+ * construction. Pure — exported for unit testing without a DB.
+ */
+export function maxBoundary(t1: Date | null, t2: Date | null): Date | null {
+  if (!t1 && !t2) return null;
+  if (!t1) return t2;
+  if (!t2) return t1;
+  return t1 > t2 ? t1 : t2;
+}
+
+/**
+ * A drawer variance is always COUNTED minus EXPECTED: negative is money missing
+ * from the drawer, positive is a surplus. The card reads the sign, not the
+ * words — it colours a negative variance red and a positive one amber — so the
+ * closed and reopened branches of `buildDrawerStatusPayload` must not compute it
+ * in opposite directions. They did: a ₹500 shortage showed as red "−₹500" on a
+ * closed drawer and as amber "+₹500" once the same drawer was reopened to
+ * investigate it.
+ *
+ * The total for a closed drawer still comes from its stored `variance` column,
+ * because that is the number written and audited at close time. Every close
+ * writer in this file computes it as `totalActual - totalExpected` (see
+ * `/`, `/my-close`, `/staff-close`), so the stored column follows this
+ * convention too, and the reopened branch applies it directly.
+ *
+ * Pure — exported for unit testing without a DB.
+ */
+export function drawerVariances(counts: {
+  countedCash: number;
+  expectedCash: number;
+  countedDigital: number;
+  expectedDigital: number;
+  countedTotal: number;
+  expectedTotal: number;
+}): { cashVariance: number; digitalVariance: number; totalVariance: number } {
+  return {
+    cashVariance: counts.countedCash - counts.expectedCash,
+    digitalVariance: counts.countedDigital - counts.expectedDigital,
+    totalVariance: counts.countedTotal - counts.expectedTotal,
+  };
+}
+
+/**
+ * A drawer only earns the word "balanced" when someone says they counted the
+ * money, or has entered note-by-note counts — which are themselves a count.
+ *
+ * The self-close form fills every actual from the system's own expected totals
+ * (`MyDayClose.tsx`: `cash: String(previewQ.data.expected.cash || "")`), so
+ * pressing Close without touching a box submits expected as actual and computes a
+ * variance of exactly zero. Measured on the live clinic on 2026-10-13: twelve
+ * consecutive staff closes across two cashiers all had `variance 0.00`, an empty
+ * `variance_note`, `denominations IS NULL`, and `actual_cash` equal to
+ * `expected_cash` to the paisa. Nothing in the stored row can tell a perfect count
+ * from no count at all, which makes "balanced" an assertion rather than evidence —
+ * and a shortage would read the same way.
+ *
+ * The auto-balance path for admins (`opts.autoBalance`) sets actuals FROM the
+ * expected totals, so its variance is zero by construction and it is never a
+ * verification.
+ */
+export const DRAWER_STATUS_NOT_VERIFIED = "not_physically_verified";
+
+export function staffDrawerStatus(args: {
+  variance: number;
+  physicallyCounted: boolean;
+  denominationsEntered: boolean;
+}): "mismatch" | "balanced" | typeof DRAWER_STATUS_NOT_VERIFIED {
+  if (args.variance !== 0) return "mismatch";
+  if (args.physicallyCounted || args.denominationsEntered) return "balanced";
+  return DRAWER_STATUS_NOT_VERIFIED;
+}
+
+/** The audit verb for a close, so the trail says whether it was verified. */
+export function staffCloseAuditAction(status: string): "mismatch_detected" | "closed" | "closed_unverified" {
+  if (status === "mismatch") return "mismatch_detected";
+  return status === DRAWER_STATUS_NOT_VERIFIED ? "closed_unverified" : "closed";
+}
+
+async function userWindowBoundary(userName: string): Promise<Date | null> {
+  const [lastOverall] = await db
+    .select({ ts: dayClosuresTable.coveredToTs })
+    .from(dayClosuresTable)
+    .where(eq(dayClosuresTable.status, "closed"))
+    .orderBy(desc(dayClosuresTable.coveredToTs))
+    .limit(1);
+
+  const [lastUser] = await db
+    .select({ ts: userDayClosuresTable.closedAt })
+    .from(userDayClosuresTable)
+    .where(eq(userDayClosuresTable.userName, userName))
+    .orderBy(desc(userDayClosuresTable.closedAt))
+    .limit(1);
+
+  const t1 = lastOverall?.ts ? new Date(lastOverall.ts) : null;
+  const t2 = lastUser?.ts    ? new Date(lastUser.ts)    : null;
+  return maxBoundary(t1, t2);
+}
+
+/** Window-scoped activity for staff day-close print slips (no test-wise detail). */
+export type { StaffPrintActivity } from "../lib/postClosureActivityTypes";
+
+type UserSummary = {
+  totals: MethodTotals;
+  billsCount: number;
+  totalBilled: number;
+  totalDue: number;
+  dueReceived: number;
+  cancelledBillsAmount: number;
+  refundsAmount: number;
+  cashExpenses: number;
+  digitalExpenses: number;
+  totalExpenses: number;
+  suspenseTotal: number;
+  suspenseItems: Array<{ amount: number; rawMethod: string }>;
+  bills: Array<{
+    id: number;
+    billNumber: string;
+    patientName: string;
+    totalAmount: number;
+    paidAmount: number;
+    balanceAmount: number;
+    discount: number;
+    discountReason: string | null;
+    discountReasonNote: string | null;
+    status: string;
+    referringDoctor: string | null;
+    createdByName: string;
+    createdAt: string;
+    /** Same IST day as prior close — next-window carry from evening billing. */
+    sameDayAfterPriorClose: boolean;
+  }>;
+  printActivity: StaffPrintActivity;
+  sameDayAfterPriorClose: {
+    billCount: number;
+    billTotal: number;
+  };
+};
+
+function toIso(v: unknown): string {
+  if (v instanceof Date) return v.toISOString();
+  if (v == null) return "";
+  return String(v);
+}
+
+function buildStaffPrintActivity(s: Omit<UserSummary, "printActivity"> & {
+  expenseDetails: StaffPrintActivity["expenseDetails"];
+  billEdits: StaffPrintActivity["billEdits"];
+  voucherEdits: StaffPrintActivity["voucherEdits"];
+}): StaffPrintActivity {
+  const discountBills = s.bills
+    .filter((b) => b.discount > 0 && b.status !== "cancelled")
+    .map((b) => ({
+      billId: b.id,
+      billNumber: b.billNumber,
+      patientName: b.patientName,
+      totalAmount: b.totalAmount,
+      discountGiven: b.discount,
+      grossAmount: b.totalAmount + b.discount,
+      discountReason: b.discountReason,
+      discountReasonNote: b.discountReasonNote,
+    }));
+  return {
+    dueReceived: s.dueReceived,
+    cancelledBillsAmount: s.cancelledBillsAmount,
+    refundsAmount: s.refundsAmount,
+    discountsGiven: discountBills.reduce((sum, b) => sum + b.discountGiven, 0),
+    discountBills,
+    billEdits: s.billEdits,
+    voucherEdits: s.voucherEdits,
+    expenseDetails: s.expenseDetails,
+    totalExpenses: s.totalExpenses,
+    cashExpenses: s.cashExpenses,
+    digitalExpenses: s.digitalExpenses,
+  };
+}
+
+async function summarizeUserWindow(
+  userName: string,
+  from: Date | null,
+  to: Date,
+): Promise<UserSummary> {
+  const pWhere = from
+    ? and(eq(paymentsTable.recordedByName, userName), gt(paymentsTable.createdAt, from), lte(paymentsTable.createdAt, to))
+    : and(eq(paymentsTable.recordedByName, userName), lte(paymentsTable.createdAt, to));
+
+  const payments = await db
+    .select({
+      id: paymentsTable.id,
+      billId: paymentsTable.billId,
+      amount: paymentsTable.amount,
+      method: paymentsTable.method,
+      notes: paymentsTable.notes,
+      recordedByName: paymentsTable.recordedByName,
+      settlementStatus: paymentsTable.settlementStatus,
+    })
+    .from(paymentsTable)
+    .where(pWhere);
+
+  // Same pure classifier used by the overall day-close path — single
+  // source of truth for bucketing + suspense isolation.
+  const classified = classifyAndBucketPayments(payments.filter(isCollectiblePayment));
+  const totals = classified.overall;
+  const suspenseItems = classified.suspenseItems.map((s) => ({ amount: s.amount, rawMethod: s.rawMethod }));
+  const suspenseTotal = classified.totalSuspense;
+
+  // Subtract THIS staff's own cash expenses (Cash Attribution Rule: an
+  // expense reduces the physical cash of the drawer owner — approved_by, or
+  // created_by when Approved By was left blank). Posting clock = created_at.
+  const ownerMatch = sql`COALESCE(NULLIF(TRIM(${expensesTable.approvedBy}), ''), NULLIF(TRIM(${expensesTable.createdBy}), '')) = ${userName}`;
+  const expWhere = from
+    ? and(
+        ownerMatch,
+        gt(expensePaymentsTable.createdAt, from),
+        lte(expensePaymentsTable.createdAt, to),
+        isNull(expensePaymentsTable.reversedAt),
+      )
+    : and(ownerMatch, lte(expensePaymentsTable.createdAt, to), isNull(expensePaymentsTable.reversedAt));
+  const expRows = await db
+    .select({
+      id: expensePaymentsTable.id,
+      amount: expensePaymentsTable.amount,
+      category: expensesTable.category,
+      description: expensesTable.description,
+      paymentMode: expensePaymentsTable.paymentMode,
+      approvedBy: expensesTable.approvedBy,
+      createdBy: expensesTable.createdBy,
+    })
+    .from(expensePaymentsTable)
+    .innerJoin(expensesTable, eq(expensePaymentsTable.expenseId, expensesTable.id))
+    .where(and(expWhere, sql`${expensesTable.paymentStatus} <> 'VOID'`));
+  // Reduce this cashier's expected physical cash by the cash expenses they
+  // approved — exactly once — by delegating to the same tested pure helper the
+  // overall path uses (applyCashExpenses). `totals` is `classified.overall`,
+  // so mutating `classified` here updates it. This previously inlined the
+  // subtraction and applied it TWICE, which understated each cashier's expected
+  // drawer cash and could mask a real shortfall as a false surplus.
+  const { cashExpenses, digitalExpenses, cashExpensesByApprover } = splitCashExpenses(expRows);
+  applyCashExpenses(classified, cashExpensesByApprover);
+  const expenseDetails = expRows.map((e) => ({
+    id: e.id,
+    amount: n(e.amount),
+    category: e.category ?? "General",
+    description: e.description ?? "",
+    paymentMode: (e.paymentMode ?? "cash").toLowerCase(),
+  }));
+  const totalExpenses = expenseDetails.reduce((s, e) => s + e.amount, 0);
+
+  // Include cancelled bills in gross billed. Outstanding uses non-cancelled only.
+  const bWhere = from
+    ? and(
+        eq(billsTable.createdByName, userName),
+        gt(billsTable.createdAt, from),
+        lte(billsTable.createdAt, to),
+      )
+    : and(
+        eq(billsTable.createdByName, userName),
+        lte(billsTable.createdAt, to),
+      );
+
+  const billRows = await db
+    .select({
+      id: billsTable.id,
+      billNumber: billsTable.billNumber,
+      totalAmount: billsTable.totalAmount,
+      paidAmount: billsTable.paidAmount,
+      balanceAmount: billsTable.balanceAmount,
+      discount: billsTable.discount,
+      discountReason: billsTable.discountReason,
+      discountReasonNote: billsTable.discountReasonNote,
+      status: billsTable.status,
+      createdAt: billsTable.createdAt,
+      createdByName: billsTable.createdByName,
+      patientName: sql<string>`COALESCE(${patientsTable.firstName} || ' ' || COALESCE(${patientsTable.lastName}, ''), 'Unknown')`,
+      referringDoctor: doctorsTable.name,
+    })
+    .from(billsTable)
+    .leftJoin(patientsTable, eq(billsTable.patientId, patientsTable.id))
+    .leftJoin(ordersTable, eq(billsTable.orderId, ordersTable.id))
+    .leftJoin(doctorsTable, eq(ordersTable.doctorId, doctorsTable.id))
+    .where(bWhere)
+    .orderBy(desc(billsTable.createdAt));
+
+  const bills = billRows.map((b) => {
+    const createdAt = b.createdAt ? new Date(b.createdAt).toISOString() : "";
+    return {
+      id: b.id,
+      billNumber: b.billNumber ?? String(b.id),
+      patientName: b.patientName,
+      totalAmount: n(b.totalAmount),
+      paidAmount: n(b.paidAmount),
+      balanceAmount: n(b.balanceAmount),
+      discount: n(b.discount),
+      discountReason: b.discountReason ?? null,
+      discountReasonNote: b.discountReasonNote ?? null,
+      status: b.status ?? "pending",
+      referringDoctor: b.referringDoctor ?? null,
+      createdByName: b.createdByName ?? "",
+      createdAt,
+      sameDayAfterPriorClose: isSameDayAfterClose(createdAt || null, from),
+    };
+  });
+  const sameDayAfterPriorClose = summarizeSameDayBills(
+    bills.map((b) => ({ createdAt: b.createdAt, totalAmount: b.totalAmount })),
+    from,
+  );
+  const activeBills = bills.filter((b) => b.status !== "cancelled");
+
+  // Bills this staff cancelled in the window (any original createdAt).
+  const cancelWhere = from
+    ? and(
+        eq(billsTable.cancelledByName, userName),
+        gt(billsTable.cancelledAt, from),
+        lte(billsTable.cancelledAt, to),
+      )
+    : and(
+        eq(billsTable.cancelledByName, userName),
+        lte(billsTable.cancelledAt, to),
+      );
+  const cancelledByMeRows = await db
+    .select({ id: billsTable.id, totalAmount: billsTable.totalAmount })
+    .from(billsTable)
+    .where(cancelWhere);
+  const cancelledBillIds = new Set(cancelledByMeRows.map((r) => r.id));
+  const cancelledBillsAmountFull = cancelledByMeRows.reduce((s, r) => s + n(r.totalAmount), 0);
+
+  // Dues collected: positive payments already in this drawer window whose
+  // bill is NOT in this staff's Bill Gen (bills they created in the window).
+  // Do not gate on bill.createdAt ≤ prior close — that dropped in-window
+  // dues like Suraj #170 (PINKI ₹3000 at 11:16am before close): UPI+CASH
+  // had the money, Dues/Expected did not. Aligns with My Daily Summary.
+  const collectiblePays = payments.filter(isCollectiblePayment);
+  const dueReceived = computeDueReceivedForWindow({
+    windowBillIds: bills.map((b) => b.id),
+    payments: collectiblePays,
+  });
+
+  // Partial test-cancel auto-refunds: same attribution as my-daily-summary —
+  // canceller owns them; creator gross is restored so their slip is unchanged.
+  const testCancelRefundsByMe = computeTestCancelRefundsAmount(collectiblePays);
+  const cancelledBillsAmount = cancelledBillsAmountFull + testCancelRefundsByMe;
+
+  const testCancelOnMyBillsWhere = from
+    ? and(
+        eq(billsTable.createdByName, userName),
+        gt(billsTable.createdAt, from),
+        lte(billsTable.createdAt, to),
+        gt(paymentsTable.createdAt, from),
+        lte(paymentsTable.createdAt, to),
+        sql`${paymentsTable.amount}::numeric < 0`,
+        sql`${paymentsTable.notes} LIKE ${TEST_CANCEL_REFUND_NOTES_PREFIX + "%"}`,
+      )
+    : and(
+        eq(billsTable.createdByName, userName),
+        lte(billsTable.createdAt, to),
+        lte(paymentsTable.createdAt, to),
+        sql`${paymentsTable.amount}::numeric < 0`,
+        sql`${paymentsTable.notes} LIKE ${TEST_CANCEL_REFUND_NOTES_PREFIX + "%"}`,
+      );
+  const testCancelRefundsOnMyCreatedBills = await db
+    .select({
+      amount: paymentsTable.amount,
+      billId: paymentsTable.billId,
+      notes: paymentsTable.notes,
+    })
+    .from(paymentsTable)
+    .innerJoin(billsTable, eq(paymentsTable.billId, billsTable.id))
+    .where(testCancelOnMyBillsWhere);
+  const grossRestore = computeGrossRestoreForTestCancelRefunds(
+    testCancelRefundsOnMyCreatedBills,
+    bills.map((b) => b.id),
+  );
+
+  const refundsRecorded = collectiblePays
+    .filter((p) => n(p.amount) < 0)
+    .reduce((s, p) => s + Math.abs(n(p.amount)), 0);
+  const refundsOnBillsICancelled = computeRefundsExcludedFromCollectible(
+    collectiblePays.map((p) => ({
+      amount: p.amount,
+      billId: p.billId,
+      billStatus: null,
+      billCreatedAt: null,
+      notes: p.notes,
+    })),
+    cancelledBillIds,
+  );
+  const formula = computeStaffSlipFormula({
+    billed: bills.reduce((s, b) => s + b.totalAmount, 0) + grossRestore,
+    duesCollected: dueReceived,
+    cancelledBills: cancelledBillsAmount,
+    refundsRecorded,
+    refundsOnBillsICancelled,
+    outstanding: activeBills.reduce((s, b) => s + b.balanceAmount, 0),
+    expense: totalExpenses,
+  });
+
+  // Bill / voucher edits by this staff inside the same close window
+  // (created_at), excluding operational audit types that flood "edits".
+  const auditTimeWhere = from
+    ? and(gt(billAuditsTable.createdAt, from), lte(billAuditsTable.createdAt, to))
+    : lte(billAuditsTable.createdAt, to);
+  const billEditsRaw = await db
+    .select({
+      id: billAuditsTable.id,
+      billId: billAuditsTable.billId,
+      reason: billAuditsTable.reason,
+      changeType: billAuditsTable.changeType,
+      oldValue: billAuditsTable.oldValue,
+      newValue: billAuditsTable.newValue,
+      createdAt: billAuditsTable.createdAt,
+      billNumber: billsTable.billNumber,
+    })
+    .from(billAuditsTable)
+    .leftJoin(billsTable, eq(billAuditsTable.billId, billsTable.id))
+    .where(and(
+      eq(billAuditsTable.editedBy, userName),
+      notInArray(billAuditsTable.changeType, [...BILL_AUDIT_OPERATIONAL_CHANGE_TYPES]),
+      auditTimeWhere,
+    ))
+    .orderBy(desc(billAuditsTable.createdAt))
+    .limit(100);
+
+  const voucherTimeWhere = from
+    ? and(gt(voucherAuditsTable.createdAt, from), lte(voucherAuditsTable.createdAt, to))
+    : lte(voucherAuditsTable.createdAt, to);
+  const voucherEditsRaw = await db
+    .select({
+      id: voucherAuditsTable.id,
+      voucherId: voucherAuditsTable.voucherId,
+      voucherNumber: voucherAuditsTable.voucherNumber,
+      reason: voucherAuditsTable.reason,
+      changeType: voucherAuditsTable.changeType,
+      oldValue: voucherAuditsTable.oldValue,
+      newValue: voucherAuditsTable.newValue,
+      createdAt: voucherAuditsTable.createdAt,
+    })
+    .from(voucherAuditsTable)
+    .where(and(
+      eq(voucherAuditsTable.editedBy, userName),
+      voucherTimeWhere,
+    ))
+    .orderBy(desc(voucherAuditsTable.createdAt))
+    .limit(100);
+
+  const billEdits = billEditsRaw.map((r) => ({
+    id: r.id,
+    billId: r.billId,
+    billNumber: r.billNumber ?? `#${r.billId}`,
+    changeType: r.changeType,
+    reason: r.reason,
+    oldValue: r.oldValue ?? null,
+    newValue: r.newValue ?? null,
+    createdAt: toIso(r.createdAt),
+  }));
+  const voucherEdits = voucherEditsRaw.map((r) => ({
+    id: r.id,
+    voucherId: r.voucherId,
+    voucherNumber: r.voucherNumber,
+    changeType: r.changeType,
+    reason: r.reason,
+    oldValue: r.oldValue ?? null,
+    newValue: r.newValue ?? null,
+    createdAt: toIso(r.createdAt),
+  }));
+
+  const base = {
+    totals,
+    billsCount:  bills.length,
+    totalBilled: formula.billed,
+    totalDue:    formula.outstanding,
+    dueReceived: formula.duesCollected,
+    cancelledBillsAmount: formula.cancelledBills,
+    refundsAmount: formula.refunds,
+    cashExpenses,
+    digitalExpenses,
+    totalExpenses,
+    suspenseTotal,
+    suspenseItems,
+    bills,
+    expenseDetails,
+    billEdits,
+    voucherEdits,
+    sameDayAfterPriorClose: {
+      billCount: sameDayAfterPriorClose.billCount,
+      billTotal: sameDayAfterPriorClose.billTotal,
+    },
+  };
+
+  return {
+    ...base,
+    printActivity: buildStaffPrintActivity(base),
+  };
+}
+
+// ── Per-user routes ──────────────────────────────────────────────────────────
+
+// Preview: current user's open window summary.
+dayCloseRouter.get("/my-preview", async (req, res) => {
+  const session  = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+
+  const from = await userWindowBoundary(userName);
+  const to   = new Date();
+  const s    = await summarizeUserWindow(userName, from, to);
+
+  res.json({
+    userName,
+    coveredFromTs: from,
+    coveredToTs:   to,
+    expected:      s.totals,
+    billsCount:    s.billsCount,
+    paymentsCount: s.totals.count,
+    totalBilled:   s.totalBilled,
+    totalDue:      s.totalDue,
+    dueReceived:   s.dueReceived,
+    cancelledBillsAmount: s.cancelledBillsAmount,
+    refundsAmount: s.refundsAmount,
+    cashExpenses:  s.cashExpenses,
+    // Suspense/exception bucket — unrecognized payment methods, excluded
+    // from `expected` above. See LOCKED BUSINESS RULE #6.
+    suspenseTotal: s.suspenseTotal,
+    suspenseCount: s.suspenseItems.length,
+    suspenseItems: s.suspenseItems,
+    bills:         s.bills,
+    sameDayAfterPriorClose: s.sameDayAfterPriorClose,
+  });
+});
+
+// Drawer status payload for My Daily Summary (self or admin-selected staff).
+async function buildDrawerStatusPayload(userName: string) {
+  const lastOverall = await lastClosureBoundary();
+
+  const [latestUserClose] = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(
+      lastOverall
+        ? and(eq(userDayClosuresTable.userName, userName), gt(userDayClosuresTable.closedAt, lastOverall))
+        : eq(userDayClosuresTable.userName, userName),
+    )
+    .orderBy(desc(userDayClosuresTable.closedAt))
+    .limit(1);
+
+  if (!latestUserClose) {
+    const from = lastOverall;
+    const to = new Date();
+    const s = await summarizeUserWindow(userName, from, to);
+    const expectedDigital = s.totals.upi + s.totals.card + s.totals.cheque + s.totals.other;
+    return {
+      drawerStatus: "open" as const,
+      userName,
+      coveredFromTs: from,
+      coveredToTs: to,
+      expectedCash: s.totals.cash,
+      countedCash: null,
+      cashVariance: null,
+      expectedDigital,
+      countedDigital: null,
+      digitalVariance: null,
+      expectedTotal: s.totals.total,
+      actualTotal: null,
+      totalVariance: null,
+      closedAt: null,
+      closedBy: null,
+      handoverNote: null,
+      approvedByName: null,
+      approvalNote: null,
+      suspenseTotal: s.suspenseTotal,
+      suspenseCount: s.suspenseItems.length,
+    };
+  }
+
+  if (latestUserClose.drawerStatus === "reopened") {
+    const from = await userWindowBoundary(userName);
+    const to = new Date();
+    const s = await summarizeUserWindow(userName, from, to);
+    const expectedDigital = s.totals.upi + s.totals.card + s.totals.cheque + s.totals.other;
+    const countedDigital = n(latestUserClose.actualUpi) + n(latestUserClose.actualCard)
+      + n(latestUserClose.actualCheque) + n(latestUserClose.actualOther);
+    // Expected is LIVE (money collected since the drawer was reopened); counted
+    // is what this drawer counted when it closed. `drawerVariances` keeps the
+    // sign the same way round as the closed branch below.
+    const v = drawerVariances({
+      countedCash: n(latestUserClose.actualCash),
+      expectedCash: s.totals.cash,
+      countedDigital,
+      expectedDigital,
+      countedTotal: n(latestUserClose.totalActual),
+      expectedTotal: s.totals.total,
+    });
+    return {
+      drawerStatus: "reopened" as const,
+      userName,
+      coveredFromTs: from,
+      coveredToTs: to,
+      expectedCash: s.totals.cash,
+      countedCash: n(latestUserClose.actualCash),
+      cashVariance: v.cashVariance,
+      expectedDigital,
+      countedDigital,
+      digitalVariance: v.digitalVariance,
+      expectedTotal: s.totals.total,
+      actualTotal: n(latestUserClose.totalActual),
+      totalVariance: v.totalVariance,
+      closedAt: latestUserClose.closedAt,
+      closedBy: latestUserClose.userName,
+      handoverNote: latestUserClose.notes || null,
+      approvedByName: latestUserClose.approvedByName ?? null,
+      approvalNote: latestUserClose.approvalNote ?? null,
+      closureId: latestUserClose.id,
+      suspenseTotal: s.suspenseTotal,
+      suspenseCount: s.suspenseItems.length,
+    };
+  }
+
+  const exp = n(latestUserClose.totalExpected);
+  const act = n(latestUserClose.totalActual);
+  const v = n(latestUserClose.variance);
+  const expCash = n(latestUserClose.expectedCash);
+  const actCash = n(latestUserClose.actualCash);
+  const expDigital = n(latestUserClose.expectedUpi) + n(latestUserClose.expectedCard)
+    + n(latestUserClose.expectedCheque) + n(latestUserClose.expectedOther);
+  const actDigital = n(latestUserClose.actualUpi) + n(latestUserClose.actualCard)
+    + n(latestUserClose.actualCheque) + n(latestUserClose.actualOther);
+  const variances = drawerVariances({
+    countedCash: actCash,
+    expectedCash: expCash,
+    countedDigital: actDigital,
+    expectedDigital: expDigital,
+    countedTotal: act,
+    expectedTotal: exp,
+  });
+
+  return {
+    drawerStatus: latestUserClose.drawerStatus,
+    userName,
+    coveredFromTs: latestUserClose.coveredFromTs,
+    coveredToTs: latestUserClose.coveredToTs,
+    expectedCash: expCash,
+    countedCash: actCash,
+    cashVariance: variances.cashVariance,
+    expectedDigital: expDigital,
+    countedDigital: actDigital,
+    digitalVariance: variances.digitalVariance,
+    expectedTotal: exp,
+    actualTotal: act,
+    // The stored column, not `variances.totalVariance`: this is the number that
+    // was written and audited at close time. It is computed the same way round
+    // by every close writer in this file, so the two agree.
+    totalVariance: v,
+    closedAt: latestUserClose.closedAt,
+    closedBy: latestUserClose.userName,
+    handoverNote: latestUserClose.notes || null,
+    approvedByName: latestUserClose.approvedByName ?? null,
+    approvalNote: latestUserClose.approvalNote ?? null,
+    closureId: latestUserClose.id,
+  };
+}
+
+// Drawer status for My Daily Summary card — returns latest close state.
+dayCloseRouter.get("/my-drawer-status", async (req, res) => {
+  const session = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+  res.json(await buildDrawerStatusPayload(userName));
+});
+
+// Admin: same drawer status shape for a selected staff member (My Daily Summary filter).
+dayCloseRouter.get("/staff-drawer-status/:userName", requireOwnerOrAdmin, async (req, res) => {
+  const userName = decodeURIComponent(String(req.params.userName || "")).trim();
+  if (!userName) { res.status(400).json({ error: "userName is required" }); return; }
+  res.json(await buildDrawerStatusPayload(userName));
+});
+
+// List: current user's past closures.
+dayCloseRouter.get("/my-list", async (req, res) => {
+  const session  = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+
+  const rows = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(eq(userDayClosuresTable.userName, userName))
+    .orderBy(desc(userDayClosuresTable.closedAt))
+    .limit(60);
+
+  res.json(rows);
+});
+
+const DenominationSchema = z.object({
+  d500: z.coerce.number().int().min(0).default(0),
+  d200: z.coerce.number().int().min(0).default(0),
+  d100: z.coerce.number().int().min(0).default(0),
+  d50:  z.coerce.number().int().min(0).default(0),
+  d20:  z.coerce.number().int().min(0).default(0),
+  d10:  z.coerce.number().int().min(0).default(0),
+  coins: z.coerce.number().min(0).default(0),
+}).optional();
+
+export const UserCloseBody = z.object({
+  actuals: z.object({
+    cash:   z.coerce.number().min(0).default(0),
+    upi:    z.coerce.number().min(0).default(0),
+    card:   z.coerce.number().min(0).default(0),
+    cheque: z.coerce.number().min(0).default(0),
+    other:  z.coerce.number().min(0).default(0),
+  }),
+  varianceNote: z.string().max(2000).default(""),
+  notes:        z.string().max(2000).default(""),
+  denominations: DenominationSchema,
+  // Defaults to FALSE on purpose. The form pre-fills the actuals from the
+  // expected totals, so silence here means "nobody asserted a count", and that
+  // must record as unverified rather than inheriting the flattering default.
+  physicallyCounted: z.boolean().default(false),
+});
+
+function calcDenominationTotal(d: { d500:number; d200:number; d100:number; d50:number; d20:number; d10:number; coins:number }): number {
+  return d.d500 * 500 + d.d200 * 200 + d.d100 * 100 + d.d50 * 50 + d.d20 * 20 + d.d10 * 10 + d.coins;
+}
+
+async function sendDayCloseEmailSafe(
+  req: { log?: { warn?: (obj: unknown, msg: string) => void; info?: (obj: unknown, msg: string) => void } },
+  args: { row: typeof userDayClosuresTable.$inferSelect; printActivity: StaffPrintActivity },
+): Promise<{ emailSent: boolean; emailSkipReason?: string }> {
+  try {
+    const result = await notifyStaffDayCloseEmail(args);
+    if (result.sent) {
+      req.log?.info?.({ closureId: args.row.id, to: result.to }, "Staff day-close email sent");
+      return { emailSent: true };
+    }
+    req.log?.warn?.({ closureId: args.row.id, reason: result.reason }, "Staff day-close email skipped");
+    return { emailSent: false, emailSkipReason: result.reason };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : "Email send failed";
+    req.log?.warn?.({ err, closureId: args.row.id }, "Staff day-close email failed (non-blocking)");
+    return { emailSent: false, emailSkipReason: reason };
+  }
+}
+
+async function notifyStaffDayCloseEmail(args: {
+  row: typeof userDayClosuresTable.$inferSelect;
+  printActivity: StaffPrintActivity;
+}): Promise<StaffDayCloseEmailResult> {
+  const [clinic] = await db.select({ name: clinicSettingsTable.name }).from(clinicSettingsTable).limit(1);
+  const denoms = args.row.denominations as {
+    d500: number; d200: number; d100: number;
+    d50: number; d20: number; d10: number; coins: number;
+  } | null;
+
+  return sendStaffDayCloseEmail({
+    clinicName: clinic?.name || "Care Diagnostics",
+    staffName: args.row.userName,
+    closureDate: String(args.row.closureDate),
+    closedAt: new Date(args.row.closedAt),
+    coveredFromTs: args.row.coveredFromTs ? new Date(args.row.coveredFromTs) : null,
+    coveredToTs: new Date(args.row.coveredToTs),
+    totalBilled: n(args.row.totalBilled),
+    totalDue: n(args.row.totalDue),
+    totalExpected: n(args.row.totalExpected),
+    totalActual: n(args.row.totalActual),
+    variance: n(args.row.variance),
+    expectedCash: n(args.row.expectedCash),
+    expectedUpi: n(args.row.expectedUpi),
+    expectedCard: n(args.row.expectedCard),
+    expectedCheque: n(args.row.expectedCheque),
+    expectedOther: n(args.row.expectedOther),
+    actualCash: n(args.row.actualCash),
+    actualUpi: n(args.row.actualUpi),
+    actualCard: n(args.row.actualCard),
+    actualCheque: n(args.row.actualCheque),
+    actualOther: n(args.row.actualOther),
+    denominations: denoms,
+    denominationTotal: args.row.denominationTotal != null ? n(args.row.denominationTotal) : null,
+    varianceNote: args.row.varianceNote || undefined,
+    notes: args.row.notes || undefined,
+    drawerStatus: args.row.drawerStatus,
+    closureId: args.row.id,
+    printActivity: args.printActivity,
+  });
+}
+
+// Close: record the current user's day close snapshot.
+dayCloseRouter.post("/my-close", async (req, res) => {
+  const session  = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  const userId   = session?.subjectId ?? null;
+  const userRole = session?.role ?? "staff";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+
+  const parsed = UserCloseBody.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid request body" }); return; }
+  const { actuals, varianceNote, notes, denominations, physicallyCounted } = parsed.data;
+
+  const inserted = await db.transaction(async (tx) => {
+    // Per-user advisory lock to prevent duplicate concurrent closes.
+    const lockId = BigInt(
+      Math.abs(userName.split("").reduce((a, c) => ((a * 31 + c.charCodeAt(0)) | 0), 0)),
+    );
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(${lockId})`);
+
+    const from = await userWindowBoundary(userName);
+    const to   = new Date();
+    const s    = await summarizeUserWindow(userName, from, to);
+
+    const totalExpected = s.totals.total;
+    const totalActual   = actuals.cash + actuals.upi + actuals.card + actuals.cheque + actuals.other;
+    const variance      = totalActual - totalExpected;
+
+    const denominationTotal = denominations ? calcDenominationTotal(denominations) : null;
+
+    const drawerStatus = staffDrawerStatus({
+      variance,
+      physicallyCounted,
+      denominationsEntered: denominations != null,
+    });
+
+    const istDate = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(to);
+
+    const [row] = await tx
+      .insert(userDayClosuresTable)
+      .values({
+        userId,
+        userName,
+        closureDate:    istDate,
+        closedAt:       to,
+        coveredFromTs:  from,
+        coveredToTs:    to,
+        expectedCash:   String(s.totals.cash),
+        expectedUpi:    String(s.totals.upi),
+        expectedCard:   String(s.totals.card),
+        expectedCheque: String(s.totals.cheque),
+        expectedOther:  String(s.totals.other),
+        totalExpected:  String(totalExpected),
+        totalBilled:    String(s.totalBilled),
+        totalDue:       String(s.totalDue),
+        billsCount:     s.billsCount,
+        paymentsCount:  s.totals.count,
+        actualCash:     String(actuals.cash),
+        actualUpi:      String(actuals.upi),
+        actualCard:     String(actuals.card),
+        actualCheque:   String(actuals.cheque),
+        actualOther:    String(actuals.other),
+        totalActual:    String(totalActual),
+        variance:       String(variance),
+        varianceNote,
+        notes,
+        denominations:  denominations ?? null,
+        denominationTotal: denominationTotal !== null ? String(denominationTotal) : null,
+        drawerStatus,
+      })
+      .returning();
+
+    // Write audit log entry.
+    await tx.insert(drawerAuditLogTable).values({
+      userClosureId: row.id,
+      action:        staffCloseAuditAction(drawerStatus),
+      userId,
+      userName,
+      userRole,
+      expectedTotal: String(totalExpected),
+      actualTotal:   String(totalActual),
+      variance:      String(variance),
+      reason:        varianceNote || "",
+    });
+
+    return { row, suspenseTotal: s.suspenseTotal, suspenseItems: s.suspenseItems, printActivity: s.printActivity };
+  });
+
+  req.log?.info({ closureId: inserted.row.id, userName, variance: inserted.row.variance, drawerStatus: inserted.row.drawerStatus }, "User day closed");
+  if (inserted.suspenseItems.length > 0) {
+    req.log?.warn(
+      { closureId: inserted.row.id, userName, suspenseCount: inserted.suspenseItems.length, suspenseTotal: inserted.suspenseTotal },
+      "User day closed with unrecognized-method payments excluded from totals — needs admin correction",
+    );
+  }
+  const email = await sendDayCloseEmailSafe(req, { row: inserted.row, printActivity: inserted.printActivity });
+  res.status(201).json({
+    ...inserted.row,
+    suspenseTotal: inserted.suspenseTotal,
+    suspenseCount: inserted.suspenseItems.length,
+    suspenseItems: inserted.suspenseItems,
+    printActivity: inserted.printActivity,
+    dueReceived: inserted.printActivity.dueReceived,
+    totalRefunds: inserted.printActivity.refundsAmount,
+    ...email,
+  });
+});
+
+// Reprint payload for a past staff closure — accounts + denomination live on
+// the row; discounts/edits/voucher mods/expenses are recomputed for the
+// persisted coveredFromTs → coveredToTs window (same as close-time snapshot).
+dayCloseRouter.get("/my-closures/:id/print-summary", async (req, res) => {
+  const session = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  const role = session?.role ?? "";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+
+  const [row] = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(eq(userDayClosuresTable.id, id))
+    .limit(1);
+  if (!row) { res.status(404).json({ error: "Not found" }); return; }
+
+  const isOwner = OWNER_ROLES.has(role);
+  if (!isOwner && row.userName !== userName) {
+    res.status(403).json({ error: "Not your closure" });
+    return;
+  }
+
+  const from = row.coveredFromTs ? new Date(row.coveredFromTs) : null;
+  const to = new Date(row.coveredToTs);
+  const s = await summarizeUserWindow(row.userName, from, to);
+  res.json({
+    ...row,
+    printActivity: s.printActivity,
+    dueReceived: s.dueReceived,
+    totalRefunds: s.refundsAmount,
+  });
+});
+
+// ── Admin actions on individual staff drawers ────────────────────────────────
+
+// Enhanced staff-close status with per-row detail for the admin table.
+dayCloseRouter.get("/staff-status", async (req, res) => {
+  const session = (req as StaffAuthRequest).staffSession;
+  if (!session || !OWNER_ROLES.has(session.role)) {
+    res.status(403).json({ error: "Owner/admin access required" });
+    return;
+  }
+
+  const lastOverall = await lastClosureBoundary();
+  const now = new Date();
+
+  const activeUsers = await db
+    .select({ id: usersTable.id, name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.isActive, true));
+
+  const allUserCloses = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(
+      lastOverall
+        ? gt(userDayClosuresTable.closedAt, lastOverall)
+        : sql`1=1`,
+    )
+    .orderBy(desc(userDayClosuresTable.closedAt));
+
+  const closeMap = new Map<string, typeof allUserCloses[number]>();
+  for (const c of allUserCloses) {
+    if (!closeMap.has(c.userName)) closeMap.set(c.userName, c);
+  }
+
+  // Live open-window totals (same window as GET /preview) so Exp. Cash /
+  // Exp. Digital for staff who have not closed match Per-Staff Collection.
+  // Previously open rows always showed ₹0 because only persisted closure
+  // rows were read — there is no expected_* until a close is written.
+  const liveWindow = await summarizeWindow(lastOverall, now);
+  const byStaffLive = new Map(
+    liveWindow.byStaff.map((s) => [s.userName, s] as const),
+  );
+
+  const users = await Promise.all(activeUsers.map(async (u) => {
+    const close = closeMap.get(u.name);
+    const isReopened = close?.drawerStatus === "reopened";
+    const needsLiveExpected = !close || isReopened;
+
+    if (!needsLiveExpected && close) {
+      return {
+        userId:           u.id,
+        userName:         u.name,
+        isClosed:         true,
+        closedAt:         close.closedAt ?? null,
+        closureId:        close.id ?? null,
+        totalCollected:   n(close.totalActual),
+        totalBilled:      n(close.totalBilled),
+        variance:         n(close.variance),
+        drawerStatus:     close.drawerStatus ?? "closed",
+        expectedCash:     n(close.expectedCash),
+        actualCash:       n(close.actualCash),
+        cashVariance:     n(close.actualCash) - n(close.expectedCash),
+        expectedDigital:  n(close.expectedUpi) + n(close.expectedCard) + n(close.expectedCheque) + n(close.expectedOther),
+        actualDigital:    n(close.actualUpi) + n(close.actualCard) + n(close.actualCheque) + n(close.actualOther),
+        digitalVariance:
+          (n(close.actualUpi) + n(close.actualCard) + n(close.actualCheque) + n(close.actualOther))
+          - (n(close.expectedUpi) + n(close.expectedCard) + n(close.expectedCheque) + n(close.expectedOther)),
+        approvedByName:   close.approvedByName ?? null,
+        approvedAt:       close.approvedAt ?? null,
+        handoverNote:     close.notes ?? null,
+        // Handover board: this drawer is shut, so the only cash they can be
+        // holding is what came in after `closedAt` — carried below as
+        // postClosure. `windowSince` is where their next slip starts.
+        livePaymentCount: 0,
+        windowSince:      close.closedAt ?? null,
+      };
+    }
+
+    // Reopened drawers use the personal window (after that close). Never-
+    // closed staff share the overall open window → byStaff from summarizeWindow.
+    let live = byStaffLive.get(u.name) ?? emptyTotals();
+    if (isReopened) {
+      const from = await userWindowBoundary(u.name);
+      const s = await summarizeUserWindow(u.name, from, now);
+      live = s.totals;
+    }
+    const expectedDigital = live.upi + live.card + live.cheque + live.other;
+
+    return {
+      userId:           u.id,
+      userName:         u.name,
+      isClosed:         false,
+      closedAt:         null,
+      closureId:        isReopened ? (close?.id ?? null) : null,
+      totalCollected:   live.total,
+      totalBilled:      0,
+      variance:         0,
+      drawerStatus:     isReopened ? "reopened" : "open",
+      expectedCash:     live.cash,
+      actualCash:       0,
+      cashVariance:     null,
+      expectedDigital,
+      actualDigital:    null,
+      digitalVariance:  null,
+      approvedByName:   null,
+      approvedAt:       null,
+      handoverNote:     isReopened ? (close?.notes ?? null) : null,
+      // Handover board: everything in `totalCollected` is still physically with
+      // this person — they have not handed it in. Their window opened at their
+      // own close when reopened, otherwise with the clinic's last overall close.
+      livePaymentCount: live.count,
+      windowSince:      isReopened ? (close?.closedAt ?? null) : lastOverall,
+    };
+  }));
+
+  // All staff drawer closes for IST calendar today (including closes that
+  // happened BEFORE the latest overall day-close). The status table above
+  // only shows the current open window — without this list, earlier same-day
+  // closes disappear after overall Close Day and staff look wrongly "Open".
+  const istToday = todayIST();
+  const todayCloseRows = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(eq(userDayClosuresTable.closureDate, istToday))
+    .orderBy(desc(userDayClosuresTable.closedAt));
+
+  const todayCloses = todayCloseRows.map((c) => ({
+    id: c.id,
+    userName: c.userName,
+    closureDate: String(c.closureDate),
+    closedAt: c.closedAt,
+    coveredFromTs: c.coveredFromTs,
+    coveredToTs: c.coveredToTs,
+    drawerStatus: c.drawerStatus ?? "closed",
+    expectedCash: n(c.expectedCash),
+    actualCash: n(c.actualCash),
+    expectedDigital: n(c.expectedUpi) + n(c.expectedCard) + n(c.expectedCheque) + n(c.expectedOther),
+    actualDigital: n(c.actualUpi) + n(c.actualCard) + n(c.actualCheque) + n(c.actualOther),
+    totalExpected: n(c.totalExpected),
+    totalActual: n(c.totalActual),
+    variance: n(c.variance),
+    // true when this close belongs to a prior overall window (before lastOverall)
+    beforeCurrentWindow: lastOverall != null && c.closedAt != null && new Date(c.closedAt) <= lastOverall,
+  }));
+
+  const todayCloseCountByUser = new Map<string, number>();
+  for (const c of todayCloses) {
+    todayCloseCountByUser.set(c.userName, (todayCloseCountByUser.get(c.userName) ?? 0) + 1);
+  }
+
+  // Loud post-closure signals for staff who already closed (or reopened):
+  // same-day evening billing after close must be visible on the admin board.
+  const usersWithTodayCounts = await Promise.all(users.map(async (u) => {
+    const base = {
+      ...u,
+      todayCloseCount: todayCloseCountByUser.get(u.userName) ?? 0,
+      postClosure: null as null | {
+        billCount: number;
+        billTotal: number;
+        paymentCount: number;
+        paymentTotal: number;
+        sameDayBillCount: number;
+        sameDayBillTotal: number;
+        sameDayPaymentCount: number;
+        sameDayPaymentTotal: number;
+      },
+    };
+    if (!u.isClosed && u.drawerStatus !== "reopened") return base;
+    const pc = await loadPostClosureActivity(u.userName);
+    if (!pc.closedAt || (pc.bills.length === 0 && pc.payments.length === 0)) return base;
+    return {
+      ...base,
+      postClosure: {
+        billCount: pc.bills.length,
+        billTotal: pc.billTotal,
+        paymentCount: pc.payments.length,
+        paymentTotal: pc.paymentTotal,
+        sameDayBillCount: pc.sameDayBillCount,
+        sameDayBillTotal: pc.sameDayBillTotal,
+        sameDayPaymentCount: pc.sameDayPaymentCount,
+        sameDayPaymentTotal: pc.sameDayPaymentTotal,
+      },
+    };
+  }));
+
+  // ── Handover board ───────────────────────────────────────────────────────
+  // The same rows, read in the one frame the clinic physically closes on: what
+  // has been handed to the owner, and what is still in a staff member's hand.
+  //
+  // This rides on `/staff-status` rather than getting its own endpoint because
+  // it is the same screen the owner already opens at 6 pm — a second page would
+  // have given him two places to look and a second definition of today to
+  // reconcile. Everything here reuses rows already fetched above; the only new
+  // query is the calendar-day figure, which exists purely to be shown *next to*
+  // the handover totals and never blended into them.
+  const slips: BoardSlipRow[] = todayCloseRows.map((c) => ({
+    id: c.id,
+    userName: c.userName,
+    closedAt: c.closedAt,
+    coveredFromTs: c.coveredFromTs,
+    totalExpected: n(c.totalExpected),
+    totalActual: n(c.totalActual),
+    variance: n(c.variance),
+    drawerStatus: c.drawerStatus ?? "closed",
+  }));
+
+  const handoverLive: BoardLiveRow[] = usersWithTodayCounts.map((u) => ({
+    userName: u.userName,
+    withStaff: u.isClosed && u.drawerStatus !== "reopened"
+      ? (u.postClosure?.paymentTotal ?? 0)
+      : u.totalCollected,
+    withStaffPayments: u.isClosed && u.drawerStatus !== "reopened"
+      ? (u.postClosure?.paymentCount ?? 0)
+      : u.livePaymentCount,
+    withStaffSinceIstDate: clinicDateOf(u.windowSince ?? lastOverall ?? now),
+  }));
+
+  const todayWindow = await summarizeWindow(clinicDayBoundsIST(now).startUtc, now);
+
+  res.json({
+    users: usersWithTodayCounts,
+    lastOverallClose: lastOverall,
+    todayIst: istToday,
+    todayCloses,
+    sameDayAfterPriorClose: liveWindow.sameDayAfterPriorClose,
+    handover: buildHandoverBoard({
+      now,
+      istToday,
+      todayStartIst: clinicDayBoundsIST(now).startUtc,
+      lastOverallClose: lastOverall,
+      collectedTodayCalendar: todayWindow.overall.total,
+      slips,
+      live: handoverLive,
+    }),
+  });
+});
+
+// Get full detail for a single user closure (admin), including the bills the
+// staff member made inside that closure's window — recomputed from the
+// persisted coveredFromTs → coveredToTs range so the admin can see exactly
+// which bills the counted cash covered.
+dayCloseRouter.get("/staff-close-detail/:id", requireOwnerOrAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [row] = await db
+    .select()
+    .from(userDayClosuresTable)
+    .where(eq(userDayClosuresTable.id, id))
+    .limit(1);
+  if (!row) { res.status(404).json({ error: "Not found" }); return; }
+
+  const from = row.coveredFromTs ? new Date(row.coveredFromTs) : null;
+  const to = new Date(row.coveredToTs);
+  const windowSummary = await summarizeUserWindow(row.userName, from, to);
+  res.json({
+    ...row,
+    bills: windowSummary.bills,
+    printActivity: windowSummary.printActivity,
+    dueReceived: windowSummary.dueReceived,
+    totalRefunds: windowSummary.refundsAmount,
+  });
+});
+
+// ── Admin-initiated per-staff close (cash handover one by one) ──────────────
+
+// Preview another staff member's open window (owner/admin). Same shape as
+// /my-preview — used by the Day Close page's per-staff close dialog.
+dayCloseRouter.get("/staff-preview/:userName", requireOwnerOrAdmin, async (req, res) => {
+  const userName = decodeURIComponent(String(req.params.userName ?? "")).trim();
+  if (!userName) { res.status(400).json({ error: "userName required" }); return; }
+
+  const from = await userWindowBoundary(userName);
+  const to = new Date();
+  const s = await summarizeUserWindow(userName, from, to);
+
+  res.json({
+    userName,
+    coveredFromTs: from,
+    coveredToTs: to,
+    expected: s.totals,
+    billsCount: s.billsCount,
+    paymentsCount: s.totals.count,
+    totalBilled: s.totalBilled,
+    totalDue: s.totalDue,
+    dueReceived: s.dueReceived,
+    cancelledBillsAmount: s.cancelledBillsAmount,
+    refundsAmount: s.refundsAmount,
+    cashExpenses: s.cashExpenses,
+    suspenseTotal: s.suspenseTotal,
+    suspenseCount: s.suspenseItems.length,
+    suspenseItems: s.suspenseItems,
+    bills: s.bills,
+    // Same shape as `/my-preview`, deliberately: My Daily Summary shows this
+    // window for a filtered staff member, and the orange "same-day after prior
+    // close" badge plus the row highlighting are a money-safety signal, not an
+    // optional extra. A response that omits it silently drops the warning.
+    sameDayAfterPriorClose: s.sameDayAfterPriorClose,
+  });
+});
+
+// Close a staff member's day on their behalf (owner/admin) — the physical
+// handover flow: the cashier hands cash to the owner one at a time, and the
+// owner records the counted amounts here. The closure row is attributed to
+// the staff member (so their window advances exactly as a self-close would),
+// while the audit log records the admin who performed it.
+const AdminStaffCloseBody = UserCloseBody.extend({
+  userName: z.string().trim().min(1).max(200),
+});
+
+type AdminCloseActor = {
+  adminId: number | null;
+  adminName: string;
+  adminRole: string;
+};
+
+type AdminCloseActuals = {
+  cash: number; upi: number; card: number; cheque: number; other: number;
+};
+
+async function closeStaffDrawerOnBehalf(opts: {
+  userName: string;
+  actuals?: AdminCloseActuals;
+  /** When true, set actuals = lock-time expected method totals (balanced close). */
+  autoBalance?: boolean;
+  /** An admin asserting they physically counted this drawer's money. */
+  physicallyCounted?: boolean;
+  varianceNote: string;
+  notes: string;
+  denominations?: {
+    d500: number; d200: number; d100: number;
+    d50: number; d20: number; d10: number; coins: number;
+  };
+  actor: AdminCloseActor;
+  /** When true, skip if this staff already has a non-reopened close after last overall. */
+  skipIfAlreadyClosed?: boolean;
+}): Promise<
+  | { skipped: true; reason: string }
+  | {
+      skipped: false;
+      row: typeof userDayClosuresTable.$inferSelect;
+      bills: Awaited<ReturnType<typeof summarizeUserWindow>>["bills"];
+      suspenseTotal: number;
+      suspenseItems: Array<{ amount: number; rawMethod: string }>;
+      printActivity: StaffPrintActivity;
+    }
+> {
+  const { userName, varianceNote, notes, denominations, actor } = opts;
+  // An auto-balanced close writes the system's own expected totals into the actual
+  // fields, so its variance is zero by construction. The bulk path therefore never
+  // gets a `physicallyCounted` to assert — `BulkStaffCloseBody` has no such field,
+  // which `day-close.physicalVerification.test.ts` pins, rather than trusting a
+  // flag here to overrule a claim that cannot reach it.
+  const physicallyCounted = opts.physicallyCounted === true;
+
+  return db.transaction(async (tx) => {
+    const lockId = BigInt(
+      Math.abs(userName.split("").reduce((a, c) => ((a * 31 + c.charCodeAt(0)) | 0), 0)),
+    );
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(${lockId})`);
+
+    if (opts.skipIfAlreadyClosed) {
+      const lastOverall = await lastClosureBoundary();
+      const [existing] = await tx
+        .select({
+          id: userDayClosuresTable.id,
+          drawerStatus: userDayClosuresTable.drawerStatus,
+          closedAt: userDayClosuresTable.closedAt,
+        })
+        .from(userDayClosuresTable)
+        .where(
+          lastOverall
+            ? and(
+                eq(userDayClosuresTable.userName, userName),
+                gt(userDayClosuresTable.closedAt, lastOverall),
+              )
+            : eq(userDayClosuresTable.userName, userName),
+        )
+        .orderBy(desc(userDayClosuresTable.closedAt))
+        .limit(1);
+      if (existing && existing.drawerStatus !== "reopened") {
+        return { skipped: true as const, reason: "already_closed" };
+      }
+    }
+
+    const from = await userWindowBoundary(userName);
+    const to = new Date();
+    const s = await summarizeUserWindow(userName, from, to);
+
+    const actuals: AdminCloseActuals = opts.autoBalance
+      ? {
+          cash: s.totals.cash,
+          upi: s.totals.upi,
+          card: s.totals.card,
+          cheque: s.totals.cheque,
+          other: s.totals.other,
+        }
+      : (opts.actuals ?? { cash: 0, upi: 0, card: 0, cheque: 0, other: 0 });
+
+    const totalExpected = s.totals.total;
+    const totalActual = actuals.cash + actuals.upi + actuals.card + actuals.cheque + actuals.other;
+    const variance = totalActual - totalExpected;
+    const denominationTotal = denominations ? calcDenominationTotal(denominations) : null;
+    const drawerStatus = staffDrawerStatus({
+      variance,
+      physicallyCounted,
+      denominationsEntered: denominations != null,
+    });
+
+    const istDate = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(to);
+
+    const [staffRow] = await tx
+      .select({ id: usersTable.id })
+      .from(usersTable)
+      .where(eq(usersTable.name, userName))
+      .limit(1);
+
+    const [row] = await tx
+      .insert(userDayClosuresTable)
+      .values({
+        userId: staffRow?.id ?? null,
+        userName,
+        closureDate: istDate,
+        closedAt: to,
+        coveredFromTs: from,
+        coveredToTs: to,
+        expectedCash: String(s.totals.cash),
+        expectedUpi: String(s.totals.upi),
+        expectedCard: String(s.totals.card),
+        expectedCheque: String(s.totals.cheque),
+        expectedOther: String(s.totals.other),
+        totalExpected: String(totalExpected),
+        totalBilled: String(s.totalBilled),
+        totalDue: String(s.totalDue),
+        billsCount: s.billsCount,
+        paymentsCount: s.totals.count,
+        actualCash: String(actuals.cash),
+        actualUpi: String(actuals.upi),
+        actualCard: String(actuals.card),
+        actualCheque: String(actuals.cheque),
+        actualOther: String(actuals.other),
+        totalActual: String(totalActual),
+        variance: String(variance),
+        varianceNote,
+        notes,
+        denominations: denominations ?? null,
+        denominationTotal: denominationTotal !== null ? String(denominationTotal) : null,
+        drawerStatus,
+      })
+      .returning();
+
+    await tx.insert(drawerAuditLogTable).values({
+      userClosureId: row.id,
+      action: staffCloseAuditAction(drawerStatus),
+      userId: actor.adminId,
+      userName: actor.adminName,
+      userRole: actor.adminRole,
+      expectedTotal: String(totalExpected),
+      actualTotal: String(totalActual),
+      variance: String(variance),
+      reason: [`Closed by ${actor.adminName} on behalf of ${userName} (cash handover)`, varianceNote].filter(Boolean).join(" — "),
+    });
+
+    return {
+      skipped: false as const,
+      row,
+      bills: s.bills,
+      suspenseTotal: s.suspenseTotal,
+      suspenseItems: s.suspenseItems,
+      printActivity: s.printActivity,
+    };
+  });
+}
+
+dayCloseRouter.post("/staff-close", requireOwnerOrAdmin, async (req, res) => {
+  const parsed = AdminStaffCloseBody.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid request body" }); return; }
+  const { userName, actuals, varianceNote, notes, denominations, physicallyCounted } = parsed.data;
+
+  const session = (req as StaffAuthRequest).staffSession;
+  const actor: AdminCloseActor = {
+    adminName: session?.subjectName ?? "Admin",
+    adminRole: session?.role ?? "admin",
+    adminId: session?.subjectId ?? null,
+  };
+
+  const inserted = await closeStaffDrawerOnBehalf({
+    userName,
+    actuals,
+    physicallyCounted,
+    varianceNote,
+    notes,
+    denominations,
+    actor,
+  });
+  if (inserted.skipped) {
+    res.status(409).json({ error: "Staff drawer already closed" });
+    return;
+  }
+
+  req.log?.info(
+    { closureId: inserted.row.id, userName, closedByAdmin: actor.adminName, variance: inserted.row.variance, drawerStatus: inserted.row.drawerStatus },
+    "Staff day closed by admin (handover)",
+  );
+  const email = await sendDayCloseEmailSafe(req, { row: inserted.row, printActivity: inserted.printActivity });
+  res.status(201).json({
+    ...inserted.row,
+    bills: inserted.bills,
+    suspenseTotal: inserted.suspenseTotal,
+    suspenseCount: inserted.suspenseItems.length,
+    suspenseItems: inserted.suspenseItems,
+    printActivity: inserted.printActivity,
+    dueReceived: inserted.printActivity.dueReceived,
+    totalRefunds: inserted.printActivity.refundsAmount,
+    ...email,
+  });
+});
+
+// Bulk-close every open (or reopened) staff drawer, auto-balancing actuals to
+// each staff member's live expected method totals. One click is allowed, but the
+// caller must say why: this path writes the system's own expected totals into the
+// actual fields, so it can never be a verification, and on 2026-10-13 it was used
+// to close a drawer the cashier could not close — producing a row that read
+// "balanced" with nobody having counted the money. The reason is stored on every
+// closure it makes, and each one records as not physically verified.
+export const BulkStaffCloseBody = z.object({
+  reason: z.string().trim().min(3).max(2000),
+  notes:  z.string().max(2000).default(""),
+});
+dayCloseRouter.post("/staff-close-all", requireOwnerOrAdmin, async (req, res) => {
+  const parsed = BulkStaffCloseBody.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "A reason is required (min 3 characters) — this closes every open staff drawer without counting the cash" });
+    return;
+  }
+
+  const session = (req as StaffAuthRequest).staffSession;
+  const actor: AdminCloseActor = {
+    adminName: session?.subjectName ?? "Admin",
+    adminRole: session?.role ?? "admin",
+    adminId: session?.subjectId ?? null,
+  };
+
+  const lastOverall = await lastClosureBoundary();
+  const activeUsers = await db
+    .select({ id: usersTable.id, name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.isActive, true));
+
+  const allUserCloses = await db
+    .select({
+      userName: userDayClosuresTable.userName,
+      drawerStatus: userDayClosuresTable.drawerStatus,
+      closedAt: userDayClosuresTable.closedAt,
+    })
+    .from(userDayClosuresTable)
+    .where(
+      lastOverall
+        ? gt(userDayClosuresTable.closedAt, lastOverall)
+        : sql`1=1`,
+    )
+    .orderBy(desc(userDayClosuresTable.closedAt));
+
+  const closeMap = new Map<string, (typeof allUserCloses)[number]>();
+  for (const c of allUserCloses) {
+    if (!closeMap.has(c.userName)) closeMap.set(c.userName, c);
+  }
+
+  const openNames = activeUsers
+    .filter((u) => {
+      const c = closeMap.get(u.name);
+      return !c || c.drawerStatus === "reopened";
+    })
+    .map((u) => u.name);
+
+  const results: Array<{
+    userName: string;
+    status: "closed" | "skipped" | "error";
+    closureId?: number;
+    totalExpected?: number;
+    totalActual?: number;
+    variance?: number;
+    drawerStatus?: string;
+    reason?: string;
+    emailSent?: boolean;
+    emailSkipReason?: string;
+  }> = [];
+
+  for (const userName of openNames) {
+    try {
+      const inserted = await closeStaffDrawerOnBehalf({
+        userName,
+        autoBalance: true,
+        varianceNote: parsed.data.reason,
+        notes: [
+          `Auto-balanced by ${actor.adminName} without a physical cash count`,
+          parsed.data.notes,
+        ].filter(Boolean).join(" — "),
+        actor,
+        skipIfAlreadyClosed: true,
+      });
+      if (inserted.skipped) {
+        results.push({ userName, status: "skipped", reason: inserted.reason });
+        continue;
+      }
+      const email = await sendDayCloseEmailSafe(req, { row: inserted.row, printActivity: inserted.printActivity });
+      results.push({
+        userName,
+        status: "closed",
+        closureId: inserted.row.id,
+        totalExpected: n(inserted.row.totalExpected),
+        totalActual: n(inserted.row.totalActual),
+        variance: n(inserted.row.variance),
+        drawerStatus: inserted.row.drawerStatus,
+        emailSent: email.emailSent,
+        emailSkipReason: email.emailSkipReason,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      req.log?.error({ err, userName }, "Bulk staff close failed for user");
+      results.push({ userName, status: "error", reason: message });
+    }
+  }
+
+  const closed = results.filter((r) => r.status === "closed").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
+  const errors = results.filter((r) => r.status === "error").length;
+  req.log?.info(
+    { closedByAdmin: actor.adminName, closed, skipped, errors, attempted: openNames.length },
+    "Bulk staff day close finished",
+  );
+  res.status(200).json({ closed, skipped, errors, results });
+});
+
+// Approve a mismatch — admin/owner only.
+const ApproveBody = z.object({ note: z.string().min(3).max(2000) });
+dayCloseRouter.post("/staff-close/:id/approve-mismatch", requireOwnerOrAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+
+  const parsed = ApproveBody.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Approval note required (min 3 chars)" }); return; }
+
+  const session       = (req as StaffAuthRequest).staffSession;
+  const approverName  = session?.subjectName ?? "Admin";
+  const approverRole  = session?.role ?? "admin";
+  const approverId    = session?.subjectId ?? null;
+  const now           = new Date();
+
+  const [updated] = await db
+    .update(userDayClosuresTable)
+    .set({
+      drawerStatus:   "approved",
+      approvedByName: approverName,
+      approvedAt:     now,
+      approvalNote:   parsed.data.note,
+    })
+    .where(and(eq(userDayClosuresTable.id, id), eq(userDayClosuresTable.drawerStatus, "mismatch")))
+    .returning();
+
+  if (!updated) {
+    res.status(409).json({ error: "Closure not found or not in mismatch state" });
+    return;
+  }
+
+  await db.insert(drawerAuditLogTable).values({
+    userClosureId: id,
+    action:       "mismatch_approved",
+    userId:       approverId,
+    userName:     approverName,
+    userRole:     approverRole,
+    expectedTotal: updated.totalExpected,
+    actualTotal:   updated.totalActual,
+    variance:      updated.variance,
+    reason:        parsed.data.note,
+  });
+
+  req.log?.info({ closureId: id, approvedBy: approverName }, "Drawer mismatch approved");
+  res.json(updated);
+});
+
+// Reopen an individual staff drawer — SUPER-ADMIN only.
+const StaffReopenBody = z.object({ reason: z.string().min(3).max(2000) });
+dayCloseRouter.post("/staff-close/:id/reopen", requireSuperAdminStaff, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+
+  const parsed = StaffReopenBody.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Reason required (min 3 chars)" }); return; }
+
+  const session    = (req as StaffAuthRequest).staffSession;
+  const reopener   = session?.subjectName ?? "Super-admin";
+  const reopenerId = session?.subjectId ?? null;
+  const now        = new Date();
+
+  // We mark the drawer as "reopened" but do NOT delete the row — audit trail preserved.
+  // A new my-close by the same user in the same window will create a NEW row.
+  // To reset their window we just update drawerStatus to "reopened".
+  const [updated] = await db
+    .update(userDayClosuresTable)
+    .set({
+      drawerStatus:    "reopened",
+      reopenedByName:  reopener,
+      reopenedAt:      now,
+      reopenReason:    parsed.data.reason,
+    })
+    .where(eq(userDayClosuresTable.id, id))
+    .returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Closure not found" });
+    return;
+  }
+
+  await db.insert(drawerAuditLogTable).values({
+    userClosureId: id,
+    action:       "drawer_reopened",
+    userId:       reopenerId,
+    userName:     reopener,
+    userRole:     "super_admin",
+    expectedTotal: updated.totalExpected,
+    actualTotal:   updated.totalActual,
+    variance:      updated.variance,
+    reason:        parsed.data.reason,
+  });
+
+  req.log?.warn({ closureId: id, reopenedBy: reopener, targetUser: updated.userName }, "Staff drawer RE-OPENED by super-admin");
+  res.json(updated);
+});
+
+// ── Post-Closure Activity (no lock — just visibility) ───────────────────────
+
+/**
+ * Find bills and payments created by `userName` AFTER their latest drawer
+ * close (if any). Billing is never blocked — this data is only used for
+ * the "Post-Closure Activity" callout shown to the staff member and admin.
+ */
+async function postClosureActivity(userName: string) {
+  const result = await loadPostClosureActivity(userName);
+  return {
+    closedAt: result.closedAt,
+    closureId: result.closureId,
+    drawerStatus: result.drawerStatus,
+    bills: result.bills,
+    payments: result.payments,
+    billTotal: result.billTotal,
+    paymentTotal: result.paymentTotal,
+    sameDayBillCount: result.sameDayBillCount,
+    sameDayBillTotal: result.sameDayBillTotal,
+    sameDayPaymentCount: result.sameDayPaymentCount,
+    sameDayPaymentTotal: result.sameDayPaymentTotal,
+  };
+}
+
+// GET /api/day-close/my-post-closure-activity — current user
+dayCloseRouter.get("/my-post-closure-activity", async (req, res) => {
+  const session  = (req as StaffAuthRequest).staffSession;
+  const userName = session?.subjectName?.trim() ?? "";
+  if (!userName) { res.status(401).json({ error: "Not authenticated" }); return; }
+  res.json(await postClosureActivity(userName));
+});
+
+// GET /api/day-close/staff-post-closure-activity/:userName — admin/owner
+dayCloseRouter.get("/staff-post-closure-activity/:userName", requireOwnerOrAdmin, async (req, res) => {
+  const userName = decodeURIComponent(String(req.params.userName ?? "")).trim();
+  if (!userName) { res.status(400).json({ error: "userName required" }); return; }
+  res.json(await postClosureActivity(userName));
+});
+
+export default dayCloseRouter;

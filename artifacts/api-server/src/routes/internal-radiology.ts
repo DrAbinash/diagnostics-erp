@@ -1,0 +1,2812 @@
+/**
+ * Internal Radiology RIS/PACS API
+ *
+ * These endpoints are NOT protected by staff session auth. Instead they use a
+ * bearer token matching the INTERNAL_API_KEY environment secret — suitable for
+ * server-to-server calls from Conquest PACS automation scripts.
+ *
+ * Mounted at: /api/internal  (see routes/index.ts)
+ *
+ * Endpoints:
+ *   GET  /api/internal/patients/:patientId/contact
+ *   POST /api/internal/radiology/studies        — study intake (upsert)
+ *   POST /api/internal/radiology/report-status  — update worklist status
+ *   POST /api/internal/radiology/ai-draft       — generate/return AI report draft
+ */
+
+import { Router, type Request, type Response, type NextFunction } from "express";
+import { db } from "@workspace/db";
+import {
+  patientsTable,
+  radiologyStudiesTable,
+  radiologyWorklistTable,
+  patientReportsTable,
+  radiologyAuditLogTable,
+  dicomNodesTable,
+  dicomPullJobsTable,
+  pacsLogsTable,
+  dicomPullAgentLogsTable,
+  dicomPullAgentStatusTable,
+  pacsSettingsTable,
+  radiologyScheduledProceduresTable,
+  testsTable,
+  billsTable,
+  portalSessionsTable,
+  usersTable,
+} from "@workspace/db/schema";
+import { and, eq, or, sql, inArray, gte, lte, desc, gt } from "drizzle-orm";
+import { logger } from "../lib/logger";
+import { requireInternalApiKey, safeEqual } from "../lib/internalApiKeyAuth";
+import { normalizeRole, type StaffAuthRequest } from "../middleware/requireStaffAuth";
+import { checkWriteLock } from "../lib/studyLocks";
+import { todayIST } from "../lib/istDate";
+import { findExistingPatient, type DicomDemographics } from "../lib/dicomPatientCreator";
+import { computeStudyPriority, applyPriorityToStudy } from "../lib/studyPriorityEngine";
+import { assignRadiologistToStudy } from "../lib/radiologistAssignment";
+import { runUsgExtraction, getUsgAdminSettings } from "../lib/usgExtractor";
+import { isUltrasoundModality, isObstetricUsgStudy } from "../lib/usgModality";
+import { checkPcpndtFormFCompliance, PCPNDT_OVERRIDE_ROLES } from "../lib/pcpndtCompliance";
+import {
+  aiReviewStateUnavailableError,
+  checkUnreviewedAiFinalize,
+  unreviewedAiFinalizeError,
+} from "../lib/reportComposer/unreviewedAiGuard";
+import { auditLog } from "../lib/audit";
+import { genderToDicomSex, sanitizeDicomSex } from "@workspace/pathology";
+import { calculateMatchScore, normalizeAccessionKey, type DicomInput, type BilledTestInput } from "../lib/pacs/matchingEngine";
+import { formatDicomPersonNameForDisplay, reconcileAccessionVsReferringDoctor } from "../lib/pacs/dicomNameNormalize";
+import { shouldFallbackToAccessionLookup, isWorklistUidRaceViolation } from "../lib/radiologyWorklistDedup";
+import { STUDY_UID_PROVENANCE } from "../lib/pacs/studyUidBinding";
+import { radiologyOpenFallbackPath, resolveRadiologyOpen } from "../lib/resolveRadiologyOpen";
+import { runDicomIntakeAutomation } from "../lib/pacs/dicomIntakeAutomation";
+import { cancelRadiologyMwlByAccession } from "../lib/pacs/cancelRadiologyStudyFromMwl";
+import {
+  RadiologyIdentityError,
+  assertReportBelongsToWorklist,
+  isApprovedMatchDecision,
+  matchAllowsFinalize,
+  classifyFinalizeMatch,
+  pickUniqueRow,
+} from "../lib/radiologyIdentity";
+
+export async function runMatchingEngineForWorklist(worklistId: number): Promise<void> {
+  const [row] = await db
+    .select()
+    .from(radiologyWorklistTable)
+    .where(eq(radiologyWorklistTable.id, worklistId))
+    .limit(1);
+
+  if (!row) return;
+
+  if (!row.studyId) {
+    await db
+      .update(radiologyWorklistTable)
+      .set({
+        matchScore: "RED",
+        matchPoints: 0,
+        matchReasons: JSON.stringify(["No study linked to this worklist item"]),
+        matchWarnings: JSON.stringify(["NO_LINKED_STUDY: No billed study linked"]),
+      })
+      .where(eq(radiologyWorklistTable.id, worklistId));
+    return;
+  }
+
+  const [study] = await db
+    .select({
+      id: radiologyStudiesTable.id,
+      patientId: radiologyStudiesTable.patientId,
+      accessionNumber: radiologyStudiesTable.accessionNumber,
+      modality: radiologyStudiesTable.modality,
+      studyDescription: radiologyStudiesTable.studyDescription,
+      studyDate: radiologyStudiesTable.studyDate,
+      referringDoctor: radiologyStudiesTable.referringDoctor,
+      patientName: sql<string>`concat(${patientsTable.firstName}, ' ', ${patientsTable.lastName})`,
+      patientUHID: patientsTable.patientId,
+      age: sql<string>`concat(${patientsTable.ageValue}, ' ', ${patientsTable.ageUnit})`,
+      sex: patientsTable.gender,
+      testName: testsTable.name,
+      billNumber: billsTable.billNumber,
+    })
+    .from(radiologyStudiesTable)
+    .innerJoin(patientsTable, eq(patientsTable.id, radiologyStudiesTable.patientId))
+    .innerJoin(testsTable, eq(testsTable.id, radiologyStudiesTable.testId))
+    .leftJoin(billsTable, eq(billsTable.id, radiologyStudiesTable.billId))
+    .where(eq(radiologyStudiesTable.id, row.studyId))
+    .limit(1);
+
+  if (!study) {
+    await db
+      .update(radiologyWorklistTable)
+      .set({
+        matchScore: "RED",
+        matchPoints: 0,
+        matchReasons: JSON.stringify(["Linked study not found in database"]),
+        matchWarnings: JSON.stringify(["STUDY_NOT_FOUND: Billed study not found"]),
+      })
+      .where(eq(radiologyWorklistTable.id, worklistId));
+    return;
+  }
+
+  const dicomInput: DicomInput = {
+    patientName: row.patientName,
+    dicomPatientId: row.dicomPatientId,
+    age: row.age,
+    sex: row.sex,
+    modality: row.modality,
+    studyDescription: row.studyDescription,
+    accessionNumber: row.accessionNumber ?? "",
+    studyDate: row.studyDate,
+    studyTime: null,
+    studyInstanceUID: row.studyInstanceUID,
+    referringDoctor: row.referringDoctor,
+  };
+
+  const billInput: BilledTestInput = {
+    id: study.id,
+    patientId: study.patientId,
+    patientName: String(study.patientName || ""),
+    patientUHID: study.patientUHID,
+    age: study.age,
+    sex: study.sex,
+    testName: study.testName,
+    modality: study.modality,
+    accessionNumber: study.accessionNumber,
+    billNumber: study.billNumber,
+    studyDate: study.studyDate,
+    referringDoctor: study.referringDoctor,
+  };
+
+  const matchResult = calculateMatchScore(dicomInput, billInput);
+
+  if (row.studyInstanceUID) {
+    const dupStudies = await db
+      .select({ id: radiologyWorklistTable.id, studyId: radiologyWorklistTable.studyId })
+      .from(radiologyWorklistTable)
+      .where(
+        and(
+          eq(radiologyWorklistTable.studyInstanceUID, row.studyInstanceUID),
+          sql`${radiologyWorklistTable.id} != ${worklistId}`
+        )
+      );
+
+    if (dupStudies.length > 0) {
+      matchResult.warnings.push("DUPLICATE_UID: Duplicate StudyInstanceUID across multiple worklist records");
+      const hasOtherStudyId = dupStudies.some(d => d.studyId && d.studyId !== row.studyId);
+      if (hasOtherStudyId) {
+        matchResult.warnings.push("STUDY_REUSED: Same DICOM study linked to multiple bills");
+      }
+      matchResult.score = "RED";
+    }
+  }
+
+  if (row.studyId) {
+    const multiStudies = await db
+      .select({ id: radiologyWorklistTable.id, studyInstanceUID: radiologyWorklistTable.studyInstanceUID })
+      .from(radiologyWorklistTable)
+      .where(
+        and(
+          eq(radiologyWorklistTable.studyId, row.studyId),
+          sql`${radiologyWorklistTable.id} != ${worklistId}`
+        )
+      );
+    if (multiStudies.length > 0 && multiStudies.some(m => m.studyInstanceUID !== row.studyInstanceUID)) {
+      matchResult.warnings.push("BILL_LINKED_TO_MULTIPLE_STUDIES: Same bill linked to multiple unrelated DICOM studies");
+      matchResult.score = "RED";
+    }
+  }
+
+  await db
+    .update(radiologyWorklistTable)
+    .set({
+      matchScore: matchResult.score,
+      matchPoints: matchResult.points,
+      matchReasons: JSON.stringify(matchResult.reasons),
+      matchWarnings: JSON.stringify(matchResult.warnings),
+    })
+    .where(eq(radiologyWorklistTable.id, worklistId));
+}
+
+/**
+ * Match Center explicit approval — persisted on radiology_worklist.match_decision. The clause
+ * itself now sits in `lib/radiologyIdentity`, which is also where bill auto-linking reads it:
+ * a second spelling of "has a human already answered which patient this is" is how the two
+ * paths start disagreeing about the same row. Re-exported because this module's re-intake
+ * guard is its published surface.
+ */
+export { isApprovedMatchDecision } from "../lib/radiologyIdentity";
+
+type WorklistIntakeValues = {
+  studyId: number | null | undefined;
+  patientId: number | null;
+  dicomPatientId: string | null;
+  patientMatchStatus: string;
+  patientName: string;
+  age: string | null;
+  sex: string | null;
+  modality: string;
+  studyDescription: string | null;
+  studyDate: string | null;
+  accessionNumber: string | null;
+  studyInstanceUID: string | null | undefined;
+  aeTitle: string | null | undefined;
+  ipAddress: string | null | undefined;
+  port: number | null | undefined;
+  referringDoctor: string | null;
+  weasisUrl: string | null | undefined;
+  sourcePacs: string;
+  sourceAeTitle: string | null | undefined;
+  dicomMetadata: unknown;
+};
+
+/**
+ * Once Match Center has APPROVED a patient association, DICOM re-intake for the
+ * same StudyInstanceUID must refresh metadata without replacing patientId /
+ * identity linkage / approval state.
+ */
+export function preserveApprovedPatientAssociationOnReintake<T extends WorklistIntakeValues>(
+  existing: {
+    id: number;
+    patientId: number | null;
+    patientMatchStatus: string;
+    matchDecision: string | null;
+    studyId: number | null;
+  },
+  values: T,
+): T {
+  if (!isApprovedMatchDecision(existing.matchDecision)) return values;
+  logger.info(
+    {
+      worklistId: existing.id,
+      approvedPatientId: existing.patientId,
+      incomingPatientId: values.patientId,
+    },
+    "Re-intake preserving APPROVED patient association",
+  );
+  return {
+    ...values,
+    patientId: existing.patientId,
+    patientMatchStatus: existing.patientMatchStatus,
+    // Keep the billed-study link that was approved with this identity.
+    studyId: existing.studyId ?? values.studyId,
+  };
+}
+
+const router = Router();
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Accepts EITHER a valid INTERNAL_API_KEY bearer token OR a valid staff JWT.
+ *
+ * This middleware is ONLY applied to the three endpoints the Radiologist
+ * Cockpit calls directly from the browser (worklist detail, report-status,
+ * ai-draft). All other PACS automation endpoints remain protected by
+ * requireInternalApiKey exclusively.
+ *
+ * Security notes:
+ * - INTERNAL_API_KEY path: same as before (server-to-server automation)
+ * - Staff JWT path: validates token against portal_sessions table, checks
+ *   user is active. Rejects inactive/expired sessions with 401.
+ * - No permissions are weakened — staff members still need requireStaffPermission
+ *   on any radiology module to have received a session in the first place.
+ */
+async function requireStaffOrInternalAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const header = req.header("authorization") ?? "";
+  const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+
+  if (!provided) {
+    res.status(401).json({ error: "Authentication required" });
+    return;
+  }
+
+  // 1. Try INTERNAL_API_KEY first (fast — no DB query needed)
+  const expectedKey = process.env["INTERNAL_API_KEY"];
+  if (expectedKey && safeEqual(provided, expectedKey)) {
+    next();
+    return;
+  }
+
+  // 2. Try staff JWT session validation
+  try {
+    const [session] = await db
+      .select()
+      .from(portalSessionsTable)
+      .where(
+        and(
+          eq(portalSessionsTable.token, provided),
+          eq(portalSessionsTable.scope, "staff"),
+          gt(portalSessionsTable.expiresAt, new Date()),
+        ),
+      )
+      .limit(1);
+
+    if (!session) {
+      res.status(401).json({ error: "Invalid or expired session. Please log in again." });
+      return;
+    }
+
+    const [user] = await db
+      .select({ id: usersTable.id, isActive: usersTable.isActive, role: usersTable.role, permissions: usersTable.permissions })
+      .from(usersTable)
+      .where(eq(usersTable.id, session.subjectId))
+      .limit(1);
+
+    if (!user || !user.isActive) {
+      res.status(401).json({ error: "Staff account is inactive." });
+      return;
+    }
+
+    // Touch last activity to keep the session alive
+    await db
+      .update(portalSessionsTable)
+      .set({ lastActivityAt: new Date() })
+      .where(eq(portalSessionsTable.id, session.id));
+
+    // M1.6A — attach the validated staff identity (same shape/parsing as
+    // requireStaffAuth) so handlers can enforce study-lock ownership. The
+    // INTERNAL_API_KEY path above deliberately attaches nothing: server-to-
+    // server automation is identity-less and never lock-gated.
+    let permissions: string[] = [];
+    try {
+      const parsed = user.permissions ? JSON.parse(user.permissions) : [];
+      if (Array.isArray(parsed)) permissions = parsed.filter((p): p is string => typeof p === "string");
+    } catch { /* leave permissions empty */ }
+    (req as StaffAuthRequest).staffSession = {
+      id: session.id,
+      subjectId: session.subjectId,
+      subjectName: session.subjectName,
+      role: normalizeRole(user.role),
+      permissions,
+      maxDiscount: null,
+    };
+
+    next();
+  } catch (err) {
+    logger.error({ err }, "requireStaffOrInternalAuth: DB error during staff JWT validation");
+    res.status(500).json({ error: "Authentication service error" });
+  }
+}
+
+// Staff JWT is accepted for worklist/report-status/ai-draft (Radiologist Cockpit).
+// DICOM intake is internal-key only — see POST /radiology/studies.
+router.use(requireStaffOrInternalAuth);
+
+
+// ── Audit helper ─────────────────────────────────────────────────────────────
+
+async function audit(opts: {
+  worklistId?: number | null;
+  accessionNumber?: string | null;
+  action: string;
+  actor?: string;
+  details?: unknown;
+}): Promise<void> {
+  try {
+    await db.insert(radiologyAuditLogTable).values({
+      worklistId: opts.worklistId ?? null,
+      accessionNumber: opts.accessionNumber ?? null,
+      action: opts.action,
+      actor: opts.actor ?? "system",
+      details: opts.details !== undefined ? JSON.stringify(opts.details) : null,
+    });
+  } catch (err) {
+    logger.error({ err }, "radiology audit log insert failed");
+  }
+}
+
+// ── Patient contact lookup ────────────────────────────────────────────────────
+// GET /api/internal/patients/:patientId/contact
+// Accepts numeric DB id OR text UHID (patient_id field).
+
+router.get("/patients/:patientId/contact", async (req, res) => {
+  const param = req.params.patientId;
+  const numericId = Number(param);
+
+  const cond = Number.isInteger(numericId) && numericId > 0
+    ? or(eq(patientsTable.id, numericId), eq(patientsTable.patientId, param))
+    : eq(patientsTable.patientId, param);
+
+  const [patient] = await db
+    .select({
+      id: patientsTable.id,
+      patientId: patientsTable.patientId,
+      firstName: patientsTable.firstName,
+      lastName: patientsTable.lastName,
+      dateOfBirth: patientsTable.dateOfBirth,
+      gender: patientsTable.gender,
+      phone: patientsTable.phone,
+      email: patientsTable.email,
+    })
+    .from(patientsTable)
+    .where(cond!);
+
+  if (!patient) {
+    res.status(404).json({ error: "Patient not found" });
+    return;
+  }
+
+  // Compute age from dateOfBirth (stored as ISO date string YYYY-MM-DD)
+  let age = "";
+  if (patient.dateOfBirth) {
+    const dob = new Date(patient.dateOfBirth);
+    if (!Number.isNaN(dob.getTime())) {
+      const now = new Date();
+      let years = now.getFullYear() - dob.getFullYear();
+      const m = now.getMonth() - dob.getMonth();
+      if (m < 0 || (m === 0 && now.getDate() < dob.getDate())) years--;
+      age = `${years}Y`;
+    }
+  }
+
+  res.json({
+    patientId: patient.patientId,
+    dbId: patient.id,
+    name: `${patient.firstName} ${patient.lastName}`.trim(),
+    age,
+    sex: patient.gender ?? "",
+    mobile: patient.phone ?? "",
+    email: patient.email ?? "",
+  });
+});
+
+// ── Study intake (upsert) ─────────────────────────────────────────────────────
+// POST /api/internal/radiology/studies
+// Creates or updates a worklist entry. Deduplication via studyInstanceUID first,
+// then accessionNumber.
+
+router.post("/radiology/studies", requireInternalApiKey, async (req, res) => {
+  const rawBody = req.body ?? {};
+  logger.info({ body: rawBody }, "POST /api/internal/radiology/studies payload");
+
+  try {
+    const b = rawBody as Record<string, unknown>;
+
+    const rawStudyId = b.studyId;
+    const patientId = (b.patientId !== undefined ? String(b.patientId) : "") || (b.PatientID !== undefined ? String(b.PatientID) : "");
+    // Clean DICOM PN syntax (LAST^FIRST^^^MD → "First Last, MD") so worklist
+    // display and the billing match engine see the same readable form.
+    const patientNameRaw = typeof b.patientName === "string" ? b.patientName.trim() : (typeof b.PatientName === "string" ? b.PatientName.trim() : "");
+    const patientName = formatDicomPersonNameForDisplay(patientNameRaw) || patientNameRaw;
+    const age = typeof b.age === "string" ? b.age.trim() || null : null;
+    const sexRaw =
+      (typeof b.sex === "string" ? b.sex.trim() : "")
+      || (typeof b.patientSex === "string" ? b.patientSex.trim() : "")
+      || (typeof b.PatientSex === "string" ? b.PatientSex.trim() : "");
+    const sex = sexRaw ? sanitizeDicomSex(sexRaw) : null;
+    const modality = typeof b.modality === "string" ? b.modality.trim() || "OT" : (typeof b.ModalitiesInStudy === "string" ? b.ModalitiesInStudy.trim() || "OT" : "OT");
+    const studyDescription = typeof b.studyDescription === "string" ? b.studyDescription.trim() || null : (typeof b.StudyDescription === "string" ? b.StudyDescription.trim() || null : null);
+    const studyDate = typeof b.studyDate === "string" ? b.studyDate.trim() || null : (typeof b.StudyDate === "string" ? b.StudyDate.trim() || null : null);
+    const accessionNumberRaw = typeof b.accessionNumber === "string" ? b.accessionNumber.trim() : (typeof b.AccessionNumber === "string" ? b.AccessionNumber.trim() : "");
+    const referringDoctorRaw = typeof b.referringDoctor === "string" ? b.referringDoctor.trim() || null : null;
+    const referringFromTag = referringDoctorRaw
+      ? (formatDicomPersonNameForDisplay(referringDoctorRaw) || referringDoctorRaw)
+      : null;
+    // MRI / billing sometimes type the referring doctor into Accession Number.
+    const reconciledIds = reconcileAccessionVsReferringDoctor({
+      accessionNumber: accessionNumberRaw,
+      referringDoctor: referringFromTag,
+    });
+    // Migrated schema: radiology_worklist.accession_number is NOT NULL DEFAULT ''.
+    // Blank Orthanc AccessionNumber must persist as "" — never null — so
+    // care-erp-sync can ingest pre-stamp USG studies and STAMP_ACCESSION_FROM_BILL
+    // can fill them later.
+    const accessionNumber = (reconciledIds.accessionNumber ?? "").trim();
+    const referringDoctor: string | null = reconciledIds.referringDoctor || null;
+    const studyInstanceUID = typeof b.studyInstanceUID === "string" ? b.studyInstanceUID.trim() || null : (typeof b.StudyInstanceUID === "string" ? b.StudyInstanceUID.trim() || null : null);
+    const aeTitle = typeof b.aeTitle === "string" ? b.aeTitle.trim() || null : null;
+    const ipAddress = typeof b.ipAddress === "string" ? b.ipAddress.trim() || null : null;
+    const port = typeof b.port === "number" ? b.port : null;
+    const weasisUrl = typeof b.weasisUrl === "string" ? b.weasisUrl.trim() || null : null;
+    const sourcePacs = typeof b.sourcePacs === "string" ? b.sourcePacs.trim() || null : null;
+    const sourceAeTitle = typeof b.sourceAeTitle === "string" ? b.sourceAeTitle.trim() || null : null;
+    const dicomMetadata = typeof b.dicomMetadata === "string" ? b.dicomMetadata.trim() || null : null;
+
+    // At least one real identifier is still required — we can't file a
+    // study with neither a UID nor an accession number to reference it by.
+    if (!accessionNumber && !studyInstanceUID) {
+      logger.warn("Missing both accessionNumber and studyInstanceUID");
+      res.status(400).json({ success: false, error: "accessionNumber or studyInstanceUID is required" });
+      return;
+    }
+    if (!patientName) {
+      logger.warn("Missing patientName");
+      res.status(400).json({ success: false, error: "patientName is required" });
+      return;
+    }
+
+    let numericStudyId: number | undefined;
+    if (typeof rawStudyId === "number") {
+      numericStudyId = rawStudyId;
+    } else if (typeof rawStudyId === "string" && /^\d+$/.test(rawStudyId.trim())) {
+      numericStudyId = parseInt(rawStudyId.trim(), 10);
+    }
+
+    let formattedStudyDate = studyDate;
+    if (studyDate && /^\d{8}$/.test(studyDate)) {
+      formattedStudyDate = `${studyDate.slice(0, 4)}-${studyDate.slice(4, 6)}-${studyDate.slice(6, 8)}`;
+    }
+
+    // Patient Resolution
+    // DICOM PatientID is an external modality identifier. Match only against
+    // patients.patient_id (CARE UHID / patient-facing id). Never treat a
+    // numeric PatientID as patients.id — modality values can collide with
+    // the internal serial PK and silently bind the wrong patient.
+    const rawDicomPatientId = patientId || null;
+    let resolvedPatientId: number | null = null;
+    let patientMatchStatus = "UNMATCHED";
+
+    if (rawDicomPatientId) {
+      const [matched] = await db
+        .select({ id: patientsTable.id })
+        .from(patientsTable)
+        .where(eq(patientsTable.patientId, rawDicomPatientId))
+        .limit(1);
+
+      if (matched) {
+        resolvedPatientId = matched.id;
+        patientMatchStatus = "MATCHED";
+        logger.info({ patientId: resolvedPatientId }, "Matched existing patient");
+      }
+    }
+
+    if (!resolvedPatientId) {
+      // Link-only: DICOM intake must not CREATE patients. It could never match
+      // one here either — intake hands over the *display* name (caret-stripped by
+      // formatDicomPersonNameForDisplay above), so parseDicomName returns an
+      // empty firstName and findExistingPatient's name+DOB branch is
+      // unreachable, and the payload carries no PatientBirthDate at all. Every
+      // unseen modality PatientID therefore INSERTed a placeholder: UHID set to
+      // the modality's own per-day string, first_name "Unknown", DOB
+      // 1900-01-01, phone 0000000000. That is how 3,047 patients holding no
+      // bill, order or appointment came to exist — for studies scored RED anyway.
+      //
+      // NULL patient_id with UNMATCHED is the state the schema documents as its
+      // own default. Billed studies still self-heal: worklistBillingLink matches
+      // on the normalized accession and back-fills patient_id from the study,
+      // which needs no invented identity. What changes is the un-billed walk-in:
+      // it now waits in Match Center instead of arriving with a fake MRN.
+      try {
+        const demo: DicomDemographics = {
+          patientId: rawDicomPatientId ?? undefined,
+          patientName,
+          sex: sex ?? undefined,
+          age: age ?? undefined,
+          studyDate: studyDate ?? undefined,
+          modality,
+        };
+        const existing = await findExistingPatient(demo);
+        if (existing) {
+          resolvedPatientId = existing.id;
+          patientMatchStatus = "MATCHED_BY_DEMOGRAPHICS";
+          logger.info({ patientId: resolvedPatientId }, "Auto-linked existing patient from DICOM demographics");
+        }
+      } catch (err) {
+        logger.warn({ err }, "DICOM demographic match failed; leaving the study unlinked");
+      }
+    }
+
+    // 4-tier fallback matching cascade for radiology_studies
+    const studySelectFields = {
+      id: radiologyStudiesTable.id,
+      status: radiologyStudiesTable.status,
+      accessionNumber: radiologyStudiesTable.accessionNumber,
+      studyInstanceUid: radiologyStudiesTable.studyInstanceUid,
+      modality: radiologyStudiesTable.modality,
+      studyDescription: radiologyStudiesTable.studyDescription,
+      referringDoctor: radiologyStudiesTable.referringDoctor,
+      patientId: radiologyStudiesTable.patientId,
+      studyDate: radiologyStudiesTable.studyDate,
+      bodyPart: radiologyStudiesTable.bodyPart,
+      orderTestId: radiologyStudiesTable.orderTestId,
+      billId: radiologyStudiesTable.billId,
+      department: radiologyStudiesTable.department,
+      startedAt: radiologyStudiesTable.startedAt,
+    };
+
+    let rStudy: any = undefined;
+    let matchMethod = "";
+
+    // 1. Matched by numeric studyId
+    if (numericStudyId) {
+      const [row] = await db
+        .select(studySelectFields)
+        .from(radiologyStudiesTable)
+        .where(eq(radiologyStudiesTable.id, numericStudyId))
+        .limit(1);
+      if (row) {
+        rStudy = row;
+        matchMethod = "matched by numeric studyId";
+      }
+    }
+
+    // 2. Matched by accessionNumber (alnum-normalized — same key MWL + Match Center use)
+    if (!rStudy && accessionNumber) {
+      const accKey = normalizeAccessionKey(accessionNumber);
+      if (accKey) {
+        const [row] = await db
+          .select(studySelectFields)
+          .from(radiologyStudiesTable)
+          .where(
+            sql`lower(regexp_replace(coalesce(${radiologyStudiesTable.accessionNumber}, ''), '[^a-zA-Z0-9]', '', 'g')) = ${accKey}`,
+          )
+          .limit(1);
+        if (row) {
+          rStudy = row;
+          matchMethod = "matched by accessionNumber";
+        }
+      }
+    }
+
+    // 3. Matched by StudyInstanceUID
+    if (!rStudy && studyInstanceUID) {
+      const [row] = await db
+        .select(studySelectFields)
+        .from(radiologyStudiesTable)
+        .where(eq(radiologyStudiesTable.studyInstanceUid, studyInstanceUID))
+        .limit(1);
+      if (row) {
+        rStudy = row;
+        matchMethod = "matched by StudyInstanceUID";
+      }
+    }
+
+    // 4. Unique-only demographic fallback: patientId + studyDate + modality.
+    // Multiple same-day same-modality studies must stay UNMATCHED (Match Center).
+    if (!rStudy && resolvedPatientId && formattedStudyDate && modality) {
+      const modalityCond = isUltrasoundModality(modality)
+        ? sql`lower(${radiologyStudiesTable.modality}) IN ('us', 'usg', 'ultrasound') OR lower(${radiologyStudiesTable.department}) = 'usg'`
+        : sql`lower(${radiologyStudiesTable.modality}) = lower(${modality})`;
+      const rows = await db
+        .select(studySelectFields)
+        .from(radiologyStudiesTable)
+        .where(
+          and(
+            eq(radiologyStudiesTable.patientId, resolvedPatientId),
+            eq(radiologyStudiesTable.studyDate, formattedStudyDate),
+            modalityCond,
+          ),
+        );
+      const picked = pickUniqueRow(rows);
+      if (picked.status === "unique") {
+        rStudy = picked.row;
+        matchMethod = "matched by unique fallback demographics";
+      } else if (picked.status === "ambiguous") {
+        logger.warn({ count: picked.count, patientId: resolvedPatientId, formattedStudyDate, modality },
+          "PACS study link: ambiguous patient/date/modality match — leaving unmatched");
+      }
+    }
+
+    // 5. USG without accession: unique scheduled/in-progress USG for this patient today only.
+    if (!rStudy && resolvedPatientId && isUltrasoundModality(modality)) {
+      const studyDateCond = formattedStudyDate
+        ? eq(radiologyStudiesTable.studyDate, formattedStudyDate)
+        : eq(radiologyStudiesTable.studyDate, todayIST());
+      const rows = await db
+        .select(studySelectFields)
+        .from(radiologyStudiesTable)
+        .where(
+          and(
+            eq(radiologyStudiesTable.patientId, resolvedPatientId),
+            studyDateCond,
+            eq(radiologyStudiesTable.department, "USG"),
+            inArray(radiologyStudiesTable.status, ["scheduled", "in_progress"]),
+          ),
+        );
+      const picked = pickUniqueRow(rows);
+      if (picked.status === "unique") {
+        rStudy = picked.row;
+        matchMethod = "matched by unique USG patient today";
+      } else if (picked.status === "ambiguous") {
+        logger.warn({ count: picked.count, patientId: resolvedPatientId },
+          "PACS study link: multiple USG studies today — leaving unmatched");
+      }
+    }
+
+    // 6. Unique-only fallback: patient + date + exact study description.
+    if (!rStudy && resolvedPatientId && formattedStudyDate && studyDescription) {
+      const rows = await db
+        .select(studySelectFields)
+        .from(radiologyStudiesTable)
+        .where(
+          and(
+            eq(radiologyStudiesTable.patientId, resolvedPatientId),
+            eq(radiologyStudiesTable.studyDate, formattedStudyDate),
+            sql`lower(${radiologyStudiesTable.studyDescription}) = lower(${studyDescription})`
+          )
+        );
+      const picked = pickUniqueRow(rows);
+      if (picked.status === "unique") {
+        rStudy = picked.row;
+        matchMethod = "matched by unique description fallback";
+      } else if (picked.status === "ambiguous") {
+        logger.warn({ count: picked.count, patientId: resolvedPatientId },
+          "PACS study link: ambiguous description match — leaving unmatched");
+      }
+    }
+
+    // Log matching result clearly
+    if (rStudy) {
+      logger.info({ studyId: rStudy.id, matchMethod }, `PACS study link: ${matchMethod}`);
+    } else {
+      logger.info("PACS study link: no match found, created PACS-only worklist row");
+    }
+
+    let resolvedStudyId: number | null = rStudy ? rStudy.id : null;
+    const previousStudyStatus: string | null = rStudy?.status ?? null;
+
+    if (rStudy) {
+      const updates: Partial<typeof radiologyStudiesTable.$inferInsert> = {
+        updatedAt: new Date(),
+        status: "acquired",
+        acquiredAt: new Date(),
+      };
+
+      if (!rStudy.startedAt && rStudy.status === "scheduled") {
+        updates.startedAt = new Date();
+      }
+
+      if (studyInstanceUID && !rStudy.studyInstanceUid) {
+        updates.studyInstanceUid = studyInstanceUID;
+      }
+      if (accessionNumber && !rStudy.accessionNumber) {
+        updates.accessionNumber = accessionNumber;
+      }
+      if (modality && (!rStudy.modality || rStudy.modality === "OT")) {
+        updates.modality = modality;
+      }
+      if (studyDescription && !rStudy.studyDescription) {
+        updates.studyDescription = studyDescription;
+      }
+      if (referringDoctor && !rStudy.referringDoctor) {
+        updates.referringDoctor = referringDoctor;
+      }
+      if (typeof b.bodyPart === "string" && b.bodyPart.trim() && !rStudy.bodyPart) {
+        updates.bodyPart = b.bodyPart.trim();
+      }
+
+      await db
+        .update(radiologyStudiesTable)
+        .set(updates)
+        .where(eq(radiologyStudiesTable.id, rStudy.id));
+
+      await audit({
+        accessionNumber: rStudy.accessionNumber || accessionNumber,
+        action: "MWL_STATUS_UPDATED",
+        actor: "pacs",
+        details: { from: rStudy.status, to: "acquired", reason: `pacs study intake: ${matchMethod}` },
+      });
+    }
+
+    // Worklist deduplication logic.
+    //
+    // study_instance_uid is the authoritative identifier (DB-enforced
+    // unique via radiology_worklist_uid_uq). accession_number is NOT
+    // unique — real DICOM data from misconfigured modalities can push the
+    // same bogus accession text for genuinely different studies. So the
+    // accession-based lookup is only used as a fallback when the incoming
+    // study has no studyInstanceUID at all (older/incomplete PACS data);
+    // it must never be used to "find" a match for a study that does have
+    // a UID, or two unrelated studies sharing a bad accession would get
+    // merged into one worklist row and silently overwrite each other.
+    let existing: typeof radiologyWorklistTable.$inferSelect | undefined;
+    if (studyInstanceUID) {
+      const [row] = await db
+        .select()
+        .from(radiologyWorklistTable)
+        .where(eq(radiologyWorklistTable.studyInstanceUID, studyInstanceUID))
+        .limit(1);
+      existing = row;
+    } else if (shouldFallbackToAccessionLookup(studyInstanceUID, accessionNumber)) {
+      const [row] = await db
+        .select()
+        .from(radiologyWorklistTable)
+        .where(eq(radiologyWorklistTable.accessionNumber, accessionNumber as string))
+        .limit(1);
+      existing = row;
+    }
+
+    const usgSettings = await getUsgAdminSettings();
+    const isVoluson = sourceAeTitle === "Voluson" || (usgSettings.geAeTitle && sourceAeTitle === usgSettings.geAeTitle);
+    const sourcePacsVal = isVoluson ? "Voluson Push" : (sourcePacs || "pacs");
+
+    const values = {
+      studyId: resolvedStudyId,
+      patientId: resolvedPatientId,
+      dicomPatientId: rawDicomPatientId,
+      patientMatchStatus,
+      patientName,
+      age,
+      sex,
+      modality,
+      studyDescription,
+      studyDate,
+      accessionNumber,
+      studyInstanceUID,
+      // D1: a UID that arrives inside the pushed DICOM study is the strongest
+      // provenance there is — the identifier came with the pixels, not from a
+      // search. Set in the same object as studyInstanceUID so the two can never
+      // be written apart; null when the push carried no UID.
+      studyUidProvenance: studyInstanceUID ? STUDY_UID_PROVENANCE.pacsIntake : null,
+      aeTitle,
+      ipAddress,
+      port,
+      referringDoctor,
+      weasisUrl,
+      sourcePacs: sourcePacsVal,
+      sourceAeTitle,
+      dicomMetadata,
+    };
+
+    let row: typeof radiologyWorklistTable.$inferSelect;
+
+    if (existing) {
+      const updateValues = preserveApprovedPatientAssociationOnReintake(existing, values);
+      const [updated] = await db
+        .update(radiologyWorklistTable)
+        .set({ ...updateValues, updatedAt: new Date() })
+        .where(eq(radiologyWorklistTable.id, existing.id))
+        .returning();
+      row = updated;
+      logger.info(
+        {
+          worklistId: row.id,
+          event: "updated",
+          preservedApprovedPatient: isApprovedMatchDecision(existing.matchDecision),
+        },
+        "Worklist entry updated",
+      );
+      await audit({
+        worklistId: row.id,
+        accessionNumber,
+        action: "STUDY_RECEIVED",
+        actor: "pacs",
+        details: {
+          event: "updated",
+          modality,
+          studyDescription,
+          sourcePacs,
+          sourceAeTitle,
+          preservedApprovedPatient: isApprovedMatchDecision(existing.matchDecision),
+        },
+      });
+    } else {
+      try {
+        const [inserted] = await db
+          .insert(radiologyWorklistTable)
+          .values({ ...values, status: "STUDY_RECEIVED" })
+          .returning();
+        row = inserted;
+        logger.info({ worklistId: row.id, event: "created" }, "Worklist entry created");
+        await audit({
+          worklistId: row.id,
+          accessionNumber,
+          action: "STUDY_RECEIVED",
+          actor: "pacs",
+          details: { event: "created", modality, studyDescription, sourcePacs, sourceAeTitle },
+        });
+      } catch (insertErr: any) {
+        // Race condition: two concurrent pushes for the same
+        // studyInstanceUID both missed the SELECT above and both tried to
+        // INSERT. Postgres's radiology_worklist_uid_uq index rejects the
+        // loser with a 23505 — treat that as "someone else just created
+        // it", re-fetch, and update instead of returning a 500. This is
+        // the update-on-conflict behavior for repeated StudyInstanceUID.
+        if (!isWorklistUidRaceViolation(insertErr, studyInstanceUID)) throw insertErr;
+
+        logger.warn({ studyInstanceUID }, "Worklist insert race on studyInstanceUID — retrying as update");
+        const [race] = await db
+          .select()
+          .from(radiologyWorklistTable)
+          .where(eq(radiologyWorklistTable.studyInstanceUID, studyInstanceUID as string))
+          .limit(1);
+        if (!race) throw insertErr; // shouldn't happen, but don't swallow a real error
+
+        const updateValues = preserveApprovedPatientAssociationOnReintake(race, values);
+        const [updated] = await db
+          .update(radiologyWorklistTable)
+          .set({ ...updateValues, updatedAt: new Date() })
+          .where(eq(radiologyWorklistTable.id, race.id))
+          .returning();
+        row = updated;
+        logger.info(
+          {
+            worklistId: row.id,
+            event: "updated-after-race",
+            preservedApprovedPatient: isApprovedMatchDecision(race.matchDecision),
+          },
+          "Worklist entry updated (race retry)",
+        );
+        await audit({
+          worklistId: row.id,
+          accessionNumber,
+          action: "STUDY_RECEIVED",
+          actor: "pacs",
+          details: {
+            event: "updated-after-race",
+            modality,
+            studyDescription,
+            sourcePacs,
+            sourceAeTitle,
+            preservedApprovedPatient: isApprovedMatchDecision(race.matchDecision),
+          },
+        });
+      }
+    }
+
+    if (row.studyId) {
+      try {
+        const priorityResult = await computeStudyPriority({
+          modality,
+          bodyPart: null,
+          studyDescription,
+          referringDoctor,
+        });
+        await applyPriorityToStudy(row.studyId, priorityResult.priority, priorityResult.reason);
+        await assignRadiologistToStudy(row.studyId, {
+          modality,
+          bodyPart: null,
+          studyId: row.studyId,
+        });
+        logger.info({ studyId: row.studyId }, "Auto-priority + assignment applied");
+      } catch (err) {
+        logger.warn({ err, studyId: row.studyId }, "Auto-priority/assignment failed");
+      }
+    }
+
+    // Auto-trigger USG measurement extraction for ultrasound modality
+    // studies. R2.0: was an exact `=== "US"` check — a PACS source sending
+    // "USG"/"Doppler"/"OB US" etc. (anything RadiologyWorklist.tsx and
+    // RadiologyReportingWorkspace.tsx now recognize via isUltrasoundModality)
+    // never triggered auto-extraction, so those studies sat with no
+    // measurements until someone manually clicked "Extract".
+    // Fire-and-forget: never blocks the intake response.
+    if (isUltrasoundModality(modality) && studyInstanceUID && (await getUsgAdminSettings()).pipelineEnabled !== false) {
+      runUsgExtraction({
+        worklistId: row.id,
+        studyId: row.studyId ?? undefined,
+        studyInstanceUID,
+        accessionNumber: accessionNumber ?? undefined,
+        patientId: row.patientId ?? undefined,
+        dicomMetadataJson: dicomMetadata ?? undefined,
+        triggeredBy: "auto",
+      }).catch((err: unknown) => {
+        logger.warn({ err, worklistId: row.id }, "USG auto-extraction failed silently");
+      });
+    }
+
+    // Bill-desk link for ultrasound, which can never identify itself.
+    //
+    // The USG unit has no MWL, so it cannot know CARE's accession and sends no
+    // StudyInstanceUID the ERP already holds: measured 666 of 668 US worklist
+    // rows arriving with study_id NULL while 711 billed US studies sat waiting
+    // with an accession. autoLinkBilledStudyForWorklist already solves this —
+    // name / modality / date ranked, unique-or-refuse, capped to YELLOW for
+    // Match Center review — but it only ran from the ERP UI and from the
+    // finalize path, which USG no longer uses. Running it here is what puts
+    // bill, test name, referring doctor and demographics on the row the Studio
+    // reads, without inventing a patient to hang them on.
+    //
+    // Ultrasound only, deliberately: MR/CT do get MWL accessions, so their
+    // linking stays on the accession fast path rather than on a name guess.
+    // Placed after the priority/assignment block so a fresh link cannot trigger
+    // them, and before the re-score below so the matcher sees the link.
+    if (!row.studyId && isUltrasoundModality(modality)) {
+      try {
+        const { autoLinkBilledStudyForWorklist } = await import("../lib/pacs/worklistBillingLink");
+        const link = await autoLinkBilledStudyForWorklist(row.id, "pacs-intake");
+        if (link.linked && link.studyId) {
+          const [linked] = await db
+            .select()
+            .from(radiologyWorklistTable)
+            .where(eq(radiologyWorklistTable.id, row.id))
+            .limit(1);
+          if (linked) row = linked;
+          logger.info(
+            { worklistId: row.id, studyId: link.studyId, method: link.method, matchScore: link.matchScore },
+            "Intake linked USG study to its bill",
+          );
+        } else {
+          logger.info({ worklistId: row.id, reason: link.reason }, "Intake USG bill link: no unique billed study");
+        }
+      } catch (err) {
+        // A link attempt must never cost the study its intake — the sync agent
+        // treats any non-2xx as permanent and drops the study forever.
+        logger.warn({ err, worklistId: row.id }, "Intake USG bill link failed");
+      }
+    }
+
+    // Run matching engine to compute and store match score / warnings.
+    // Skip when Match Center has already APPROVED identity — re-scoring must
+    // not downgrade match state on a locked patient association.
+    if (!isApprovedMatchDecision(row.matchDecision)) {
+      try {
+        await runMatchingEngineForWorklist(row.id);
+      } catch (matchErr) {
+        logger.error({ err: matchErr, worklistId: row.id }, "Intake matching engine execution failed");
+      }
+    }
+
+    // Wire Orthanc arrival → queue token done + MWL cleanup + live UI refresh
+    runDicomIntakeAutomation({
+      worklistId: row.id,
+      accessionNumber: rStudy?.accessionNumber || accessionNumber,
+      orderTestId: rStudy?.orderTestId,
+      billId: rStudy?.billId,
+      department: rStudy?.department,
+      // Prefer the persisted worklist patient (may be APPROVED-preserved).
+      patientId: row.patientId ?? resolvedPatientId,
+      patientName,
+      modality,
+      previousStudyStatus,
+    }).catch((err: unknown) => {
+      logger.warn({ err, worklistId: row.id }, "dicom-intake automation failed silently");
+    });
+
+    // DICOM → Ollama draft: enqueue per Settings → Radiology → AI (on arrival or scheduled).
+    if (studyInstanceUID) {
+      import("../lib/ai/schedulerService")
+        .then(({ scheduleStudyOnDicomArrival }) =>
+          scheduleStudyOnDicomArrival({
+            studyInstanceUid: studyInstanceUID as string,
+            modality: modality ?? null,
+          }),
+        )
+        .catch((err: unknown) => {
+          logger.warn({ err, worklistId: row.id }, "AI draft schedule on intake failed silently");
+        });
+    }
+
+    logger.info({ worklistId: row.id, accessionNumber }, "POST /api/internal/radiology/studies success");
+    res.status(201).json({ success: true, worklistId: row.id });
+    return;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error({ err, body: rawBody }, "POST /api/internal/radiology/studies FAILED");
+    res.status(500).json({ success: false, error: message });
+    return;
+  }
+});
+
+// ── Report status update ──────────────────────────────────────────────────────
+// POST /api/internal/radiology/report-status
+
+router.post("/radiology/report-status", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    /** radiology_worklist.id — preferred when accession/UID are missing or stale. */
+    worklistId?: number;
+    studyId?: number;
+    accessionNumber?: string;
+    studyInstanceUID?: string;
+    status?: string;
+    deliveryStatus?: string;
+    reportId?: number;
+    actor?: string;
+    auditDetails?: unknown;
+    // PCPNDT override (admin/super_admin only, audited) — see the
+    // REPORT_FINAL compliance gate below.
+    pcpndtOverride?: boolean;
+    pcpndtOverrideReason?: string;
+    /** Admin-only: allow REPORT_FINAL without a signed patient report row. */
+    softFinalOverride?: boolean;
+    softFinalReason?: string;
+    /** Owner-approved policy A3: one explicit confirmation to finalize a
+     * billed examination that has no linked images (no contradictory match). */
+    confirmUnlinked?: boolean;
+  };
+
+  // Find worklist row — worklist id first (canonical workspace key), then UID/accession.
+  let existing: typeof radiologyWorklistTable.$inferSelect | undefined;
+  if (b.worklistId) {
+    const [row] = await db
+      .select()
+      .from(radiologyWorklistTable)
+      .where(eq(radiologyWorklistTable.id, b.worklistId));
+    existing = row;
+  }
+  if (!existing && b.studyInstanceUID) {
+    const [row] = await db
+      .select()
+      .from(radiologyWorklistTable)
+      .where(eq(radiologyWorklistTable.studyInstanceUID, b.studyInstanceUID));
+    existing = row;
+  }
+  if (!existing && b.accessionNumber) {
+    const [row] = await db
+      .select()
+      .from(radiologyWorklistTable)
+      .where(eq(radiologyWorklistTable.accessionNumber, b.accessionNumber));
+    existing = row;
+  }
+  if (!existing && b.studyId) {
+    const [row] = await db
+      .select()
+      .from(radiologyWorklistTable)
+      .where(eq(radiologyWorklistTable.studyId, b.studyId));
+    existing = row;
+  }
+
+  if (!existing) {
+    res.status(404).json({ error: "Worklist entry not found" });
+    return;
+  }
+
+  // Soft Final (status-only REPORT_FINAL without a signed patient report) is
+  // admin/owner override only — radiologists must use Workspace Finalize & Sign.
+  // Canonical finalizeRadiologyReport always sets deliveryStatus READY_TO_SEND
+  // (even when the patient-report row is skipped for unbilled studies).
+  // INTERNAL_API_KEY automation keeps its existing role handling, but a status
+  // flip to REPORT_FINAL with no signed row is now AI-review guarded for every
+  // caller — see the unreviewed-AI block below this one.
+  const ADMIN_SOFT_FINAL_ROLES = new Set(["admin", "super_admin", "owner"]);
+  // A study becomes REPORT_FINAL through three doors and this is the one that
+  // can be reached without any report row existing. Until now the only evidence
+  // that a report was behind the flip was `deliveryStatus` — a field the CALLER
+  // sets — so naming READY_TO_SEND alone closed billed studies that had no
+  // report at all (measured 2026-10-16 on an isolated database: HTTP 200 for a
+  // billed worklist whose study had zero patient_reports rows, leaving
+  // report_id NULL, and because the workspace's signing gate reads that same
+  // status the study could then never be signed).
+  //
+  // The door with no reportId is the open one. When a caller does name a report,
+  // assertReportBelongsToWorklist() below already proves it exists, is this
+  // patient's, and resolves to THIS worklist through
+  // resolveWorklistFromStudyRef() — the shared helper that knows
+  // patient_reports.study_id may hold either a worklist row id or a billed
+  // radiology_studies.id, the two sequences that overlap by design. Re-checking
+  // ownership here would only give one refusal two vocabularies, so what is
+  // decided from the stored rows is canonicality for the id-less call: a row
+  // bound to this worklist for this patient, or no billable test behind it.
+  let isCanonicalFinalize = b.deliveryStatus === "READY_TO_SEND";
+  if (b.status === "REPORT_FINAL" && !b.reportId) {
+    const boundStudy = existing.studyId
+      ? (await db
+          .select({
+            orderTestId: radiologyStudiesTable.orderTestId,
+            billId: radiologyStudiesTable.billId,
+          })
+          .from(radiologyStudiesTable)
+          .where(eq(radiologyStudiesTable.id, existing.studyId)))[0]
+      : undefined;
+    const isBilledStudy = Boolean(boundStudy?.orderTestId || boundStudy?.billId);
+
+    if (isBilledStudy) {
+      // Resolve the row this study actually owns, the way create binds it
+      // (patient-reports.ts writes radiology_worklist.report_id and stores the
+      // worklist row id in patient_reports.study_id). The row's lifecycle state
+      // is not the test: canonical finalize flips the worklist before it signs
+      // (create -> report-status -> sign, radiologyReportLifecycle.ts, and
+      // signatureWithdrawalReopensStudy.request.test.ts exercises that exact
+      // order), so the row is legitimately unsigned at this instant — and after
+      // a withdrawal it is draft again while the correction is prepared.
+      let bound: (typeof patientReportsTable.$inferSelect) | undefined = existing.reportId
+        ? (await db
+            .select()
+            .from(patientReportsTable)
+            .where(eq(patientReportsTable.id, existing.reportId)))[0]
+        : (await db
+            .select()
+            .from(patientReportsTable)
+            .where(
+              and(
+                eq(patientReportsTable.studyId, existing.id),
+                existing.patientId != null ? eq(patientReportsTable.patientId, existing.patientId) : undefined,
+              )
+            )
+            .limit(1))[0];
+      if (bound && existing.patientId != null && bound.patientId !== existing.patientId) bound = undefined;
+      isCanonicalFinalize = Boolean(bound);
+    }
+    // An unbilled study keeps its existing behaviour: no report row can exist,
+    // and READY_TO_SEND is what the workspace legitimately sends for it.
+  }
+  if (
+    b.status === "REPORT_FINAL" &&
+    !b.reportId &&
+    !isCanonicalFinalize &&
+    (req as StaffAuthRequest).staffSession
+  ) {
+    const sessionRole = normalizeRole((req as StaffAuthRequest).staffSession?.role ?? "");
+    const softOverride = b.softFinalOverride === true;
+    if (!softOverride || !ADMIN_SOFT_FINAL_ROLES.has(sessionRole)) {
+      res.status(409).json({
+        error: "SOFT_FINAL_BLOCKED",
+        message:
+          "Marking a study Final without a signed report is blocked. Open the Reporting Workspace and use Finalize & Sign, or use Admin mark final with a reason.",
+      });
+      return;
+    }
+    const session = (req as StaffAuthRequest).staffSession;
+    await auditLog({
+      userId: session?.subjectId ?? null,
+      userName: session?.subjectName ?? "system",
+      role: sessionRole || "system",
+      action: "soft_final_override",
+      module: "radiology",
+      entityType: "radiology_worklist",
+      entityId: String(existing.id),
+      newValue: JSON.stringify({ accessionNumber: existing.accessionNumber }),
+      reason: typeof b.softFinalReason === "string" && b.softFinalReason.trim().length >= 3
+        ? b.softFinalReason.trim()
+        : "admin soft final (no signed reportId)",
+    });
+  }
+
+  // Unreviewed-AI protection on every non-canonical finalize.
+  //
+  // Finalize & Sign is guarded twice already (POST /api/patient-reports and
+  // POST /:id/sign both call checkUnreviewedAiFinalize). This endpoint is the
+  // third way a study becomes REPORT_FINAL — Admin "mark final" without a
+  // signed row, and the same status flip over an internal API key — and until
+  // now it was the only one with no AI-review check. Being an admin made the
+  // bypass silent, not legitimate: an unreviewed AI draft could sit PENDING
+  // while the worklist read as Final, printed nothing, and sent nothing.
+  //
+  // Same shared guard, same typed rejections, no duplicated logic, no new
+  // override: soft-final keeps its audited role gate for the missing-signature
+  // problem, which is a different problem from unreviewed machine text.
+  if (b.status === "REPORT_FINAL" && !b.reportId && !isCanonicalFinalize) {
+    const aiReview = await checkUnreviewedAiFinalize({
+      worklistId: existing.id,
+      studyId: existing.studyId ?? null,
+    });
+    if (aiReview.state === "unreviewed") {
+      res.status(409).json(unreviewedAiFinalizeError(aiReview.draft));
+      return;
+    }
+    if (aiReview.state === "unknown") {
+      res.status(503).json(aiReviewStateUnavailableError());
+      return;
+    }
+  }
+
+  // PCPNDT server-side finalize guard. The canonical Radiology Reporting
+  // Workspace's finalizeReport() already blocks this client-side
+  // (isObstetricUsgStudy() in the frontend's lib/usgModality.ts), but that
+  // is a UI-level guard only — a direct call to this endpoint (bypassing the
+  // client entirely) would otherwise still be able to flip an obstetric/
+  // fetal ultrasound study to REPORT_FINAL with zero PCPNDT Form F
+  // compliance check. This is the authoritative, DB-verified check (reads
+  // `existing.modality`/`existing.studyDescription` from the worklist row
+  // itself, never trusts client-supplied values) and covers BOTH the billed
+  // path (which also creates a patient_reports row — see the equivalent
+  // guard in patient-reports.ts POST /) and the unbilled path (where this
+  // report-status call is the ONLY finalize-adjacent write that happens).
+  // Only the legacy, PCPNDT-compliant pipeline (routes/usgReports.ts,
+  // UsgReporting.tsx) may finalize these studies — see
+  // docs/usg-reporting/platform-consolidation-pr-b.md §17-18.
+  // Roadmap §1.4 step 2 (docs/usg-reporting/pcpndt-canonical-roadmap.md):
+  // upgraded from a blanket block to the real shared Form F verification
+  // (lib/pcpndtCompliance.ts — the same check the legacy usgReports.ts
+  // finalize enforces). Compliant obstetric studies proceed; non-compliant
+  // ones are refused with the exact missing fields. Step 4: admin/
+  // super_admin may override with a documented reason (audited), mirroring
+  // the legacy finalize-force gate. Note: the billed path also passes the
+  // equivalent gate in patient-reports.ts POST /; this covers the unbilled
+  // path where this status flip is the only finalize-adjacent write.
+  if (b.status === "REPORT_FINAL" && isObstetricUsgStudy(existing.modality, existing.studyDescription)) {
+    const compliance = await checkPcpndtFormFCompliance(existing.patientId);
+    if (!compliance.compliant) {
+      const overrideReason = typeof b.pcpndtOverrideReason === "string" ? b.pcpndtOverrideReason.trim() : "";
+      const sessionRole = (req as StaffAuthRequest).staffSession?.role ?? "";
+      if (b.pcpndtOverride === true && PCPNDT_OVERRIDE_ROLES.has(sessionRole) && overrideReason.length >= 3) {
+        const session = (req as StaffAuthRequest).staffSession;
+        await auditLog({
+          userId: session?.subjectId ?? null,
+          userName: session?.subjectName ?? "system",
+          role: sessionRole || "system",
+          action: "pcpndt_override_finalize",
+          module: "radiology",
+          entityType: "radiology_worklist",
+          entityId: String(existing.id),
+          newValue: JSON.stringify({
+            patientId: existing.patientId,
+            complianceErrors: compliance.errors,
+          }),
+          reason: overrideReason,
+        });
+      } else {
+        res.status(409).json({
+          error: "pcpndt_compliance_required",
+          message:
+            "This is an obstetric/fetal ultrasound study and its PCPNDT Form F record is missing or incomplete. Complete and verify Form F for this patient (Form F page), then finalize again. An admin/super_admin may override with a documented reason (pcpndtOverride + pcpndtOverrideReason).",
+          validationErrors: compliance.errors,
+          formFId: compliance.formFId,
+        });
+        return;
+      }
+    }
+  }
+
+  // M1.6A — a status flip (finalize) by a STAFF session is refused while
+  // another user actively holds the study lock: two radiologists must never
+  // finalize the same study over each other. The INTERNAL_API_KEY automation
+  // path carries no session and is never lock-gated.
+  const staffSession = (req as StaffAuthRequest).staffSession;
+  if (staffSession) {
+    const gate = await checkWriteLock(existing.id, staffSession.subjectId);
+    if (gate.blocked) {
+      res.status(409).json({
+        error: "LOCKED_BY_OTHER",
+        lockedBy: gate.lockedBy,
+        message: `This study is currently being reported by ${gate.lockedBy}.`,
+      });
+      return;
+    }
+  }
+
+  const VALID_STATUSES = ["STUDY_RECEIVED", "AI_DRAFT_READY", "REPORT_IN_PROGRESS", "REPORT_FINAL", "DELIVERED"];
+  const VALID_DELIVERY = ["READY_TO_SEND", "SENT"];
+
+  if (b.status === "REPORT_FINAL") {
+    const matchClass = classifyFinalizeMatch({
+      matchScore: existing.matchScore,
+      matchDecision: existing.matchDecision,
+      matchWarnings: existing.matchWarnings,
+      hasLinkedStudy: existing.studyId != null,
+    });
+    if (matchClass === "REFUSED") {
+      res.status(409).json({
+        error: "Match Center identity is unresolved. The recorded match contradicts this study (possible wrong patient or examination). Resolve it in Match Center before finalizing.",
+        code: "MATCH_GATE_BLOCKED",
+        worklistId: existing.id,
+        matchScore: existing.matchScore,
+        matchDecision: existing.matchDecision,
+      });
+      return;
+    }
+    if (matchClass === "CONFIRM_UNLINKED" && b.confirmUnlinked !== true) {
+      res.status(409).json({
+        error: "No images are linked to this billed examination. One explicit confirmation is required to finalize without images.",
+        code: "UNLINKED_CONFIRM_REQUIRED",
+        worklistId: existing.id,
+        matchScore: existing.matchScore,
+      });
+      return;
+    }
+    if (existing.status === "REPORT_FINAL" || existing.status === "DELIVERED") {
+      if (b.reportId && existing.reportId && existing.reportId !== b.reportId) {
+        res.status(409).json({
+          error: "Worklist already has a different final report.",
+          code: "ALREADY_FINAL",
+          existingReportId: existing.reportId,
+        });
+        return;
+      }
+      res.json({ ...existing, success: true, idempotent: true });
+      return;
+    }
+  }
+
+  if (b.reportId) {
+    try {
+      await assertReportBelongsToWorklist(b.reportId, existing);
+    } catch (err) {
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  const updates: Partial<typeof radiologyWorklistTable.$inferInsert> = { updatedAt: new Date() };
+  if (b.status && VALID_STATUSES.includes(b.status)) updates.status = b.status;
+  if (b.deliveryStatus && VALID_DELIVERY.includes(b.deliveryStatus)) updates.deliveryStatus = b.deliveryStatus;
+  if (b.reportId) updates.reportId = b.reportId;
+  // Completed studies hold no locks (M1.6A): the flip to REPORT_FINAL /
+  // DELIVERED clears the lock server-side — release-on-finalize is
+  // authoritative here, never a client courtesy call.
+  if (b.status === "REPORT_FINAL" || b.status === "DELIVERED") {
+    updates.lockUserId = null;
+    updates.lockUserName = null;
+    updates.lockTime = null;
+    updates.lockLastActivityAt = null;
+    updates.lockWorkstation = null;
+  }
+
+  const [updated] = await db
+    .update(radiologyWorklistTable)
+    .set(updates)
+    .where(
+      b.status === "REPORT_FINAL"
+        ? and(
+            eq(radiologyWorklistTable.id, existing.id),
+            sql`${radiologyWorklistTable.status} IS DISTINCT FROM 'REPORT_FINAL'`,
+          )
+        : eq(radiologyWorklistTable.id, existing.id),
+    )
+    .returning();
+
+  if (b.status === "REPORT_FINAL" && !updated) {
+    res.status(409).json({
+      error: "Worklist already finalized (concurrent request).",
+      code: "ALREADY_FINAL",
+    });
+    return;
+  }
+
+  const changes: string[] = [];
+  if (b.status) changes.push(`status → ${b.status}`);
+  if (b.deliveryStatus) changes.push(`deliveryStatus → ${b.deliveryStatus}`);
+
+  await audit({
+    worklistId: existing.id,
+    accessionNumber: existing.accessionNumber,
+    action: "REPORT_STATUS_UPDATED",
+    actor: b.actor ?? "system",
+    details: { changes, ...(typeof b.auditDetails === "object" && b.auditDetails ? b.auditDetails : {}) },
+  });
+
+  if (b.status === "REPORT_FINAL" && existing.studyId) {
+    import("../lib/pacsArchive.js").then(({ archiveReportToPacs }) => {
+      archiveReportToPacs(existing.studyId!);
+    }).catch(err => {
+      logger.error({ err }, "Failed to load pacsArchive helper in report-status");
+    });
+  }
+
+  res.json(updated);
+});
+
+// ── AI draft generation ───────────────────────────────────────────────────────
+// POST /api/internal/radiology/ai-draft
+//
+// Tries Gemini if configured; falls back to structured template-based placeholder.
+// SAFETY: AI output is NEVER automatically set to REPORT_FINAL. The radiologist
+// must explicitly click "Save Final Report" in the UI.
+
+const RADIOLOGY_TEMPLATES: Record<string, { technique: string; findings: string; impression: string; recommendation: string }> = {
+  "MRI Brain Plain": {
+    technique: "Multiplanar, multisequence MRI of the brain was performed using T1W, T2W, FLAIR, DWI, GRE/SWI sequences on a [field strength] Tesla MRI scanner without contrast administration.",
+    findings: `<b>Brain Parenchyma:</b>
+Grey-white matter differentiation is preserved. No focal cortical or subcortical signal abnormality identified.
+
+<b>Ventricles and Sulci:</b>
+Ventricles are normal in size and configuration. Basal cisterns are patent. Cortical sulci show age-appropriate prominence.
+
+<b>Corpus Callosum:</b>
+Normal morphology and signal.
+
+<b>Cerebellum and Brainstem:</b>
+No signal abnormality. Normal foliation of cerebellar hemispheres. Brainstem is normal.
+
+<b>Basal Ganglia and Thalami:</b>
+Normal signal and morphology bilaterally.
+
+<b>Posterior Fossa:</b>
+No mass lesion or extra-axial collection. Foramen magnum is patent.
+
+<b>Calvarium and Orbits:</b>
+No aggressive bony lesion. Orbits appear normal.
+
+<b>Visualized Paranasal Sinuses and Mastoid Air Cells:</b>
+Clear.`,
+    impression: "• No acute intracranial abnormality identified on plain MRI brain.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings and symptoms. MRI Brain with contrast is recommended if clinically indicated.",
+  },
+  "MRI Brain With Contrast": {
+    technique: "Multiplanar, multisequence MRI of the brain was performed using T1W, T2W, FLAIR, DWI, GRE/SWI sequences followed by T1W post-gadolinium contrast sequences on a [field strength] Tesla MRI scanner.",
+    findings: `<b>Brain Parenchyma (Pre-contrast):</b>
+Grey-white matter differentiation is preserved. No focal signal abnormality.
+
+<b>Post-Contrast Enhancement:</b>
+No abnormal parenchymal, leptomeningeal, or pachymeningeal enhancement identified.
+
+<b>Ventricles and Sulci:</b>
+Normal in size and configuration.
+
+<b>Corpus Callosum:</b>
+Normal morphology and signal.
+
+<b>Cerebellum and Brainstem:</b>
+No lesion or enhancement.
+
+<b>Basal Ganglia and Thalami:</b>
+Normal signal bilaterally. No abnormal enhancement.
+
+<b>Calvarium and Orbits:</b>
+No aggressive bony lesion or abnormal enhancement.`,
+    impression: "• No abnormal intracranial enhancement detected.\n• No mass lesion, abscess, or leptomeningeal disease identified.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings. Repeat MRI recommended if symptoms persist.",
+  },
+  "MRI LS Spine": {
+    technique: "Multiplanar, multisequence MRI of the lumbar spine was performed using T1W and T2W sequences in sagittal and axial planes.",
+    findings: `<b>Vertebral Alignment:</b>
+Normal lumbar lordosis maintained. No listhesis.
+
+<b>Vertebral Bodies:</b>
+Height, morphology, and marrow signal of all lumbar vertebral bodies appear within normal limits.
+
+<b>Intervertebral Discs:</b>
+L1-L2: Normal height and signal.
+L2-L3: Normal height and signal.
+L3-L4: Normal height and signal.
+L4-L5: Mild disc desiccation noted. No significant disc herniation or canal compromise.
+L5-S1: Mild disc desiccation. No significant disc herniation.
+
+<b>Spinal Canal:</b>
+Adequate calibre at all levels. No significant central canal stenosis.
+
+<b>Neural Foramina:</b>
+No significant foraminal narrowing.
+
+<b>Conus Medullaris:</b>
+Terminating at L1-L2 level — within normal limits.
+
+<b>Paravertebral Soft Tissues:</b>
+Unremarkable.`,
+    impression: "• Mild degenerative disc changes at L4-L5 and L5-S1 without significant neural compromise.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings. Physiotherapy and conservative management may be considered.",
+  },
+  "MRI Cervical Spine": {
+    technique: "Multiplanar, multisequence MRI of the cervical spine was performed using T1W and T2W sequences in sagittal and axial planes.",
+    findings: `<b>Vertebral Alignment:</b>
+Normal cervical lordosis maintained. No listhesis.
+
+<b>Vertebral Bodies:</b>
+Height, morphology, and marrow signal are within normal limits.
+
+<b>Intervertebral Discs:</b>
+C2-C3 through C6-C7: No significant disc herniation, disc desiccation, or canal compromise.
+
+<b>Spinal Canal:</b>
+Adequate calibre at all levels. No significant central canal stenosis.
+
+<b>Neural Foramina:</b>
+No significant foraminal narrowing.
+
+<b>Spinal Cord:</b>
+Normal in calibre and signal throughout.
+
+<b>Paravertebral Soft Tissues:</b>
+Unremarkable.`,
+    impression: "• No significant disc herniation or cord signal abnormality on MRI cervical spine.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings and neurological examination.",
+  },
+  "CT Brain": {
+    technique: "Non-contrast CT of the brain was performed using standard axial sections with coronal and sagittal reformats.",
+    findings: `<b>Brain Parenchyma:</b>
+No hyperdense or hypodense lesion identified. Grey-white matter differentiation is preserved.
+
+<b>Ventricles:</b>
+Lateral, third, and fourth ventricles are normal in size and configuration.
+
+<b>Basal Cisterns:</b>
+Patent. No effacement.
+
+<b>Midline Structures:</b>
+No midline shift.
+
+<b>Extra-Axial Spaces:</b>
+No subdural, epidural, or subarachnoid haemorrhage.
+
+<b>Posterior Fossa:</b>
+Cerebellum and brainstem appear normal. No mass lesion.
+
+<b>Calvarium:</b>
+No fracture or lytic/sclerotic lesion.
+
+<b>Visualized Paranasal Sinuses and Mastoid Air Cells:</b>
+Clear.`,
+    impression: "• No acute intracranial haemorrhage, infarct, or space-occupying lesion on CT brain.\n• [Add specific findings if applicable.]",
+    recommendation: "MRI brain is recommended for further evaluation if clinically indicated.",
+  },
+  "X-Ray Chest": {
+    technique: "PA view chest X-ray obtained in full inspiration.",
+    findings: `<b>Lung Fields:</b>
+Both lung fields are clear. No consolidation, collapse, cavity, or pleural effusion.
+
+<b>Hila:</b>
+Bilateral hilar shadows are within normal limits.
+
+<b>Mediastinum:</b>
+Superior mediastinum appears normal in width. Trachea is centrally placed.
+
+<b>Heart:</b>
+Cardiothoracic ratio is within normal limits (< 50%). Cardiac contours are normal.
+
+<b>Diaphragm:</b>
+Both hemidiaphragms are dome-shaped and at normal levels. Costophrenic angles are sharp.
+
+<b>Bony Thorax:</b>
+Ribs, clavicles, and visible shoulder joints appear normal. No fracture.`,
+    impression: "• No active cardiopulmonary pathology detected on chest X-ray.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings. High-resolution CT chest recommended if indicated.",
+  },
+  "USG Abdomen": {
+    technique: "Real-time B-mode ultrasound of the abdomen was performed using a [frequency] MHz probe.",
+    findings: `<b>Liver:</b>
+Normal in size and echogenicity. No focal lesion, biliary dilatation, or ascites. Portal vein diameter within normal limits.
+
+<b>Gallbladder:</b>
+Normal in size. Wall thickness within normal limits. No calculi or polyp. No pericholecystic fluid.
+
+<b>Common Bile Duct:</b>
+Not dilated. Diameter within normal limits.
+
+<b>Pancreas:</b>
+Visualised portions appear normal in echogenicity and outline. No focal lesion or ductal dilatation.
+
+<b>Spleen:</b>
+Normal in size and echogenicity.
+
+<b>Kidneys:</b>
+Both kidneys are normal in size, shape, and echogenicity. Corticomedullary differentiation maintained. No hydronephrosis, calculus, or focal lesion.
+
+<b>Urinary Bladder:</b>
+Adequately filled. Walls appear normal. No intraluminal lesion.
+
+<b>Aorta and IVC:</b>
+No significant dilatation or wall abnormality in the visualised portions.`,
+    impression: "• No sonographic abnormality detected in the abdomen.\n• [Add specific findings if applicable.]",
+    recommendation: "Please correlate with clinical findings and laboratory investigations.",
+  },
+};
+
+// Normalise template name lookup — case-insensitive, trim whitespace.
+function findTemplate(key: string): typeof RADIOLOGY_TEMPLATES[string] | undefined {
+  if (!key) return undefined;
+  const k = key.trim().toLowerCase();
+  for (const [name, tpl] of Object.entries(RADIOLOGY_TEMPLATES)) {
+    if (name.toLowerCase() === k) return tpl;
+  }
+  return undefined;
+}
+
+function buildTemplateFromModality(modality: string, studyDescription: string): typeof RADIOLOGY_TEMPLATES[string] {
+  // Best-effort fuzzy match by studyDescription first, then modality.
+  const desc = `${studyDescription} ${modality}`.toLowerCase();
+  if (desc.includes("brain") && (desc.includes("contrast") || desc.includes("ce"))) return RADIOLOGY_TEMPLATES["MRI Brain With Contrast"]!;
+  if (desc.includes("brain") && desc.includes("mri")) return RADIOLOGY_TEMPLATES["MRI Brain Plain"]!;
+  if ((desc.includes("ls") || desc.includes("lumbar")) && desc.includes("spine")) return RADIOLOGY_TEMPLATES["MRI LS Spine"]!;
+  if ((desc.includes("cervical") || desc.includes("neck")) && desc.includes("spine")) return RADIOLOGY_TEMPLATES["MRI Cervical Spine"]!;
+  if (desc.includes("ct") && desc.includes("brain")) return RADIOLOGY_TEMPLATES["CT Brain"]!;
+  if (desc.includes("chest") || desc.includes("cxr")) return RADIOLOGY_TEMPLATES["X-Ray Chest"]!;
+  if (desc.includes("usg") || desc.includes("abdomen") || desc.includes("ultrasound")) return RADIOLOGY_TEMPLATES["USG Abdomen"]!;
+
+  const m = modality.toUpperCase();
+  if (m === "MR") return RADIOLOGY_TEMPLATES["MRI Brain Plain"]!;
+  if (m === "CT") return RADIOLOGY_TEMPLATES["CT Brain"]!;
+  if (m === "CR" || m === "DX") return RADIOLOGY_TEMPLATES["X-Ray Chest"]!;
+  if (m === "US") return RADIOLOGY_TEMPLATES["USG Abdomen"]!;
+  return RADIOLOGY_TEMPLATES["X-Ray Chest"]!;
+}
+
+function buildFormattedHtml(opts: {
+  patientName: string;
+  age: string;
+  sex: string;
+  studyDescription: string;
+  accessionNumber: string;
+  studyDate: string;
+  technique: string;
+  findings: string;
+  impression: string;
+  recommendation: string;
+}): string {
+  const { patientName, age, sex, studyDescription, accessionNumber, studyDate, technique, findings, impression, recommendation } = opts;
+  return `<div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.6; padding: 16px;">
+<p style="font-weight: bold; margin: 0;">Patient: ${patientName} &nbsp;|&nbsp; Age/Sex: ${age} / ${sex} &nbsp;|&nbsp; Accession: ${accessionNumber} &nbsp;|&nbsp; Date: ${studyDate}</p>
+<hr style="border: 2px solid #000; margin: 8px 0;" />
+<p style="text-align: center; font-weight: bold; text-decoration: underline; font-size: 15px;">${studyDescription.toUpperCase()}</p>
+
+<p><b>TECHNIQUE:</b><br/>${technique}</p>
+
+<p><b>FINDINGS / OBSERVATIONS:</b><br/>${findings.replace(/\n/g, "<br/>")}</p>
+
+<p><b>IMPRESSION:</b><br/>${impression.replace(/\n/g, "<br/>")}</p>
+
+<p><b>RECOMMENDATION:</b><br/>${recommendation}</p>
+
+<p style="font-style: italic; color: #555; margin-top: 16px;">Please correlate with clinical findings.</p>
+</div>`;
+}
+
+router.post("/radiology/ai-draft", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    studyId?: number;
+    modality?: string;
+    studyDescription?: string;
+    clinicalHistory?: string;
+    rawFindings?: string;
+    templateId?: number;
+    templateName?: string;
+    // Context for demographics in HTML output
+    patientName?: string;
+    age?: string;
+    sex?: string;
+    accessionNumber?: string;
+    studyDate?: string;
+  };
+
+  const modality = b.modality?.trim() || "OT";
+  const studyDescription = b.studyDescription?.trim() || modality;
+  const patientName = b.patientName?.trim() || "Patient";
+  const age = b.age?.trim() || "";
+  const sex = b.sex?.trim() || "";
+  const accessionNumber = b.accessionNumber?.trim() || "";
+  const studyDate = b.studyDate?.trim() || todayIST();
+
+  // Mark worklist entry as AI_DRAFT_READY (look up by studyId if provided)
+  let worklistRow: typeof radiologyWorklistTable.$inferSelect | undefined;
+  if (b.studyId) {
+    const [r] = await db.select().from(radiologyWorklistTable).where(eq(radiologyWorklistTable.id, b.studyId));
+    worklistRow = r;
+  }
+
+  // Resolve template
+  const tpl = (b.templateName ? findTemplate(b.templateName) : undefined)
+    ?? buildTemplateFromModality(modality, studyDescription);
+
+  const title = `${studyDescription} — Report`;
+
+  // If raw findings provided, incorporate into the findings section.
+  let findings = tpl.findings;
+  if (b.rawFindings?.trim()) {
+    findings = `<b>RADIOLOGIST FINDINGS:</b><br/>${b.rawFindings.trim()}<br/><br/>${findings}`;
+  }
+  if (b.clinicalHistory?.trim()) {
+    findings = `<b>CLINICAL HISTORY:</b><br/>${b.clinicalHistory.trim()}<br/><br/>${findings}`;
+  }
+
+  // Attempt Gemini generation if key present.
+  let aiGenerated = false;
+  try {
+    const hasGemini = !!(process.env["AI_INTEGRATIONS_GEMINI_API_KEY"] || process.env["GEMINI_API_KEY"]);
+    if (hasGemini && (b.rawFindings?.trim() || b.clinicalHistory?.trim())) {
+      const { geminiGenerate } = await import("@workspace/integrations-gemini-ai");
+      const prompt = `You are an expert radiologist. Generate a structured radiology report.
+Study: ${studyDescription}
+Modality: ${modality}
+${b.clinicalHistory ? `Clinical History: ${b.clinicalHistory}` : ""}
+${b.rawFindings ? `Raw Findings / Dictation: ${b.rawFindings}` : ""}
+
+Return a JSON object with these exact keys: title, technique, findings (HTML with <b> headings), impression (bullet points), recommendation.
+Respond ONLY with the JSON object, no markdown fences.`;
+
+      const raw = await geminiGenerate(prompt, { maxTokens: 4096 });
+      // Strip markdown fences if model adds them anyway
+      const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+      const parsed = JSON.parse(cleaned) as {
+        title?: string; technique?: string; findings?: string;
+        impression?: string; recommendation?: string;
+      };
+      if (parsed.findings) {
+        findings = parsed.findings;
+        if (parsed.impression) tpl.impression = parsed.impression;
+        if (parsed.recommendation) tpl.recommendation = parsed.recommendation;
+        if (parsed.technique) tpl.technique = parsed.technique;
+        aiGenerated = true;
+      }
+    }
+  } catch {
+    // Fall through to template-based output silently
+  }
+
+  const draft = {
+    title,
+    technique: tpl.technique,
+    findings,
+    impression: tpl.impression,
+    recommendation: tpl.recommendation,
+    formattedReportHtml: buildFormattedHtml({
+      patientName, age, sex, studyDescription, accessionNumber, studyDate,
+      technique: tpl.technique, findings, impression: tpl.impression,
+      recommendation: tpl.recommendation,
+    }),
+    formattedReportText: [
+      `Patient: ${patientName} | Age/Sex: ${age} / ${sex} | Accession: ${accessionNumber} | Date: ${studyDate}`,
+      "─────────────────────────────────",
+      studyDescription.toUpperCase(),
+      "",
+      "TECHNIQUE:",
+      tpl.technique,
+      "",
+      "FINDINGS:",
+      findings.replace(/<[^>]+>/g, ""),
+      "",
+      "IMPRESSION:",
+      tpl.impression,
+      "",
+      "RECOMMENDATION:",
+      tpl.recommendation,
+      "",
+      "Please correlate with clinical findings.",
+    ].join("\n"),
+    aiGenerated,
+    templateUsed: b.templateName ?? studyDescription,
+  };
+
+  // Update worklist status if we found a row
+  if (worklistRow) {
+    await db
+      .update(radiologyWorklistTable)
+      .set({
+        status: "AI_DRAFT_READY",
+        aiDraftStatus: "READY",
+        aiDraftJson: JSON.stringify(draft),
+        updatedAt: new Date(),
+      })
+      .where(eq(radiologyWorklistTable.id, worklistRow.id));
+
+    await audit({
+      worklistId: worklistRow.id,
+      accessionNumber: worklistRow.accessionNumber,
+      action: "AI_DRAFT_GENERATED",
+      actor: "system",
+      details: { aiGenerated, templateUsed: draft.templateUsed },
+    });
+  }
+
+  res.json(draft);
+});
+
+// ── DICOM event ingestion ─────────────────────────────────────────────────────
+// POST /api/internal/radiology/dicom-event
+// Called by Conquest Lua hooks and the Python PACS agent to log events.
+// Any actor with INTERNAL_API_KEY can write; logs are then visible in PacsLogs.
+
+router.post("/radiology/dicom-event", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    message?: string;
+    severity?: string;
+    source?: string;
+    eventType?: string;
+    logType?: string;
+    studyInstanceUid?: string;
+    accessionNumber?: string;
+    patientId?: string;
+    modality?: string;
+    payload?: unknown;
+    errorStack?: string;
+  };
+
+  if (!b.message?.trim()) {
+    res.status(400).json({ error: "message is required" });
+    return;
+  }
+
+  const VALID_SEV = ["info", "warning", "error", "debug"];
+  const payloadStr = b.payload != null
+    ? (typeof b.payload === "string" ? b.payload : JSON.stringify(b.payload))
+    : null;
+
+  const [row] = await db.insert(pacsLogsTable).values({
+    message:          b.message.trim(),
+    severity:         VALID_SEV.includes(b.severity ?? "") ? b.severity! : "info",
+    source:           b.source ?? null,
+    eventType:        b.eventType ?? null,
+    logType:          b.logType ?? "dicom-event",
+    studyInstanceUid: b.studyInstanceUid ?? null,
+    accessionNumber:  b.accessionNumber ?? null,
+    patientId:        b.patientId ?? null,
+    modality:         b.modality ?? null,
+    payload:          payloadStr,
+    errorStack:       b.errorStack ?? null,
+  }).returning();
+
+  res.status(201).json(row);
+});
+
+// ── Orthanc OnStoredInstance webhook (low-latency auto-push) ──────────────────
+// POST /api/internal/radiology/orthanc-webhook   { orthancStudyId }
+//
+// The background /changes poller (lib/pacs/orthancChangesPoller.ts) is the
+// reliable baseline; this endpoint is the near-instant fast path, called by a
+// tiny Orthanc-side Lua hook (docker/orthanc/erp_notify.lua) the moment a study
+// stabilises. It fetches the study from Orthanc and runs the SAME intake
+// (incl. USG SR extraction) the poller uses, so the two paths are identical and
+// idempotent — a study pushed by both is upserted once.
+router.post("/radiology/orthanc-webhook", async (req, res): Promise<void> => {
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const orthancStudyId = typeof b.orthancStudyId === "string" ? b.orthancStudyId.trim() : "";
+  if (!orthancStudyId) {
+    res.status(400).json({ success: false, error: "orthancStudyId is required" });
+    return;
+  }
+  try {
+    const { ingestOrthancStudyId } = await import("../lib/pacs/orthancChangesPoller");
+    const ok = await ingestOrthancStudyId(orthancStudyId);
+    res.json({ success: ok });
+  } catch (err) {
+    logger.error({ err, orthancStudyId }, "orthanc-webhook ingest failed");
+    res.status(502).json({ success: false, error: "Ingest failed" });
+  }
+});
+
+// ── Worklist read endpoints ───────────────────────────────────────────────────
+// GET /api/internal/radiology/worklist?status=&modality=&date=
+router.get("/radiology/worklist", async (req, res) => {
+  const status = (req.query.status as string) || "";
+  const modality = (req.query.modality as string) || "";
+
+  const conds = [];
+  if (status && status !== "all") conds.push(eq(radiologyWorklistTable.status, status));
+  if (modality && modality !== "all") conds.push(eq(radiologyWorklistTable.modality, modality));
+
+  const rows = await db
+    .select()
+    .from(radiologyWorklistTable)
+    .where(conds.length > 0 ? and(...conds) : undefined)
+    .orderBy(sql`created_at DESC`)
+    .limit(200);
+
+  res.json(rows);
+});
+
+// GET /api/internal/radiology/resolve-open?orderId=&patientId=&uhid=&modality=&patientName=
+// Deep-link helper for Hope (and other partners): map a CARE order/patient/UHID to
+// the Reporting Workspace worklist id. Falls back to a filtered worklist path
+// when the MRI/CT study has not arrived in PACS yet.
+router.get("/radiology/resolve-open", async (req, res) => {
+  const orderIdRaw = req.query.orderId;
+  const patientIdRaw = req.query.patientId;
+  const uhid = typeof req.query.uhid === "string" ? req.query.uhid.trim() : null;
+  const modality = typeof req.query.modality === "string" ? req.query.modality : null;
+  const patientName = typeof req.query.patientName === "string" ? req.query.patientName : null;
+
+  const orderId = orderIdRaw != null && orderIdRaw !== "" ? Number(orderIdRaw) : null;
+  const patientId = patientIdRaw != null && patientIdRaw !== "" ? Number(patientIdRaw) : null;
+
+  const hasOrder = orderId != null && Number.isFinite(orderId);
+  const hasPatient = patientId != null && Number.isFinite(patientId);
+  if (!hasOrder && !hasPatient && !uhid) {
+    res.status(400).json({
+      error: "Provide orderId, patientId, and/or uhid",
+      fallbackPath: radiologyOpenFallbackPath({ modality, patientName }),
+    });
+    return;
+  }
+
+  try {
+    const target = await resolveRadiologyOpen({
+      orderId: hasOrder ? orderId : null,
+      patientId: hasPatient ? patientId : null,
+      modality,
+      uhid,
+    });
+
+    if (!target) {
+      res.status(404).json({
+        error: "No radiology study ready for reporting yet",
+        fallbackPath: radiologyOpenFallbackPath({ modality, patientName }),
+      });
+      return;
+    }
+
+    res.json({
+      ...target,
+      reportPath: `/radiology/report/${target.worklistId}`,
+      fallbackPath: radiologyOpenFallbackPath({ modality: target.modality || modality, patientName }),
+    });
+  } catch (err) {
+    logger.error({ err, orderId, patientId, uhid, modality }, "resolve-open failed");
+    res.status(500).json({
+      error: "Failed to resolve radiology open target",
+      fallbackPath: radiologyOpenFallbackPath({ modality, patientName }),
+    });
+  }
+});
+
+// POST /api/internal/radiology/send-report-to-hope
+// Push a finalized radiology report to Hope immediately (outbox + dispatch).
+router.post("/radiology/send-report-to-hope", async (req, res) => {
+  const reportId = req.body?.reportId != null ? Number(req.body.reportId) : null;
+  const worklistId = req.body?.worklistId != null ? Number(req.body.worklistId) : null;
+  if ((reportId == null || !Number.isFinite(reportId)) && (worklistId == null || !Number.isFinite(worklistId))) {
+    res.status(400).json({ error: "Provide reportId and/or worklistId" });
+    return;
+  }
+  try {
+    const { emitReportToHope } = await import("../services/integration/emitReportToHope");
+    const result = await emitReportToHope({
+      reportId: reportId != null && Number.isFinite(reportId) ? reportId : null,
+      worklistId: worklistId != null && Number.isFinite(worklistId) ? worklistId : null,
+      dispatchNow: true,
+    });
+    if (!result.ok) {
+      const status = result.code === "NOT_FOUND" ? 404
+        : result.code === "NOT_SIGNED" ? 409
+        : result.code === "NO_REFERRAL" ? 409
+        : 500;
+      res.status(status).json(result);
+      return;
+    }
+    res.json(result);
+  } catch (err) {
+    logger.error({ err, reportId, worklistId }, "send-report-to-hope failed");
+    res.status(500).json({ ok: false, error: "Failed to send report to Hope", code: "EMIT_FAILED" });
+  }
+});
+
+// GET /api/internal/radiology/worklist/:id
+router.get("/radiology/worklist/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+  let [row] = await db.select().from(radiologyWorklistTable).where(eq(radiologyWorklistTable.id, id));
+  if (!row) { res.status(404).json({ error: "Not found" }); return; }
+
+  let autoLinkMeta: { linked: boolean; studyId?: number; matchPoints?: number; matchScore?: string; reason?: string } | null = null;
+  if (row.patientId && !row.studyId) {
+    try {
+      const { autoLinkBilledStudyForWorklist } = await import("../lib/pacs/worklistBillingLink");
+      const link = await autoLinkBilledStudyForWorklist(id, "worklist-entry-load");
+      autoLinkMeta = link;
+      if (link.linked && link.studyId) {
+        row = { ...row, studyId: link.studyId };
+      }
+    } catch {
+      /* non-blocking */
+    }
+  }
+
+  let pacsArchiveStatus = "none";
+  let pacsArchiveResponse = null;
+  let pacsInstanceId = null;
+  let priority: string | null = null;
+  let billNumber: string | null = null;
+  let uhid: string | null = null;
+
+  if (row.studyId) {
+    const [study] = await db
+      .select({
+        pacsArchiveStatus: radiologyStudiesTable.pacsArchiveStatus,
+        pacsArchiveResponse: radiologyStudiesTable.pacsArchiveResponse,
+        pacsInstanceId: radiologyStudiesTable.pacsInstanceId,
+        // Phase D (Reading Room) — reuse existing columns, no schema change
+        priority: radiologyStudiesTable.priority,
+        billId: radiologyStudiesTable.billId,
+      })
+      .from(radiologyStudiesTable)
+      .where(eq(radiologyStudiesTable.id, row.studyId));
+
+    if (study) {
+      pacsArchiveStatus = study.pacsArchiveStatus || "none";
+      pacsArchiveResponse = study.pacsArchiveResponse;
+      pacsInstanceId = study.pacsInstanceId;
+      priority = study.priority ?? null;
+      if (study.billId) {
+        const [bill] = await db
+          .select({ billNumber: billsTable.billNumber })
+          .from(billsTable)
+          .where(eq(billsTable.id, study.billId));
+        billNumber = bill?.billNumber ?? null;
+      }
+    }
+  }
+
+  if (row.patientId) {
+    const [pat] = await db
+      .select({ uhid: patientsTable.patientId })
+      .from(patientsTable)
+      .where(eq(patientsTable.id, row.patientId));
+    uhid = pat?.uhid ?? null;
+  }
+
+  res.json({
+    ...row,
+    pacsArchiveStatus,
+    pacsArchiveResponse,
+    pacsInstanceId,
+    // Phase D additive fields (safe for old clients — extra keys ignored)
+    priority,
+    billNumber,
+    uhid,
+    autoLinkMeta,
+  });
+});
+
+// GET /api/internal/radiology/audit/:worklistId
+router.get("/radiology/audit/:worklistId", async (req, res) => {
+  const id = Number(req.params.worklistId);
+  if (!Number.isFinite(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+  const rows = await db
+    .select()
+    .from(radiologyAuditLogTable)
+    .where(eq(radiologyAuditLogTable.worklistId, id))
+    .orderBy(sql`created_at DESC`);
+  res.json(rows);
+});
+
+// GET /api/internal/radiology/templates — list available template names
+router.get("/radiology/templates", (_req, res) => {
+  res.json(Object.keys(RADIOLOGY_TEMPLATES).map((name) => ({ name })));
+});
+
+// ── DICOM Pull Job Agent Endpoints ────────────────────────────────────────────
+// These are called by the dicom-pull-agent service running on the Conquest
+// server machine. Auth: same INTERNAL_API_KEY bearer token.
+
+
+// GET /api/internal/dicom/pull-jobs/pending
+// The pull agent calls this every POLL_INTERVAL_MS to get queued jobs.
+// Returns jobs with status='pending', including the parent node details
+// so the agent has host/port/aeTitle/conquestAeTitle in one round-trip.
+router.get("/dicom/pull-jobs/pending", async (_req, res) => {
+  const jobs = await db.select().from(dicomPullJobsTable)
+    .where(eq(dicomPullJobsTable.status, "pending"))
+    .orderBy(dicomPullJobsTable.createdAt)
+    .limit(10);
+
+  if (jobs.length === 0) {
+    res.json({ jobs: [] });
+    return;
+  }
+
+  // Attach node details to each job
+  const nodeIds = [...new Set(jobs.map((j) => j.nodeId))];
+  const nodes = await db.select().from(dicomNodesTable)
+    .where(inArray(dicomNodesTable.id, nodeIds));
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+
+  res.json({
+    jobs: jobs.map((j) => ({ ...j, node: nodeMap.get(j.nodeId) ?? null })),
+  });
+});
+
+// PATCH /api/internal/dicom/pull-jobs/:jobId/claim
+// Agent calls this immediately before starting work to prevent duplicate processing.
+router.patch("/dicom/pull-jobs/:jobId/claim", async (req, res) => {
+  const jobId = Number(req.params.jobId);
+  if (!Number.isFinite(jobId)) {
+    res.status(400).json({ error: "Invalid jobId" });
+    return;
+  }
+  const [job] = await db.select().from(dicomPullJobsTable)
+    .where(eq(dicomPullJobsTable.id, jobId));
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  if (job.status !== "pending") {
+    // Another agent already claimed it
+    res.status(409).json({ error: `Job already in status '${job.status}'` });
+    return;
+  }
+  const agentId = String(req.body?.agentId ?? "unknown");
+  const [updated] = await db.update(dicomPullJobsTable).set({
+    status: "running",
+    agentId,
+    startedAt: new Date(),
+  }).where(eq(dicomPullJobsTable.id, jobId)).returning();
+  res.json(updated);
+});
+
+// PATCH /api/internal/dicom/pull-jobs/:jobId
+// Agent calls this when the job finishes (success, failed, or partial).
+router.patch("/dicom/pull-jobs/:jobId", async (req, res) => {
+  const jobId = Number(req.params.jobId);
+  if (!Number.isFinite(jobId)) {
+    res.status(400).json({ error: "Invalid jobId" });
+    return;
+  }
+  const [job] = await db.select().from(dicomPullJobsTable)
+    .where(eq(dicomPullJobsTable.id, jobId));
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  const b = req.body ?? {};
+  const status = ["completed", "failed", "partial"].includes(b.status) ? b.status : "failed";
+  const [updated] = await db.update(dicomPullJobsTable).set({
+    status,
+    studiesFound:       typeof b.studiesFound  === "number" ? b.studiesFound  : job.studiesFound,
+    studiesPulled:      typeof b.studiesPulled === "number" ? b.studiesPulled : job.studiesPulled,
+    studiesFailed:      typeof b.studiesFailed === "number" ? b.studiesFailed : job.studiesFailed,
+    studyInstanceUIDs:  typeof b.studyInstanceUIDs === "string" ? b.studyInstanceUIDs : job.studyInstanceUIDs,
+    errorMessage:       typeof b.errorMessage === "string" ? b.errorMessage : job.errorMessage,
+    agentId:            typeof b.agentId === "string" ? b.agentId : job.agentId,
+    completedAt:        new Date(),
+  }).where(eq(dicomPullJobsTable.id, jobId)).returning();
+
+  // Update the node's lastPullAt / lastPullStatus
+  const pullStatus = status === "completed" ? "success" : status === "partial" ? "partial" : "failed";
+  const pullMsg = status === "completed"
+    ? `${updated.studiesPulled ?? 0} studies pulled`
+    : updated.errorMessage ?? status;
+  await db.update(dicomNodesTable).set({
+    lastPullAt: new Date(),
+    lastPullStatus: pullStatus,
+    lastPullMessage: pullMsg,
+  }).where(eq(dicomNodesTable.id, job.nodeId));
+
+  res.json(updated);
+});
+
+// ── Helpers: DICOM formatting ─────────────────────────────────────────────────
+
+// Map internal gender strings → DICOM sex codes M / F / O (exact match only).
+function dicomSex(gender: string | null | undefined): "M" | "F" | "O" {
+  return genderToDicomSex(gender) ?? "O";
+}
+
+// ISO date string (YYYY-MM-DD) or null → DICOM date string (YYYYMMDD) or null
+function dicomDate(isoDate: string | null | undefined): string | null {
+  if (!isoDate) return null;
+  return isoDate.replace(/-/g, "").slice(0, 8);
+}
+
+// Date/timestamp → DICOM date (YYYYMMDD)
+function dicomDateFromTs(ts: Date | string | null | undefined): string | null {
+  if (!ts) return null;
+  const d = ts instanceof Date ? ts : new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const dy = String(d.getDate()).padStart(2, "0");
+  return `${y}${mo}${dy}`;
+}
+
+// Date/timestamp → DICOM time (HHMMSS)
+function dicomTimeFromTs(ts: Date | string | null | undefined): string | null {
+  if (!ts) return null;
+  const d = ts instanceof Date ? ts : new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  const h = String(d.getHours()).padStart(2, "0");
+  const m = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  return `${h}${m}${s}`;
+}
+
+// Build DICOM PatientName "LAST^FIRST"
+function dicomPatientName(firstName: string | null, lastName: string | null): string {
+  const last = (lastName ?? "").trim().toUpperCase();
+  const first = (firstName ?? "").trim().toUpperCase();
+  return last ? `${last}^${first}` : first;
+}
+
+// Map internal status → MWL status
+function toMwlStatus(internalStatus: string): string {
+  switch (internalStatus) {
+    case "scheduled": return "SCHEDULED";
+    case "in_progress": return "IN_PROGRESS";
+    case "acquired": return "COMPLETED";
+    case "reported_preliminary":
+    case "reported_final":
+    case "delivered": return "COMPLETED";
+    case "cancelled": return "CANCELLED";
+    default: return "SCHEDULED";
+  }
+}
+
+// Map MWL status → internal status
+function fromMwlStatus(mwlStatus: string): string {
+  switch (mwlStatus.toUpperCase()) {
+    case "SCHEDULED": return "scheduled";
+    case "ARRIVED":   return "scheduled";   // arrived but not scanning yet
+    case "IN_PROGRESS": return "in_progress";
+    case "COMPLETED": return "acquired";
+    case "CANCELLED": return "cancelled";
+    default: return "scheduled";
+  }
+}
+
+// ── GET /api/internal/radiology/mwl-orders ───────────────────────────────────
+//
+// Returns scheduled radiology orders in DICOM Modality Worklist (MWL) JSON.
+// Filters: status=SCHEDULED|IN_PROGRESS|all  modality=MR|CT|...  date=YYYY-MM-DD
+// Auth: Bearer INTERNAL_API_KEY
+
+router.get("/radiology/mwl-orders", async (req, res) => {
+  const mwlStatus = ((req.query.status as string) || "SCHEDULED").toUpperCase();
+  const modality  = (req.query.modality as string) || "";
+  const dateParam = (req.query.date as string) || "";
+
+  // Translate MWL status filter → internal status list
+  let internalStatuses: string[];
+  if (mwlStatus === "ALL") {
+    internalStatuses = ["scheduled", "in_progress", "acquired", "cancelled"];
+  } else if (mwlStatus === "COMPLETED") {
+    internalStatuses = ["acquired", "reported_preliminary", "reported_final", "delivered"];
+  } else if (mwlStatus === "IN_PROGRESS") {
+    internalStatuses = ["in_progress"];
+  } else if (mwlStatus === "CANCELLED") {
+    internalStatuses = ["cancelled"];
+  } else {
+    internalStatuses = ["scheduled"];
+  }
+
+  const conds = [
+    internalStatuses.length === 1
+      ? eq(radiologyStudiesTable.status, internalStatuses[0]!)
+      : sql`${radiologyStudiesTable.status} = ANY(${internalStatuses})`,
+  ];
+  if (modality && modality !== "all") {
+    conds.push(eq(radiologyStudiesTable.modality, modality));
+  }
+  if (dateParam) {
+    // dateParam = YYYY-MM-DD → filter by study_date
+    conds.push(eq(radiologyStudiesTable.studyDate, dateParam));
+  }
+
+  const rows = await db
+    .select({
+      id:                      radiologyStudiesTable.id,
+      accessionNumber:         radiologyStudiesTable.accessionNumber,
+      modality:                radiologyStudiesTable.modality,
+      studyDescription:        radiologyStudiesTable.studyDescription,
+      bodyPart:                radiologyStudiesTable.bodyPart,
+      scheduledAt:             radiologyStudiesTable.scheduledAt,
+      studyDate:               radiologyStudiesTable.studyDate,
+      status:                  radiologyStudiesTable.status,
+      scheduledStationAETitle: radiologyStudiesTable.scheduledStationAETitle,
+      referringDoctor:         radiologyStudiesTable.referringDoctor,
+      testId:                  radiologyStudiesTable.testId,
+      orderId:                 radiologyStudiesTable.orderId,
+      department:              radiologyStudiesTable.department,
+      // patient fields
+      patientDbId:   patientsTable.id,
+      patientUhid:   patientsTable.patientId,
+      firstName:     patientsTable.firstName,
+      lastName:      patientsTable.lastName,
+      gender:        patientsTable.gender,
+      dateOfBirth:   patientsTable.dateOfBirth,
+      phone:         patientsTable.phone,
+    })
+    .from(radiologyStudiesTable)
+    .leftJoin(patientsTable, eq(patientsTable.id, radiologyStudiesTable.patientId))
+    .where(and(...conds))
+    .orderBy(radiologyStudiesTable.scheduledAt)
+    .limit(500);
+
+  const mwlOrders = rows.map((r) => ({
+    orderId:                 r.id,
+    status:                  toMwlStatus(r.status),
+    internalStatus:          r.status,
+    // Patient demographics
+    patientId:               r.patientUhid ?? String(r.patientDbId ?? ""),
+    patientName:             dicomPatientName(r.firstName, r.lastName),
+    sex:                     dicomSex(r.gender),
+    patientSex:              dicomSex(r.gender),
+    patientBirthDate:        dicomDate(r.dateOfBirth),
+    phone:                   r.phone ?? null,
+    // Study identification
+    accessionNumber:         r.accessionNumber,
+    testId:                  r.testId,
+    modality:                r.modality,
+    studyDescription:        r.studyDescription ?? null,
+    bodyPart:                r.bodyPart ?? null,
+    referringDoctor:         r.referringDoctor ?? null,
+    // Schedule
+    scheduledDate:           dicomDateFromTs(r.scheduledAt),
+    scheduledTime:           dicomTimeFromTs(r.scheduledAt),
+    scheduledStationAETitle: r.scheduledStationAETitle ?? null,
+    department:              r.department ?? null,
+  }));
+
+  res.json(mwlOrders);
+});
+
+// ── POST /api/internal/radiology/mwl-order-status ────────────────────────────
+//
+// Update status of a radiology order from an MWL lifecycle event.
+// Body: { orderId?, accessionNumber?, status, actor? }
+// Valid statuses: SCHEDULED, ARRIVED, IN_PROGRESS, COMPLETED, CANCELLED
+// Auth: Bearer INTERNAL_API_KEY
+
+router.post("/radiology/mwl-order-status", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    orderId?:        number;
+    accessionNumber?: string;
+    status?:         string;
+    actor?:          string;
+  };
+
+  const VALID_MWL = ["SCHEDULED", "ARRIVED", "IN_PROGRESS", "COMPLETED", "CANCELLED"];
+  const mwlStatus = b.status?.toUpperCase().trim();
+  if (!mwlStatus || !VALID_MWL.includes(mwlStatus)) {
+    res.status(400).json({
+      error: `status is required and must be one of: ${VALID_MWL.join(", ")}`,
+    });
+    return;
+  }
+
+  // Locate the study
+  let study: typeof radiologyStudiesTable.$inferSelect | undefined;
+  if (b.orderId) {
+    const [r] = await db
+      .select()
+      .from(radiologyStudiesTable)
+      .where(eq(radiologyStudiesTable.id, b.orderId));
+    study = r;
+  }
+  if (!study && b.accessionNumber) {
+    const [r] = await db
+      .select()
+      .from(radiologyStudiesTable)
+      .where(eq(radiologyStudiesTable.accessionNumber, b.accessionNumber.trim()));
+    study = r;
+  }
+  if (!study) {
+    res.status(404).json({ error: "Radiology order not found — supply orderId or accessionNumber" });
+    return;
+  }
+
+  const internalStatus = fromMwlStatus(mwlStatus);
+  const updates: Partial<typeof radiologyStudiesTable.$inferInsert> = {
+    status: internalStatus,
+    updatedAt: new Date(),
+  };
+  if (internalStatus === "in_progress" && !study.startedAt) updates.startedAt = new Date();
+  if (internalStatus === "acquired"    && !study.acquiredAt) updates.acquiredAt = new Date();
+
+  const [updated] = await db
+    .update(radiologyStudiesTable)
+    .set(updates)
+    .where(eq(radiologyStudiesTable.id, study.id))
+    .returning();
+
+  // Agent-reported CANCELLED → drop Orthanc .wl + scheduled procedure (best-effort).
+  if (mwlStatus === "CANCELLED" && updated.accessionNumber) {
+    cancelRadiologyMwlByAccession(updated.accessionNumber, "mwl-order-status CANCELLED").catch((err) => {
+      logger.warn({ err, accessionNumber: updated.accessionNumber }, "MWL cancel after mwl-order-status failed");
+    });
+  }
+
+  await audit({
+    accessionNumber: study.accessionNumber,
+    action: "MWL_STATUS_UPDATED",
+    actor: b.actor ?? "mwl-agent",
+    details: { from: study.status, to: internalStatus, mwlStatus },
+  });
+
+  res.json({
+    orderId:        updated.id,
+    accessionNumber: updated.accessionNumber,
+    internalStatus: updated.status,
+    mwlStatus:      toMwlStatus(updated.status),
+  });
+});
+
+// ── DICOM Pull Agent — internal endpoints ─────────────────────────────────────
+// POST /api/internal/dicom-agent/heartbeat
+// Called by the pull agent at the end of every poll cycle. Upserts the status
+// row for (agentName, agentHost). Also optionally logs a HEARTBEAT event.
+
+router.post("/dicom-agent/heartbeat", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    agentName?: string;
+    agentHost?: string;
+    sourceAeTitle?: string;
+    sourceIp?: string;
+    modality?: string;
+    status?: string;
+    message?: string;
+    stats?: {
+      studiesFoundToday?: number;
+      studiesPulledToday?: number;
+      failedToday?: number;
+    };
+  };
+
+  const agentName = b.agentName?.trim() || "default";
+  const agentHost = b.agentHost?.trim() || "unknown";
+  const now = new Date();
+  const statusUpper = (b.status ?? "INFO").toUpperCase();
+  const isError = statusUpper === "FAILED";
+  const isSuccess = statusUpper === "SUCCESS";
+
+  const [existing] = await db
+    .select({ id: dicomPullAgentStatusTable.id })
+    .from(dicomPullAgentStatusTable)
+    .where(
+      and(
+        eq(dicomPullAgentStatusTable.agentName, agentName),
+        eq(dicomPullAgentStatusTable.agentHost, agentHost),
+      ),
+    )
+    .limit(1);
+
+  type StatusPatch = Partial<typeof dicomPullAgentStatusTable.$inferInsert>;
+  const patch: StatusPatch = {
+    lastHeartbeatAt: now,
+    isOnline: true,
+  };
+  if (isSuccess) patch.lastSuccessfulPullAt = now;
+  if (isError) {
+    patch.lastErrorAt = now;
+    patch.lastErrorMessage = b.message ?? null;
+  }
+  if (b.stats?.studiesFoundToday  !== undefined) patch.studiesFoundToday  = b.stats.studiesFoundToday;
+  if (b.stats?.studiesPulledToday !== undefined) patch.studiesPulledToday = b.stats.studiesPulledToday;
+  if (b.stats?.failedToday        !== undefined) patch.failedToday        = b.stats.failedToday;
+
+  if (existing) {
+    await db.update(dicomPullAgentStatusTable)
+      .set(patch)
+      .where(eq(dicomPullAgentStatusTable.id, existing.id));
+  } else {
+    await db.insert(dicomPullAgentStatusTable).values({
+      agentName,
+      agentHost,
+      lastHeartbeatAt: now,
+      isOnline: true,
+      lastSuccessfulPullAt: isSuccess ? now : null,
+      lastErrorAt: isError ? now : null,
+      lastErrorMessage: isError ? (b.message ?? null) : null,
+      studiesFoundToday:  b.stats?.studiesFoundToday  ?? 0,
+      studiesPulledToday: b.stats?.studiesPulledToday ?? 0,
+      failedToday:        b.stats?.failedToday        ?? 0,
+    });
+  }
+
+  // Optional: log the heartbeat itself so operators can see pulse in the log table.
+  if (b.message) {
+    try {
+      await db.insert(dicomPullAgentLogsTable).values({
+        agentName,
+        agentHost,
+        eventType: "HEARTBEAT",
+        sourceAeTitle: b.sourceAeTitle ?? null,
+        sourceIp:      b.sourceIp      ?? null,
+        modality:      b.modality      ?? null,
+        status:        statusUpper,
+        message:       b.message,
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  res.json({ ok: true, agentName, agentHost });
+});
+
+// POST /api/internal/dicom-agent/log
+// Called by the pull agent for every operational event (C-ECHO, C-FIND, C-MOVE,
+// C-STORE, ERP_POST, etc.). Also side-effects the status row when relevant.
+
+router.post("/dicom-agent/log", async (req, res) => {
+  const b = (req.body ?? {}) as {
+    agentName?: string;
+    agentHost?: string;
+    eventType?: string;
+    sourceAeTitle?: string;
+    sourceIp?: string;
+    modality?: string;
+    studyInstanceUID?: string;
+    accessionNumber?: string;
+    patientName?: string;
+    patientId?: string | number;
+    status?: string;
+    message?: string;
+    rawPayload?: unknown;
+  };
+
+  if (!b.eventType?.trim() || !b.message?.trim()) {
+    res.status(400).json({ error: "eventType and message are required" });
+    return;
+  }
+
+  const agentName   = b.agentName?.trim()   || "default";
+  const agentHost   = b.agentHost?.trim()   || "unknown";
+  const statusUpper = (b.status ?? "INFO").toUpperCase();
+  const eventType   = b.eventType.toUpperCase();
+
+  const [inserted] = await db.insert(dicomPullAgentLogsTable).values({
+    agentName,
+    agentHost,
+    eventType,
+    sourceAeTitle: b.sourceAeTitle ?? null,
+    sourceIp:      b.sourceIp      ?? null,
+    modality:      b.modality?.toUpperCase() ?? null,
+    studyInstanceUID: b.studyInstanceUID ?? null,
+    accessionNumber:  b.accessionNumber  ?? null,
+    patientName:   b.patientName ?? null,
+    patientId:     b.patientId !== undefined ? String(b.patientId) : null,
+    status:        statusUpper,
+    message:       b.message,
+    rawPayload:    b.rawPayload ? JSON.stringify(b.rawPayload) : null,
+  }).returning({ id: dicomPullAgentLogsTable.id });
+
+  // Side-effect: update status row if applicable
+  if (statusUpper === "FAILED") {
+    try {
+      await db.update(dicomPullAgentStatusTable)
+        .set({ lastErrorAt: new Date(), lastErrorMessage: b.message ?? null })
+        .where(and(
+          eq(dicomPullAgentStatusTable.agentName, agentName),
+          eq(dicomPullAgentStatusTable.agentHost, agentHost),
+        ));
+    } catch { /* non-fatal */ }
+  }
+  if (statusUpper === "SUCCESS" && (eventType === "C_MOVE" || eventType === "C_GET" || eventType === "C_STORE")) {
+    try {
+      await db.update(dicomPullAgentStatusTable)
+        .set({ lastSuccessfulPullAt: new Date() })
+        .where(and(
+          eq(dicomPullAgentStatusTable.agentName, agentName),
+          eq(dicomPullAgentStatusTable.agentHost, agentHost),
+        ));
+    } catch { /* non-fatal */ }
+  }
+
+  res.json({ ok: true, id: inserted?.id ?? null });
+});
+
+// ── GET /api/internal/dicom-agent/config ─────────────────────────────────────
+// Returns the full pull-agent configuration so the Windows/local agent can
+// auto-fetch it every 5 minutes without manual config.json editing.
+// Reads from dicomNodesTable (the new unified schema) and maps fields to the
+// shape expected by both the legacy Windows agent and the new local bridge.
+router.get("/dicom-agent/config", requireInternalApiKey, async (_req, res) => {
+  const [settingsRows, nodes] = await Promise.all([
+    db.select().from(pacsSettingsTable).where(eq(pacsSettingsTable.category, "conquest")),
+    db.select().from(dicomNodesTable)
+      .where(eq(dicomNodesTable.isActive, true))
+      .orderBy(dicomNodesTable.aeTitle),
+  ]);
+
+  const sm: Record<string, string> = {};
+  for (const row of settingsRows) {
+    if (row.key && row.value != null) sm[row.key] = row.value;
+  }
+
+  // Map dicomNodesTable fields to the modality shape the agent expects
+  const modalities = nodes.map((n) => ({
+    id: n.id,
+    machineName: n.aeTitle,
+    aeTitle: n.aeTitle,
+    ipAddress: n.host,
+    host: n.host,
+    port: n.port,
+    modality: n.modality,
+    location: n.location,
+    description: n.description,
+    isActive: n.isActive,
+    autoPull: n.autoPull,
+    pullIntervalSeconds: n.pullIntervalSeconds,
+    queryLookbackHours: n.queryLookbackHours,
+    conquestAeTitle: n.conquestAeTitle,
+    conquestHost: n.conquestHost,
+    conquestPort: n.conquestPort,
+    preferredRetrieveMethod: n.preferredRetrieveMethod,
+    watchFolderPath: n.watchFolderPath ?? "",
+    processedFolderPath: n.processedFolderPath ?? "",
+    failedFolderPath: n.failedFolderPath ?? "",
+    name: n.name ?? n.aeTitle,
+    allowNonDicomImages: n.allowNonDicomImages ?? false,
+    maxUploadSizeMB: n.maxUploadSizeMB ?? 512,
+    thumbnailPreview: n.thumbnailPreview ?? true,
+    multiFrameSupport: n.multiFrameSupport ?? true,
+  }));
+
+  res.json({
+    conquest: {
+      host:    sm["conquest_host"]    ?? "127.0.0.1",
+      port:    Number(sm["conquest_port"]    ?? 5678),
+      aeTitle: sm["conquest_ae"]      ?? "CONQUEST1",
+    },
+    modalities,
+    pullSettings: {
+      pollIntervalMs:     Number(sm["pull_interval_ms"]     ?? 300_000),
+      agentAeTitle:       sm["agent_ae_title"]              ?? "DIAGNO_AGENT",
+      maxConcurrentJobs:  Number(sm["max_concurrent_jobs"]  ?? 3),
+    },
+    erpSettings: {
+      heartbeatEndpoint: "/api/internal/dicom-agent/heartbeat",
+      logEndpoint:       "/api/internal/dicom-agent/log",
+      configEndpoint:    "/api/internal/dicom-agent/config",
+    },
+  });
+});
+
+// ── GET /api/internal/radiology/retention-policy ─────────────────────────────
+// Polled by care-pacs orthanc-retention sidecar. Default OFF.
+router.get("/radiology/retention-policy", requireInternalApiKey, async (_req, res) => {
+  const rows = await db
+    .select({ key: pacsSettingsTable.key, value: pacsSettingsTable.value })
+    .from(pacsSettingsTable)
+    .where(
+      or(
+        eq(pacsSettingsTable.key, "orthanc_auto_retention_enabled"),
+        eq(pacsSettingsTable.key, "orthanc_retention_keep_studies"),
+        eq(pacsSettingsTable.key, "orthanc_retention_cleanup_trigger"),
+      )!,
+    );
+
+  const map = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  const enabled = map.orthanc_auto_retention_enabled === "true";
+  const keepStudies = Number(map.orthanc_retention_keep_studies ?? 500);
+  const cleanupTrigger = Number(map.orthanc_retention_cleanup_trigger ?? 520);
+  res.json({
+    enabled,
+    keepStudies: Number.isFinite(keepStudies) && keepStudies > 0 ? keepStudies : 500,
+    cleanupTrigger: Number.isFinite(cleanupTrigger) && cleanupTrigger > 0 ? cleanupTrigger : 520,
+  });
+});
+
+// ── POST /api/internal/radiology/purge-reconcile ─────────────────────────────
+// After Orthanc DELETE by the retention sidecar, scrub matching ERP cache rows.
+router.post("/radiology/purge-reconcile", requireInternalApiKey, async (req, res) => {
+  try {
+    const { scrubErpStudyCache, logPurgeEvent } = await import("../lib/pacs/orthancPurge");
+    const body = req.body as { studyInstanceUIDs?: unknown };
+    const uids = Array.isArray(body.studyInstanceUIDs)
+      ? body.studyInstanceUIDs.map((u) => String(u || "").trim()).filter(Boolean)
+      : [];
+    if (uids.length === 0) {
+      res.status(400).json({ error: "studyInstanceUIDs array required" });
+      return;
+    }
+    const erp = await scrubErpStudyCache(uids);
+    await logPurgeEvent({
+      message: `ERP reconcile after Orthanc retention: ${uids.length} UIDs`,
+      studyInstanceUIDs: uids,
+      payload: { erp, count: uids.length },
+      severity: "info",
+    });
+    res.json({ ok: true, count: uids.length, erp });
+  } catch (err) {
+    logger.error({ err }, "purge-reconcile failed");
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ── GET /api/internal/radiology/mwl ──────────────────────────────────────────
+// Structured MWL JSON for the Windows DICOM MWL SCP agent.
+// Returns scheduled procedures so the agent can serve DICOM C-FIND responses
+// to imaging equipment (MRI, CT, X-Ray, Ultrasound).
+// Protected by Bearer INTERNAL_API_KEY (requireInternalApiKey middleware).
+router.get("/radiology/mwl", async (req, res) => {
+  const { modality, date, status } = req.query as Record<string, string | undefined>;
+
+  const conds = [];
+  // Default: only scheduled + sent_to_mwl (not yet completed/cancelled)
+  const statusFilter = status?.toUpperCase() ?? "ACTIVE";
+  if (statusFilter === "ACTIVE") {
+    conds.push(
+      or(
+        eq(radiologyScheduledProceduresTable.status, "SCHEDULED"),
+        eq(radiologyScheduledProceduresTable.status, "SENT_TO_MWL"),
+      )!,
+    );
+  } else if (statusFilter !== "ALL") {
+    conds.push(eq(radiologyScheduledProceduresTable.status, statusFilter));
+  }
+  if (modality) conds.push(eq(radiologyScheduledProceduresTable.modality, modality.toUpperCase()));
+  if (date) {
+    const compact = date.replace(/-/g, "");
+    conds.push(eq(radiologyScheduledProceduresTable.scheduledDate, compact));
+  }
+
+  const rows = await db
+    .select()
+    .from(radiologyScheduledProceduresTable)
+    .where(conds.length ? and(...conds) : undefined)
+    .orderBy(desc(radiologyScheduledProceduresTable.createdAt))
+    .limit(500);
+
+  // Map to DICOM MWL-compatible field names
+  const procedures = rows.map((r) => ({
+    accessionNumber:             r.accessionNumber,
+    studyDescription:            r.studyDescription ?? r.procedureName ?? "",
+    requestedProcedureId:        r.procedureCode ?? r.accessionNumber,
+    requestedProcedureDescription: r.procedureName ?? r.studyDescription ?? "",
+    modality:                    r.modality ?? "OT",
+    scheduledDate:               r.scheduledDate ?? "",
+    scheduledTime:               r.scheduledTime ?? "",
+    stationAeTitle:              r.stationAeTitle ?? "",
+    bodyPartExamined:            r.bodyPartExamined ?? "",
+    patientName:                 (r.patientName ?? "").toUpperCase().replace(/\s+/g, "^"),
+    patientId:                   r.patientId ?? "",
+    patientSex:                  sanitizeDicomSex(r.patientSex) ?? "",
+    sex:                         sanitizeDicomSex(r.patientSex) ?? "",
+    patientDob:                  (r.patientDob ?? "").replace(/-/g, ""),
+    patientAge:                  r.patientAge ?? "",
+    referringPhysicianName:      (r.referringDoctor ?? "").toUpperCase().replace(/\s+/g, "^"),
+    status:                      r.status,
+    sourceBillId:                r.sourceBillId ?? null,
+    sourceOrderId:               r.sourceOrderId ?? null,
+    id:                          r.id,
+  }));
+
+  res.json({
+    count: procedures.length,
+    fetchedAt: new Date().toISOString(),
+    procedures,
+  });
+});
+
+export default router;

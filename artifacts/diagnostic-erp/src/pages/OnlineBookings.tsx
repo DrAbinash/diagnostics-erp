@@ -1,0 +1,940 @@
+import { useMemo, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/fetchApi";
+import PageHeader from "@/components/PageHeader";
+import { WhatsAppDeliveryQueuePanel } from "@/components/WhatsAppDeliveryQueuePanel";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { useToast } from "@/hooks/use-toast";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  Search, RefreshCw, CheckCircle2, XCircle, Eye, Globe, Star,
+  CreditCard, Phone, Calendar, FileText, User, Clock, Plus, Copy, MessageCircle,
+  Pencil, Stethoscope,
+} from "lucide-react";
+import { Link } from "wouter";
+import { NewOnlineBookingDialog } from "./NewOnlineBookingDialog";
+import { copyTextRobust } from "@/lib/copyTextRobust";
+import { Label } from "@/components/ui/label";
+
+type CatalogTest = { id: number; code: string; name: string; category: string; price: string };
+type CatalogPkg = { id: number; code: string; name: string; price: string };
+
+function parseBookingIdList(raw: string | null | undefined): number[] {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function bookingWhatsAppPaymentUrl(phone: string, bookingRef: string, paymentUrl: string) {
+  const digits = phone.replace(/\D/g, "");
+  const withCountry = digits.length === 10 ? `91${digits}` : digits;
+  const text = `Care Diagnostics — payment link for booking ${bookingRef}:\n${paymentUrl}`;
+  return withCountry
+    ? `https://wa.me/${withCountry}?text=${encodeURIComponent(text)}`
+    : `https://wa.me/?text=${encodeURIComponent(text)}`;
+}
+
+
+type OnlineBooking = {
+  id: number;
+  bookingRef: string;
+  name: string;
+  phone: string;
+  email: string;
+  selectedDate: string;
+  timeSlot: string;
+  testIds: string;
+  packageIds: string;
+  totalAmount: string;
+  notes: string;
+  isVip: boolean;
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
+  status: string;
+  patientId: number | null;
+  billId: number | null;
+  confirmedByName: string | null;
+  confirmedAt: string | null;
+  createdAt: string;
+  source?: string;
+  referringDoctorId?: number | null;
+  referringDoctorName?: string | null;
+};
+
+type Doctor = { id: number; name: string; specialization?: string | null };
+
+const STATUS_COLORS: Record<string, string> = {
+  pending_payment: "bg-yellow-100 text-yellow-800 border-yellow-300",
+  paid:            "bg-blue-100 text-blue-800 border-blue-300",
+  confirmed:       "bg-emerald-100 text-emerald-800 border-emerald-300",
+  payment_failed: "bg-red-100 text-red-800 border-red-300",
+  cancelled:       "bg-gray-100 text-gray-800 border-gray-300",
+};
+
+const STATUS_LABELS: Record<string, string> = {
+  pending_payment: "Pending Payment",
+  paid:            "Paid – Awaiting Confirm",
+  confirmed:       "Confirmed",
+  cancelled:       "Cancelled",
+  payment_failed:  "Payment Failed",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  website: "Website",
+  kiosk: "Kiosk",
+  reception: "Reception",
+  phone: "Phone",
+};
+
+export default function OnlineBookingsPage() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const [status, setStatus] = useState("all");
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<OnlineBooking | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [newOpen, setNewOpen] = useState(false);
+  const [shareLink, setShareLink] = useState<{
+    url: string;
+    bookingRef: string;
+    phone: string;
+    copied: boolean;
+  } | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editPhone, setEditPhone] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+  const [editDoctorId, setEditDoctorId] = useState<number | null>(null);
+  const [editDoctorSearch, setEditDoctorSearch] = useState("");
+  const [editDoctorSearchOpen, setEditDoctorSearchOpen] = useState(false);
+  const [editTestIds, setEditTestIds] = useState<Set<number>>(new Set());
+  const [editPkgIds, setEditPkgIds] = useState<Set<number>>(new Set());
+  const [editTestQuery, setEditTestQuery] = useState("");
+
+  async function createAndShowPaymentShare(booking: {
+    id: number;
+    bookingRef: string;
+    phone: string;
+  }) {
+    const r = await api.post<{ url: string; linkId: string }>(
+      `/api/online-bookings/${booking.id}/payment-link`,
+      {},
+    );
+    if (!r.url) {
+      throw new Error("Payment link created but no URL was returned");
+    }
+    // Always open the dialog with the real URL. On http://NAS clipboard often
+    // fails — never claim "copied" unless copyTextRobust actually succeeded
+    // (otherwise staff paste a leftover screenshot).
+    const copied = await copyTextRobust(r.url);
+    setShareLink({
+      url: r.url,
+      bookingRef: booking.bookingRef,
+      phone: booking.phone,
+      copied,
+    });
+    return { url: r.url, copied };
+  }
+
+  const { data, isFetching, refetch } = useQuery<{ bookings: OnlineBooking[] }>({
+    queryKey: ["online-bookings", status, search],
+    queryFn: () => {
+      const p = new URLSearchParams();
+      if (status !== "all") p.set("status", status);
+      if (search.trim()) p.set("search", search.trim());
+      return api.get(`/api/online-bookings?${p.toString()}`);
+    },
+    refetchInterval: 30_000,
+  });
+
+  const { data: doctorsPayload } = useQuery<{ doctors: Doctor[] }>({
+    queryKey: ["doctors"],
+    queryFn: () => api.get("/api/doctors"),
+    staleTime: 60_000,
+  });
+  const doctors = doctorsPayload?.doctors ?? [];
+
+  const { data: catalog } = useQuery<{ tests: CatalogTest[]; packages: CatalogPkg[] }>({
+    queryKey: ["online-bookings-catalog"],
+    queryFn: () => api.get("/api/online-bookings/catalog"),
+    enabled: editOpen || !!selected,
+    staleTime: 60_000,
+  });
+  const catalogTests = catalog?.tests ?? [];
+  const catalogPkgs = catalog?.packages ?? [];
+
+  const bookings = data?.bookings ?? [];
+
+  function openEdit(b: OnlineBooking) {
+    setSelected(b);
+    setEditName(b.name);
+    setEditPhone(b.phone);
+    setEditNotes(b.notes || "");
+    setEditDoctorId(b.referringDoctorId ?? null);
+    setEditDoctorSearch(b.referringDoctorName || (b.referringDoctorId ? "" : "Walk-in / Self"));
+    setEditDoctorSearchOpen(false);
+    setEditTestIds(new Set(parseBookingIdList(b.testIds)));
+    setEditPkgIds(new Set(parseBookingIdList(b.packageIds)));
+    setEditTestQuery("");
+    setEditOpen(true);
+  }
+
+  const canEditTests = selected?.status === "pending_payment";
+
+  const editFilteredTests = useMemo(() => {
+    const q = editTestQuery.trim().toLowerCase();
+    if (!q) return catalogTests;
+    return catalogTests.filter(
+      (t) =>
+        t.name.toLowerCase().includes(q) ||
+        t.code.toLowerCase().includes(q) ||
+        t.category.toLowerCase().includes(q),
+    );
+  }, [catalogTests, editTestQuery]);
+
+  const editTotal = useMemo(() => {
+    const t = catalogTests.filter((x) => editTestIds.has(x.id)).reduce((s, x) => s + Number(x.price), 0);
+    const p = catalogPkgs.filter((x) => editPkgIds.has(x.id)).reduce((s, x) => s + Number(x.price), 0);
+    return t + p;
+  }, [catalogTests, catalogPkgs, editTestIds, editPkgIds]);
+
+  const selectedInvestigations = useMemo(() => {
+    if (!selected) return [] as string[];
+    const testIds = parseBookingIdList(selected.testIds);
+    const pkgIds = parseBookingIdList(selected.packageIds);
+    const names: string[] = [];
+    for (const id of testIds) {
+      const t = catalogTests.find((x) => x.id === id);
+      names.push(t ? t.name : `Test #${id}`);
+    }
+    for (const id of pkgIds) {
+      const p = catalogPkgs.find((x) => x.id === id);
+      names.push(p ? `Package · ${p.name}` : `Package #${id}`);
+    }
+    return names;
+  }, [selected, catalogTests, catalogPkgs]);
+
+  const editMutation = useMutation({
+    mutationFn: (payload: {
+      id: number;
+      name: string;
+      phone: string;
+      notes: string;
+      referringDoctorId: number | null;
+      referringDoctorName: string;
+      testIds?: number[];
+      packageIds?: number[];
+    }) => {
+      const body: Record<string, unknown> = {
+        name: payload.name,
+        phone: payload.phone,
+        notes: payload.notes,
+        referringDoctorId: payload.referringDoctorId,
+        referringDoctorName: payload.referringDoctorName,
+      };
+      if (payload.testIds && payload.packageIds) {
+        body.testIds = payload.testIds;
+        body.packageIds = payload.packageIds;
+      }
+      return api.patch<OnlineBooking>(`/api/online-bookings/${payload.id}`, body);
+    },
+    onSuccess: (updated) => {
+      qc.invalidateQueries({ queryKey: ["online-bookings"] });
+      setSelected(updated);
+      setEditOpen(false);
+      toast({
+        title: "Booking updated",
+        description: `₹${Number(updated.totalAmount).toLocaleString("en-IN", { minimumFractionDigits: 2 })} · ${
+          updated.referringDoctorName?.trim() || "Walk-in / Self"
+        }`,
+      });
+    },
+    onError: (e: Error) => toast({ title: "Could not update", description: e.message, variant: "destructive" }),
+  });
+
+  const confirmMutation = useMutation({
+    mutationFn: (id: number) => api.post(`/api/online-bookings/${id}/confirm`, {}),
+    onSuccess: (res: { billId: number; billNumber?: string | null; dueAtCentre?: boolean }) => {
+      qc.invalidateQueries({ queryKey: ["online-bookings"] });
+      setConfirmOpen(false);
+      toast({
+        title: res.dueAtCentre ? "Booking confirmed — due at Billing Desk" : "Booking confirmed",
+        description: res.dueAtCentre
+          ? `Unpaid bill ${res.billNumber || `#${res.billId}`} created. Collect cash/UPI/card at Billing Desk — this does not post Online Collections.`
+          : `Bill ${res.billNumber || `#${res.billId}`} created and tokens issued.`,
+      });
+    },
+    onError: (e: Error) => toast({ title: "Error", description: e.message, variant: "destructive" }),
+  });
+
+  const cancelMutation = useMutation({
+    mutationFn: (id: number) => api.post(`/api/online-bookings/${id}/cancel`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["online-bookings"] });
+      setCancelOpen(false);
+      toast({ title: "Booking cancelled" });
+    },
+    onError: (e: Error) => toast({ title: "Error", description: e.message, variant: "destructive" }),
+  });
+
+  const paidCount = bookings.filter((b) => b.status === "paid").length;
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <PageHeader
+        title="Online Bookings"
+        subtitle={`Website, kiosk, phone and reception · ${paidCount > 0 ? `${paidCount} awaiting confirmation` : "All confirmed"}`}
+        actions={
+          <div className="flex items-center gap-2">
+            <Button size="sm" onClick={() => setNewOpen(true)}>
+              <Plus size={13} className="mr-1" />
+              New Booking
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
+              <RefreshCw size={13} className={`mr-1 ${isFetching ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
+          </div>
+        }
+      />
+
+      <WhatsAppDeliveryQueuePanel />
+
+      {/* Filter bar */}
+      <div className="bg-card border border-card-border rounded-xl p-4 flex flex-wrap items-center gap-3">
+        <Select value={status} onValueChange={setStatus}>
+          <SelectTrigger className="w-52"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="pending_payment">Pending Payment</SelectItem>
+            <SelectItem value="paid">Paid – Awaiting Confirm</SelectItem>
+            <SelectItem value="confirmed">Confirmed</SelectItem>
+            <SelectItem value="cancelled">Cancelled</SelectItem>
+            <SelectItem value="payment_failed">Payment Failed</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="relative flex-1 min-w-[220px] max-w-md">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="Search name, phone, ref…"
+            className="pl-9"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* Table */}
+      {bookings.length === 0 ? (
+        <div className="bg-card border border-card-border rounded-xl py-20 text-center">
+          <Globe size={32} className="mx-auto mb-3 text-muted-foreground/40" />
+          <p className="text-base font-medium">No online bookings found</p>
+          <p className="text-sm text-muted-foreground mt-1">
+            Bookings from the clinic website, kiosk, phone, and reception appear here.
+          </p>
+        </div>
+      ) : (
+        <div className="bg-card border border-card-border rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-card-border bg-muted/30 text-muted-foreground text-xs uppercase tracking-wide">
+                  <th className="px-4 py-3 text-left font-medium">Ref</th>
+                  <th className="px-4 py-3 text-left font-medium">Patient</th>
+                  <th className="px-4 py-3 text-left font-medium">Date</th>
+                  <th className="px-4 py-3 text-right font-medium">Amount</th>
+                  <th className="px-4 py-3 text-left font-medium">Status</th>
+                  <th className="px-4 py-3 text-left font-medium">Source</th>
+                  <th className="px-4 py-3 text-left font-medium">Booked</th>
+                  <th className="px-4 py-3 text-right font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-card-border">
+                {bookings.map((b) => (
+                  <tr key={b.id} className="hover:bg-muted/20 transition-colors">
+                    <td className="px-4 py-3">
+                      <div className="font-mono text-xs font-bold text-primary">{b.bookingRef}</div>
+                      {b.isVip && (
+                        <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-amber-600 mt-0.5">
+                          <Star size={9} className="fill-amber-500" /> VIP
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium">{b.name}</div>
+                      <div className="text-xs text-muted-foreground flex items-center gap-1">
+                        <Phone size={10} /> {b.phone}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1 text-muted-foreground">
+                        <Calendar size={12} />
+                        <span>{b.selectedDate}</span>
+                      </div>
+                      {b.timeSlot && (
+                        <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-1">
+                          <Clock size={10} /> {b.timeSlot}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right font-semibold tabular-nums">
+                      ₹{Number(b.totalAmount).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold border ${STATUS_COLORS[b.status] ?? "bg-zinc-100 text-zinc-700 border-zinc-300"}`}>
+                        {STATUS_LABELS[b.status] ?? b.status}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {SOURCE_LABELS[b.source || "website"] || b.source || "Website"}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {new Date(b.createdAt).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <Button
+                          size="sm" variant="ghost"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => { setSelected(b); }}
+                        >
+                          <Eye size={12} className="mr-1" /> View
+                        </Button>
+                        {(b.status === "pending_payment" || b.status === "paid") && (
+                          <Button
+                            size="sm" variant="outline"
+                            className="h-7 px-2 text-xs"
+                            data-testid="booking-edit"
+                            onClick={() => openEdit(b)}
+                          >
+                            <Pencil size={12} className="mr-1" /> Edit
+                          </Button>
+                        )}
+                        {b.status === "confirmed" && b.billId && (
+                          <Link href={`/billing/${b.billId}`}>
+                            <Button
+                              size="sm" variant="outline"
+                              className="h-7 px-2 text-xs text-teal-700 border-teal-300"
+                              title="Open bill to edit referring doctor"
+                            >
+                              <Stethoscope size={12} className="mr-1" /> Doctor
+                            </Button>
+                          </Link>
+                        )}
+                        {b.status === "paid" && (
+                          <Button
+                            size="sm" variant="default"
+                            className="h-7 px-2 text-xs bg-emerald-600 hover:bg-emerald-700"
+                            onClick={() => { setSelected(b); setConfirmOpen(true); }}
+                          >
+                            <CheckCircle2 size={12} className="mr-1" /> Confirm
+                          </Button>
+                        )}
+                        {b.status === "pending_payment" && (b.source === "reception" || b.source === "phone") && (
+                          <Button
+                            size="sm" variant="default"
+                            className="h-7 px-2 text-xs bg-emerald-600 hover:bg-emerald-700"
+                            onClick={() => { setSelected(b); setConfirmOpen(true); }}
+                          >
+                            <CheckCircle2 size={12} className="mr-1" /> Confirm (Pay at Centre)
+                          </Button>
+                        )}
+                        {(b.status === "paid" || b.status === "pending_payment") && (
+                          <Button
+                            size="sm" variant="outline"
+                            className="h-7 px-2 text-xs text-destructive border-destructive/30 hover:bg-destructive/10"
+                            onClick={() => { setSelected(b); setCancelOpen(true); }}
+                          >
+                            <XCircle size={12} className="mr-1" /> Cancel
+                          </Button>
+                        )}
+                        {b.status === "pending_payment" && (
+                          <Button
+                            size="sm" variant="outline"
+                            className="h-7 px-2 text-xs text-emerald-700 border-emerald-300 hover:bg-emerald-50"
+                            data-testid="booking-share-link"
+                            onClick={async () => {
+                              try {
+                                const { copied } = await createAndShowPaymentShare(b);
+                                toast({
+                                  title: "Payment link ready",
+                                  description: copied
+                                    ? "Link copied — open WhatsApp from the dialog to send it (do not paste a screenshot)."
+                                    : "Copy failed — use Copy or WhatsApp in the dialog.",
+                                });
+                              } catch (e: unknown) {
+                                toast({ title: "Error", description: (e as { message?: string }).message || "Could not create link", variant: "destructive" });
+                              }
+                            }}
+                          >
+                            <MessageCircle size={12} className="mr-1" /> Share Link
+                          </Button>
+                        )}
+                        {b.status === "confirmed" && b.billId && (
+                          <Link href={`/billing/${b.billId}`}>
+                            <Button size="sm" variant="outline" className="h-7 px-2 text-xs">
+                              <FileText size={12} className="mr-1" /> Bill
+                            </Button>
+                          </Link>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Detail drawer */}
+      {selected && !confirmOpen && !cancelOpen && !editOpen && (
+        <Dialog open onOpenChange={() => setSelected(null)}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Booking {selected.bookingRef}</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                <div><span className="text-muted-foreground">Name</span><p className="font-medium">{selected.name}</p></div>
+                <div><span className="text-muted-foreground">Phone</span><p className="font-medium">{selected.phone}</p></div>
+                <div><span className="text-muted-foreground">Email</span><p className="font-medium">{selected.email || "—"}</p></div>
+                <div><span className="text-muted-foreground">Date</span><p className="font-medium">{selected.selectedDate}</p>{selected.timeSlot && <p className="text-xs text-muted-foreground flex items-center gap-1 mt-0.5"><Clock size={10} />{selected.timeSlot}</p>}</div>
+                <div><span className="text-muted-foreground">Amount</span><p className="font-semibold text-primary">₹{Number(selected.totalAmount).toLocaleString("en-IN", { minimumFractionDigits: 2 })}</p></div>
+                <div><span className="text-muted-foreground">VIP</span><p>{selected.isVip ? <span className="text-amber-600 font-semibold flex items-center gap-1"><Star size={12} className="fill-amber-500" />Yes</span> : "No"}</p></div>
+                <div className="col-span-2">
+                  <span className="text-muted-foreground">Referring doctor</span>
+                  <p className="font-medium">{selected.referringDoctorName?.trim() || "Walk-in / Self"}</p>
+                </div>
+                <div className="col-span-2">
+                  <span className="text-muted-foreground">Investigations</span>
+                  {selectedInvestigations.length > 0 ? (
+                    <ul className="mt-1 space-y-0.5">
+                      {selectedInvestigations.map((name) => (
+                        <li key={name} className="font-medium">{name}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="font-medium text-muted-foreground">None listed</p>
+                  )}
+                </div>
+              </div>
+              {selected.notes && (
+                <div><span className="text-muted-foreground block mb-1">Notes</span><p className="bg-muted/40 rounded p-2 text-sm">{selected.notes}</p></div>
+              )}
+              <div>
+                <span className="text-muted-foreground block mb-1">Payment</span>
+                <div className="bg-muted/40 rounded p-2 text-xs font-mono space-y-0.5">
+                  <div>Order: {selected.razorpayOrderId || "—"}</div>
+                  <div>Payment: {selected.razorpayPaymentId || "—"}</div>
+                </div>
+              </div>
+              {selected.status === "confirmed" && (
+                <div className="flex gap-2 flex-wrap">
+                  {selected.patientId && (
+                    <Link href={`/patients/${selected.patientId}`}>
+                      <Button size="sm" variant="outline"><User size={12} className="mr-1" /> Patient</Button>
+                    </Link>
+                  )}
+                  {selected.billId && (
+                    <Link href={`/billing/${selected.billId}`}>
+                      <Button size="sm" variant="outline"><FileText size={12} className="mr-1" /> View Bill</Button>
+                    </Link>
+                  )}
+                  {selected.billId && (
+                    <Link href={`/billing/${selected.billId}`}>
+                      <Button size="sm" variant="outline" className="text-teal-700 border-teal-300">
+                        <Stethoscope size={12} className="mr-1" /> Edit Doctor on Bill
+                      </Button>
+                    </Link>
+                  )}
+                </div>
+              )}
+            </div>
+            <DialogFooter className="gap-2">
+              {(selected.status === "pending_payment" || selected.status === "paid") && (
+                <Button variant="outline" onClick={() => openEdit(selected)}>
+                  <Pencil size={14} className="mr-1.5" /> Edit
+                </Button>
+              )}
+              {selected.status === "paid" && (
+                <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => setConfirmOpen(true)}>
+                  <CheckCircle2 size={14} className="mr-1.5" /> Confirm & Issue Tokens
+                </Button>
+              )}
+              <Button variant="outline" onClick={() => setSelected(null)}>Close</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Confirm dialog */}
+      {selected && confirmOpen && (
+        <Dialog open onOpenChange={() => setConfirmOpen(false)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Confirm Online Booking</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-2 text-sm">
+              <p>Confirming <strong>{selected.bookingRef}</strong> for <strong>{selected.name}</strong> will:</p>
+              {(selected.source === "reception" || selected.source === "phone") && selected.status === "pending_payment" ? (
+                <ul className="list-disc ml-5 space-y-1 text-muted-foreground">
+                  <li>Create or link the patient record</li>
+                  <li>Create an order and an <strong className="text-foreground">unpaid bill</strong> (₹{Number(selected.totalAmount).toLocaleString("en-IN")} due)</li>
+                  <li>Not record a payment and not post Online Collections / ICICI</li>
+                  <li>Issue queue tokens {selected.isVip ? "(VIP priority)" : "(online queue)"}</li>
+                  <li>Collect cash / UPI / card later at Billing Desk — that is what posts accounts</li>
+                </ul>
+              ) : (
+                <ul className="list-disc ml-5 space-y-1 text-muted-foreground">
+                  <li>Create or link the patient record</li>
+                  <li>Create an order and a paid bill (₹{Number(selected.totalAmount).toLocaleString("en-IN")})</li>
+                  <li>Issue queue tokens {selected.isVip ? "(VIP priority)" : "(online queue)"}</li>
+                </ul>
+              )}
+              <p className="text-muted-foreground">Appointment date: <strong className="text-foreground">{selected.selectedDate}</strong>{selected.timeSlot && <> · <strong className="text-foreground">{selected.timeSlot}</strong></>}</p>
+            </div>
+            <DialogFooter>
+              <Button
+                className="bg-emerald-600 hover:bg-emerald-700"
+                onClick={() => confirmMutation.mutate(selected.id)}
+                disabled={confirmMutation.isPending}
+              >
+                <CheckCircle2 size={14} className="mr-1.5" />
+                {confirmMutation.isPending ? "Confirming…" : "Confirm Booking"}
+              </Button>
+              <Button variant="outline" onClick={() => setConfirmOpen(false)}>Cancel</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Cancel dialog */}
+      {selected && cancelOpen && (
+        <Dialog open onOpenChange={() => setCancelOpen(false)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Cancel Booking?</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">
+              Cancel <strong className="text-foreground">{selected.bookingRef}</strong> for {selected.name}?
+              The patient will need to be notified separately about any refund.
+            </p>
+            <DialogFooter>
+              <Button
+                variant="destructive"
+                onClick={() => cancelMutation.mutate(selected.id)}
+                disabled={cancelMutation.isPending}
+              >
+                {cancelMutation.isPending ? "Cancelling…" : "Yes, Cancel Booking"}
+              </Button>
+              <Button variant="outline" onClick={() => setCancelOpen(false)}>Keep Booking</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Edit booking — contact, doctor, notes, and investigations (pending payment) */}
+      {selected && editOpen && (
+        <Dialog open onOpenChange={(o) => { if (!o) setEditOpen(false); }}>
+          <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto" data-testid="booking-edit-dialog">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Pencil size={16} /> Edit booking {selected.bookingRef}
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3 text-sm">
+              <div>
+                <Label>Patient name</Label>
+                <Input className="mt-1" value={editName} onChange={(e) => setEditName(e.target.value)} />
+              </div>
+              <div>
+                <Label>Phone</Label>
+                <Input className="mt-1" value={editPhone} onChange={(e) => setEditPhone(e.target.value)} />
+              </div>
+              <div>
+                <Label className="flex items-center gap-1"><Stethoscope size={13} /> Referring doctor</Label>
+                <div className="relative mt-1">
+                  <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="Search doctor…"
+                    value={editDoctorSearch}
+                    onChange={(e) => { setEditDoctorSearch(e.target.value); setEditDoctorSearchOpen(true); }}
+                    onFocus={() => setEditDoctorSearchOpen(true)}
+                    onBlur={() => setTimeout(() => setEditDoctorSearchOpen(false), 150)}
+                    className="pl-9"
+                  />
+                  {editDoctorSearchOpen && (
+                    <div className="mt-1 border border-card-border rounded-lg bg-popover shadow-lg max-h-56 overflow-y-auto absolute z-50 w-full">
+                      <button
+                        type="button"
+                        className="w-full text-left px-3 py-2.5 hover:bg-muted/50 italic border-b border-border"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          setEditDoctorId(null);
+                          setEditDoctorSearch("Walk-in / Self");
+                          setEditDoctorSearchOpen(false);
+                        }}
+                      >
+                        Walk-in / Self (no referral)
+                      </button>
+                      {doctors
+                        .filter((d) => {
+                          const q = editDoctorSearch.trim().toLowerCase();
+                          if (!q || q === "walk-in / self") return true;
+                          return d.name.toLowerCase().includes(q) || (d.specialization || "").toLowerCase().includes(q);
+                        })
+                        .slice(0, 40)
+                        .map((d) => (
+                          <button
+                            key={d.id}
+                            type="button"
+                            className="w-full text-left px-3 py-2.5 hover:bg-muted/50"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              setEditDoctorId(d.id);
+                              setEditDoctorSearch(d.name);
+                              setEditDoctorSearchOpen(false);
+                            }}
+                          >
+                            <div className="font-medium">Dr. {d.name}</div>
+                            {d.specialization && (
+                              <div className="text-xs text-muted-foreground">{d.specialization}</div>
+                            )}
+                          </button>
+                        ))}
+                    </div>
+                  )}
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Add the doctor before Share Link / Confirm so commission tracks correctly.
+                </p>
+              </div>
+              <div>
+                <Label>Investigations</Label>
+                {canEditTests ? (
+                  <>
+                    <Input
+                      className="mt-1 mb-2"
+                      placeholder="Search tests…"
+                      value={editTestQuery}
+                      onChange={(e) => setEditTestQuery(e.target.value)}
+                      data-testid="booking-edit-test-search"
+                    />
+                    <div
+                      className="border rounded-lg max-h-44 overflow-y-auto divide-y"
+                      data-testid="booking-edit-investigations"
+                    >
+                      {editFilteredTests.map((t) => (
+                        <label key={t.id} className="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-muted/30">
+                          <input
+                            type="checkbox"
+                            checked={editTestIds.has(t.id)}
+                            onChange={() => {
+                              setEditTestIds((prev) => {
+                                const n = new Set(prev);
+                                if (n.has(t.id)) n.delete(t.id);
+                                else n.add(t.id);
+                                return n;
+                              });
+                            }}
+                          />
+                          <span className="flex-1 truncate">{t.name}</span>
+                          <span className="text-xs text-muted-foreground">₹{Number(t.price).toLocaleString("en-IN")}</span>
+                        </label>
+                      ))}
+                      {catalogPkgs.map((p) => (
+                        <label key={`pkg-${p.id}`} className="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-muted/30">
+                          <input
+                            type="checkbox"
+                            checked={editPkgIds.has(p.id)}
+                            onChange={() => {
+                              setEditPkgIds((prev) => {
+                                const n = new Set(prev);
+                                if (n.has(p.id)) n.delete(p.id);
+                                else n.add(p.id);
+                                return n;
+                              });
+                            }}
+                          />
+                          <span className="flex-1 truncate">Package · {p.name}</span>
+                          <span className="text-xs text-muted-foreground">₹{Number(p.price).toLocaleString("en-IN")}</span>
+                        </label>
+                      ))}
+                      {catalogTests.length === 0 && catalogPkgs.length === 0 && (
+                        <p className="px-3 py-2 text-muted-foreground">
+                          No online-booking catalogue configured. Add tests in Settings → Online Booking.
+                        </p>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1.5 flex justify-between">
+                      <span>{editTestIds.size + editPkgIds.size} selected</span>
+                      <span className="font-semibold text-foreground">
+                        Total ₹{editTotal.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                      </span>
+                    </p>
+                  </>
+                ) : (
+                  <div className="mt-1 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                    Payment already received — investigations are locked. Cancel and rebook to change tests, or adjust at Billing Desk after confirm.
+                    {selectedInvestigations.length > 0 && (
+                      <ul className="mt-1.5 space-y-0.5 text-foreground font-medium">
+                        {selectedInvestigations.map((name) => (
+                          <li key={name}>{name}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div>
+                <Label>Notes</Label>
+                <textarea
+                  rows={2}
+                  className="mt-1 w-full px-3 py-2 text-sm border border-input rounded-md bg-background"
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>Cancel</Button>
+              <Button
+                type="button"
+                disabled={
+                  editMutation.isPending ||
+                  editName.trim().length < 1 ||
+                  editPhone.replace(/\D/g, "").length < 10 ||
+                  (canEditTests && editTestIds.size + editPkgIds.size === 0)
+                }
+                onClick={() => {
+                  const doc = editDoctorId != null ? doctors.find((d) => d.id === editDoctorId) : undefined;
+                  editMutation.mutate({
+                    id: selected.id,
+                    name: editName.trim(),
+                    phone: editPhone.trim(),
+                    notes: editNotes,
+                    referringDoctorId: editDoctorId,
+                    referringDoctorName: doc?.name || "",
+                    ...(canEditTests
+                      ? { testIds: [...editTestIds], packageIds: [...editPkgIds] }
+                      : {}),
+                  });
+                }}
+              >
+                {editMutation.isPending ? "Saving…" : "Save"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      <NewOnlineBookingDialog
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        onCreated={async (booking, paymentChoice) => {
+          qc.invalidateQueries({ queryKey: ["online-bookings"] });
+          setNewOpen(false);
+          if (paymentChoice === "link") {
+            try {
+              const { copied } = await createAndShowPaymentShare({
+                id: booking.id,
+                bookingRef: booking.bookingRef,
+                phone: booking.phone || "",
+              });
+              toast({
+                title: "Booking saved · payment link ready",
+                description: copied
+                  ? `${booking.bookingRef} · Link copied. Use WhatsApp in the dialog to send the URL (not a screenshot).`
+                  : `${booking.bookingRef} · Use Copy or WhatsApp in the dialog.`,
+              });
+            } catch (e: unknown) {
+              toast({
+                title: "Booking saved",
+                description: `${booking.bookingRef} created, but the payment link could not be generated: ${(e as { message?: string }).message || "no gateway configured"}. Use Pay at Centre or Share Link from the list.`,
+              });
+            }
+          } else {
+            toast({
+              title: "Booking saved — pay at centre",
+              description: `${booking.bookingRef} is holding the slot. Confirm when the patient arrives to create an unpaid bill, then collect at Billing Desk.`,
+            });
+          }
+        }}
+      />
+
+      <Dialog open={shareLink !== null} onOpenChange={(o) => { if (!o) setShareLink(null); }}>
+        <DialogContent className="max-w-md" data-testid="booking-share-link-dialog">
+          <DialogHeader>
+            <DialogTitle>Share payment link</DialogTitle>
+          </DialogHeader>
+          {shareLink && (
+            <div className="space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                Booking <span className="font-semibold text-foreground">{shareLink.bookingRef}</span>
+                {shareLink.copied ? " · URL copied to clipboard" : " · copy the URL below"}
+              </p>
+              <Input
+                readOnly
+                value={shareLink.url}
+                className="font-mono text-xs"
+                onFocus={(e) => e.target.select()}
+              />
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                Send this URL in WhatsApp — do not paste a screenshot of a QR code.
+              </p>
+              <DialogFooter className="flex-col sm:flex-row gap-2 sm:justify-between">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="text-emerald-700 border-emerald-300"
+                  onClick={async () => {
+                    const ok = await copyTextRobust(shareLink.url);
+                    if (ok) {
+                      setShareLink({ ...shareLink, copied: true });
+                      toast({ title: "Copied", description: "Payment link copied as text — paste into WhatsApp." });
+                    } else {
+                      toast({
+                        title: "Copy failed",
+                        description: "Select the URL above and press Ctrl+C (LAN HTTP may block auto-copy).",
+                        variant: "destructive",
+                      });
+                    }
+                  }}
+                >
+                  <Copy size={14} className="mr-1" /> Copy link
+                </Button>
+                <Button
+                  type="button"
+                  className="bg-emerald-600 hover:bg-emerald-700"
+                  onClick={() => {
+                    window.open(
+                      bookingWhatsAppPaymentUrl(shareLink.phone, shareLink.bookingRef, shareLink.url),
+                      "_blank",
+                      "noopener,noreferrer",
+                    );
+                  }}
+                >
+                  <MessageCircle size={14} className="mr-1" /> WhatsApp
+                </Button>
+              </DialogFooter>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

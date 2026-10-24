@@ -1,0 +1,2162 @@
+import { Router } from "express";
+import crypto from "node:crypto";
+import rateLimit from "express-rate-limit";
+import { deriveBillTokenFromTestTokens } from "../lib/deriveBillToken";
+import { db } from "@workspace/db";
+import {
+  clinicSettingsTable,
+  testsTable,
+  packagesTable,
+  packageTestsTable,
+  onlineBookingsTable,
+  testTokensTable,
+  billsTable,
+  paymentsTable,
+  paymentLogsTable,
+  doctorsTable,
+} from "@workspace/db/schema";
+import {
+  createPendingOnlineBooking,
+  failPendingBooking,
+  generateBookingRef,
+  getSlotAvailability,
+  OnlineBookingError,
+  type CreatePendingBookingInput,
+} from "../services/onlineBookingCreate";
+import {
+  parseBookingTimeSlots,
+  validateSelfRegistration as validateSelfRegistrationShared,
+} from "../services/onlineBookingSlots";
+import { eq, and, or, inArray } from "drizzle-orm";
+import { logger } from "../lib/logger";
+import { PaymentEngine } from "../lib/payments/PaymentEngine";
+import { resolveActiveGateway } from "../lib/payments/resolveActiveGateway";
+import { buildPrintClinic } from "../lib/buildPrintClinic";
+import { recordPaymentDiagnostic, getRecentDiagnostics, getDiagnosticById, getLastSuccessAndFailure } from "../lib/payments/paymentDiagnostics";
+import { confirmBookingInternal } from "./online-bookings";
+import { autoVoucherForPayment } from "../lib/auto-voucher";
+import { getIciciPublicBaseUrl } from "../lib/payments/iciciPublicBaseUrl";
+import { assembleIciciRedirectUrl } from "../lib/payments/initiateIciciOrangePayment";
+import { resolveBillDeskCollector } from "../lib/payments/resolveBillDeskCollector";
+import { assertOnlineBookingFullPayment, paiseToRupees, rupeesToPaise } from "../lib/financialIntegrity";
+
+/** Canonical frozen amount stored on the booking (catalog / server-side). */
+function frozenBookingAmount(booking: { totalAmount: unknown }): number {
+  return paiseToRupees(rupeesToPaise(booking.totalAmount));
+}
+
+/** Returns null when captured payment matches the frozen booking amount. */
+function capturedMatchesFrozen(booking: { totalAmount: unknown }, captured: unknown): string | null {
+  return assertOnlineBookingFullPayment({
+    frozenAmount: frozenBookingAmount(booking),
+    capturedAmount: captured,
+  });
+}
+
+export const validateSelfRegistration = validateSelfRegistrationShared;
+
+export function calculateDobFromAge(ageValue: number, ageUnit: string): string {
+  const now = new Date();
+  if (ageUnit.toLowerCase() === "months") {
+    now.setMonth(now.getMonth() - ageValue);
+  } else if (ageUnit.toLowerCase() === "days") {
+    now.setDate(now.getDate() - ageValue);
+  } else {
+    // years
+    now.setFullYear(now.getFullYear() - ageValue);
+  }
+  return now.toISOString().slice(0, 10);
+}
+
+export let lastIciciTransaction: {
+  txnRef?: string;
+  responseCode?: string;
+  respDescription?: string;
+  timestamp?: string;
+} | null = null;
+
+export const publicBookingRouter = Router();
+
+const bookingLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many booking attempts. Please try again later." },
+});
+
+const createOrderLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many order attempts. Please try again in 15 minutes." },
+});
+
+async function getSettings() {
+  const [row] = await db.select().from(clinicSettingsTable).limit(1);
+  return row;
+}
+
+function publicCreateInput(body: Record<string, unknown>, bookingRef?: string) {
+  // Public website/kiosk only. Never accept reception/phone here — those
+  // sources hold capacity until confirm/cancel (Pay at Centre).
+  const source = body.source === "kiosk" ? "kiosk" : "website";
+  return {
+    name: String(body.name ?? ""),
+    phone: String(body.phone ?? ""),
+    email: String(body.email ?? ""),
+    selectedDate: String(body.selectedDate ?? ""),
+    timeSlot: String(body.timeSlot ?? ""),
+    slotModality: typeof body.slotModality === "string" ? body.slotModality : "",
+    testIds: Array.isArray(body.testIds) ? body.testIds as number[] : [],
+    packageIds: Array.isArray(body.packageIds) ? body.packageIds as number[] : [],
+    totalAmount: Number(body.totalAmount),
+    notes: String(body.notes ?? ""),
+    isVip: Boolean(body.isVip),
+    ageValue: Number(body.ageValue),
+    ageUnit: String(body.ageUnit ?? "years"),
+    gender: String(body.gender ?? ""),
+    referringDoctorId: (body.referringDoctorId as number | null) ?? null,
+    referringDoctorName: String(body.referringDoctorName ?? ""),
+    source,
+    bookingRef,
+  };
+}
+
+async function reserveOrReject(req: { body?: unknown }, res: { status: (n: number) => { json: (b: unknown) => void } }, extra?: { bookingRef?: string; gateway?: CreatePendingBookingInput["gateway"] }) {
+  try {
+    return await createPendingOnlineBooking({
+      ...publicCreateInput((req.body || {}) as Record<string, unknown>, extra?.bookingRef),
+      gateway: extra?.gateway,
+    });
+  } catch (err) {
+    if (err instanceof OnlineBookingError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return null;
+    }
+    throw err;
+  }
+}
+
+// ── PayU helpers ──────────────────────────────────────────────────────────────
+
+const PAYU_PROD_URL = "https://secure.payu.in/_payment";
+const PAYU_TEST_URL = "https://test.payu.in/_payment";
+
+function payuRequestHash(params: {
+  key: string; txnid: string; amount: string; productinfo: string;
+  firstname: string; email: string; salt: string;
+}): string {
+  const { key, txnid, amount, productinfo, firstname, email, salt } = params;
+  const str = `${key}|${txnid}|${amount}|${productinfo}|${firstname}|${email}|||||||||${salt}`;
+  return crypto.createHash("sha512").update(str).digest("hex");
+}
+
+function payuResponseHash(params: {
+  key: string; txnid: string; amount: string; productinfo: string;
+  firstname: string; email: string; status: string; salt: string;
+}): string {
+  const { key, txnid, amount, productinfo, firstname, email, status, salt } = params;
+  const str = `${salt}|${status}||||||||||${email}|${firstname}|${productinfo}|${amount}|${txnid}|${key}`;
+  return crypto.createHash("sha512").update(str).digest("hex");
+}
+
+function getPublicBase(req: { headers: Record<string, string | string[] | undefined> }): string {
+  const publicBaseUrl = process.env.PUBLIC_BASE_URL || process.env.BASE_URL;
+  if (publicBaseUrl) return publicBaseUrl.replace(/\/$/, "");
+  const domains = process.env.REPLIT_DOMAINS;
+  if (domains) return `https://${domains.split(",")[0]}`;
+  const host = String(req.headers["host"] || "localhost");
+  const proto = String(req.headers["x-forwarded-proto"] || "http");
+  return `${proto}://${host}`;
+}
+
+// ── GET /api/public/booking/config ────────────────────────────────────────────
+// ── GET /api/public/booking/config ────────────────────────────────────────────
+publicBookingRouter.get("/config", async (_req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  const settings = await getSettings();
+  if (!settings) {
+    res.json({ enabled: false, keyId: "", vipEnabled: false, gateway: null, allowedTestIds: [], allowedPackageIds: [] });
+    return;
+  }
+
+  const onlineBookingEnabled = !!settings.onlineBookingEnabled;
+
+  let allowedTestIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedTestIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedTestIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  let allowedPackageIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedPackageIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedPackageIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  // Hope partner page (/book?source=hope) — a narrower selection of the same
+  // Care catalogue, curated in Settings. Read-only passthrough of the two id
+  // lists; empty means "not configured" and the page falls back to the global
+  // whitelist above. Nothing here affects pricing, collection, or settlement.
+  const parseIdList = (raw: string | null | undefined): number[] => {
+    try {
+      const parsed = JSON.parse(raw || "[]");
+      return Array.isArray(parsed)
+        ? parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0)
+        : [];
+    } catch { return []; }
+  };
+  const hopeAllowedTestIds = parseIdList(settings?.hopeBookingAllowedTestIds);
+  const hopeAllowedPackageIds = parseIdList(settings?.hopeBookingAllowedPackageIds);
+
+  if (!onlineBookingEnabled) {
+    res.json({
+      enabled: false,
+      keyId: "",
+      vipEnabled: false,
+      gateway: null,
+      payuMerchantKey: "",
+      phonepeMerchantId: "",
+      bharatpeMerchantId: "",
+      iciciMerchantId: "",
+      kioskUpiVpa: settings.kioskUpiVpa || "",
+      kioskUpiName: settings.kioskUpiName || "",
+      upiQrEnabled: false,
+      upiVpa: "",
+      upiQrImageUrl: "",
+      allowedTestIds: [],
+      allowedPackageIds: [],
+      hopeAllowedTestIds: [],
+      hopeAllowedPackageIds: [],
+      quickTestIds: [],
+      quickTestCategoryImages: settings.quickTestCategoryImages || "{}",
+      quickTestOverlayOpacity: settings.quickTestOverlayOpacity ?? 35,
+      vipPercentage: Number(settings.vipPercentage || 50),
+      disclaimerRefundPercentage: settings.disclaimerRefundPercentage ?? 90,
+      activePaymentGateway: null,
+      enableCardPayment: false,
+      enableQrPayment: false,
+      enableVipBooking: false,
+      enablePaymentLogos: settings.enablePaymentLogos,
+      enablePaymentTimer: settings.enablePaymentTimer,
+      customIciciBannerUrl: settings.customIciciBannerUrl,
+      customPhonepeBannerUrl: settings.customPhonepeBannerUrl,
+      customBharatpeBannerUrl: settings.customBharatpeBannerUrl,
+      customPayuBannerUrl: settings.customPayuBannerUrl,
+    });
+    return;
+  }
+
+  const razorpayKeyId = settings.razorpayKeyId || "";
+  const payuKey = settings.payuMerchantKey || "";
+  const phonepeMerchantId = process.env.PHONEPE_MERCHANT_ID || settings.phonepeMerchantId || "";
+  const bharatpeMerchantId = process.env.BHARATPE_MERCHANT_ID || settings.bharatpeMerchantId || "";
+  const iciciMerchantId = process.env.ICICI_MERCHANT_ID || settings.iciciMerchantId || "";
+
+  const gateway = resolveActiveGateway(settings);
+
+  // Same clinic_settings.quick_test_ids Billing Desk (and the kiosk) use for
+  // their quick-select slots — the frontend cross-references these against
+  // its already-whitelisted /tests list, so an ID that isn't allowed for
+  // online booking simply won't resolve to a tile.
+  let quickTestIds: (number | null)[] = [];
+  try {
+    const parsed = JSON.parse(settings.quickTestIds || "[]");
+    if (Array.isArray(parsed)) quickTestIds = parsed;
+  } catch { /* ignore */ }
+
+  // Admin-configurable appointment time slots ({ value, label }[]). The form
+  // falls back to its built-in defaults when this is empty/unset.
+  const bookingTimeSlots = parseBookingTimeSlots(settings.bookingTimeSlots);
+
+  res.json({
+    enabled: true,
+    bookingTimeSlots,
+    keyId: razorpayKeyId,
+    vipEnabled: settings.vipQueueEnabled,
+    gateway,
+    payuMerchantKey: payuKey,
+    phonepeMerchantId: settings.phonepeEnabled ? phonepeMerchantId : "",
+    bharatpeMerchantId: settings.bharatpeEnabled ? bharatpeMerchantId : "",
+    iciciMerchantId: settings.iciciEnabled ? iciciMerchantId : "",
+    kioskUpiVpa: settings.kioskUpiVpa,
+    kioskUpiName: settings.kioskUpiName,
+    upiQrEnabled: settings.upiQrEnabled,
+    upiVpa: settings.upiVpa || settings.kioskUpiVpa || "",
+    upiQrImageUrl: settings.upiQrImageUrl || "",
+    allowedTestIds,
+    allowedPackageIds,
+    hopeAllowedTestIds,
+    hopeAllowedPackageIds,
+    quickTestIds,
+    quickTestCategoryImages: settings.quickTestCategoryImages || "{}",
+    quickTestOverlayOpacity: settings.quickTestOverlayOpacity ?? 35,
+    vipPercentage: Number(settings.vipPercentage || 50),
+    disclaimerRefundPercentage: settings.disclaimerRefundPercentage ?? 90,
+    activePaymentGateway: gateway || settings.activePaymentGateway,
+    enableCardPayment: settings.enableCardPayment,
+    enableQrPayment: settings.enableQrPayment,
+    enableVipBooking: settings.enableVipBooking,
+    enablePaymentLogos: settings.enablePaymentLogos,
+    enablePaymentTimer: settings.enablePaymentTimer,
+    customIciciBannerUrl: settings.customIciciBannerUrl,
+    customPhonepeBannerUrl: settings.customPhonepeBannerUrl,
+    customBharatpeBannerUrl: settings.customBharatpeBannerUrl,
+    customPayuBannerUrl: settings.customPayuBannerUrl,
+  });
+});
+
+// GET /api/public/booking/slots?date=YYYY-MM-DD&testIds=1,2&packageIds=3
+// Occupancy for the shared website/kiosk/reception slot pool.
+publicBookingRouter.get("/slots", async (req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  const settings = await getSettings();
+  const selectedDate = String(req.query.date || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+    res.status(400).json({ error: "date (YYYY-MM-DD) is required." });
+    return;
+  }
+  if (!settings?.onlineBookingEnabled) {
+    res.json({ slots: [], selectedDate });
+    return;
+  }
+  const parseIds = (raw: unknown) =>
+    String(raw || "")
+      .split(",")
+      .map((v) => Number(v.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+  const result = await getSlotAvailability({
+    selectedDate,
+    testIds: parseIds(req.query.testIds),
+    packageIds: parseIds(req.query.packageIds),
+  });
+  res.json(result);
+});
+
+// GET /api/public/booking/doctors
+// Public, minimal referring-doctor list for the online booking form's
+// "Referring Doctor" picker (mirrors the Billing Desk picker). Only exposes
+// id/name/specialization — no PII (phone/email/commission). Returns an empty
+// list when online booking is disabled so the picker simply doesn't populate.
+publicBookingRouter.get("/doctors", async (_req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.json({ doctors: [] });
+    return;
+  }
+  const rows = await db
+    .select({
+      id: doctorsTable.id,
+      name: doctorsTable.name,
+      specialization: doctorsTable.specialization,
+    })
+    .from(doctorsTable);
+  res.json({ doctors: rows });
+});
+
+// GET /api/public/booking/by-ref?ref=...
+publicBookingRouter.get("/by-ref", async (req, res): Promise<void> => {
+  const ref = String(req.query.ref || "").trim();
+  if (!ref) { res.status(400).json({ error: "ref is required" }); return; }
+  const [row] = await db.select().from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.bookingRef, ref))
+    .limit(1);
+  if (!row) { res.status(404).json({ error: "Booking not found" }); return; }
+
+  let tokenNo: number | null = null;
+  if (row.billId) {
+    const testTokenRows = await db
+      .select({ tokenNo: testTokensTable.tokenNo, tokenDate: testTokensTable.tokenDate })
+      .from(testTokensTable)
+      .where(eq(testTokensTable.billId, row.billId));
+    const derived = deriveBillTokenFromTestTokens(
+      testTokenRows,
+      testTokenRows[0]?.tokenDate,
+    );
+    if (derived) tokenNo = derived.tokenNo;
+  }
+
+  // Never expose the Razorpay HMAC signature: it is a server-computed secret
+  // used only for internal payment verification and is not read by any client
+  // (the confirmation UIs derive the paid gateway from the payment/txn IDs,
+  // not the signature). Everything else on the row is unchanged.
+  const { razorpaySignature: _omit, ...booking } = row as Record<string, unknown>;
+  res.json({ booking, tokenNo });
+});
+
+// GET /api/public/booking/clinic-print-info
+// Public, read-only clinic fields needed to render the SAME Billing-Desk
+// receipt template (buildBillPrintHtml) for an online-booking confirmation
+// receipt — see PrintClinic in diagnostic-erp/src/lib/printBill.ts. Kept
+// separate from /config (payment gateway settings) since the receipt page
+// needs it whether or not a real gateway is configured.
+publicBookingRouter.get("/clinic-print-info", async (_req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings) { res.status(404).json({ error: "Clinic settings not found" }); return; }
+  res.json(buildPrintClinic(settings));
+});
+
+// GET /api/public/booking/my-bookings — RETIRED (410).
+// Previously returned every online_bookings column (name, email, tests,
+// gateway txn ids...) to anyone who typed a 10-digit phone number — the core
+// PHI exposure in SECURITY_FINDING_PUBLIC_BOOKING_PHI_EXPOSURE. Replaced by
+// the session-authenticated GET /api/patient/my-bookings (patientPortal.ts).
+publicBookingRouter.get("/my-bookings", async (_req, res): Promise<void> => {
+  res.status(410).json({ error: "This endpoint has been retired. Please update the app." });
+});
+
+// GET /api/public/booking/my-reports — RETIRED (410).
+// Was an empty stub; real report delivery is the session-authenticated
+// GET /api/patient/my-reports + POST /api/patient/reports/:id/link.
+publicBookingRouter.get("/my-reports", async (_req, res): Promise<void> => {
+  res.status(410).json({ error: "This endpoint has been retired. Please update the app." });
+});
+
+// Helper function to check if test category is enabled in settings
+function isTestCategoryEnabled(category: string, department: string, services: Record<string, boolean>): boolean {
+  if (!services || Object.keys(services).length === 0) return true;
+  
+  const cat = (category || "").toLowerCase().trim();
+  const dept = (department || "").toLowerCase().trim();
+  
+  const matches = (keywords: string[]) => keywords.some(k => cat.includes(k) || dept.includes(k));
+
+  if (matches(["mri"])) {
+    return services.mri !== false;
+  }
+  if (matches(["ct scan", "ct-scan", "computed tomography"]) || cat === "ct" || dept === "ct") {
+    return services.ct !== false;
+  }
+  if (matches(["usg", "ultrasound", "sonar", "doppler"])) {
+    return services.usg !== false;
+  }
+  if (matches(["xray", "x-ray", "x ray", "mammography"])) {
+    return services.xray !== false;
+  }
+  if (matches(["pathology", "haematology", "biochemistry", "microbiology", "serology", "clinical pathology", "cytopathology", "histopathology", "blood", "urine", "stool", "sputum", "semen", "cbc", "lft", "kft"])) {
+    return services.pathology !== false;
+  }
+  if (matches(["doctor", "consultation", "consult"])) {
+    return services.doctor !== false;
+  }
+  if (matches(["opd"])) {
+    return services.opd !== false;
+  }
+  if (matches(["emergency"])) {
+    return services.emergency !== false;
+  }
+  if (matches(["home collection", "home-collection"])) {
+    return services.home_collection !== false;
+  }
+
+  // Fallback check: if any service key matches the category or department name exactly
+  for (const [key, enabled] of Object.entries(services)) {
+    if (cat === key.toLowerCase() || dept === key.toLowerCase()) {
+      return enabled !== false;
+    }
+  }
+
+  return services.pathology !== false;
+}
+
+// GET /api/public/booking/tests
+publicBookingRouter.get("/tests", async (req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  const settings = await getSettings();
+  const sourceHope = String(req.query.source || "").toLowerCase() === "hope";
+
+  const onlineBookingEnabled = !!settings?.onlineBookingEnabled;
+  let allowedTestIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedTestIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedTestIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  // Hope partner page: when Hope curation is configured, serve only that subset.
+  // Empty Hope list keeps the global whitelist (fail-open for unset curation).
+  if (sourceHope) {
+    try {
+      const parsed = JSON.parse(settings?.hopeBookingAllowedTestIds || "[]");
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        allowedTestIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+      }
+    } catch { /* ignore */ }
+  }
+
+  let allowedPackageIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedPackageIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedPackageIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  if (!onlineBookingEnabled || allowedTestIds.length === 0) {
+    logger.info({
+      onlineBookingEnabled,
+      allowedTestIdsCount: allowedTestIds.length,
+      allowedPackageIdsCount: allowedPackageIds.length,
+      returnedTestsCount: 0,
+      returnedPackagesCount: 0,
+    }, "Public booking tests requested, returning empty due to disabled or empty whitelist");
+    res.json({ tests: [] });
+    return;
+  }
+
+  const baseQuery = db
+    .select({
+      id: testsTable.id,
+      code: testsTable.code,
+      name: testsTable.name,
+      category: testsTable.category,
+      department: testsTable.department,
+      price: testsTable.price,
+      duration: testsTable.duration,
+    })
+    .from(testsTable)
+    .where(and(eq(testsTable.isActive, true)))
+    .orderBy(testsTable.category, testsTable.name);
+
+  const tests = await baseQuery;
+
+  // Filter only selected active tests (remove fallback logic)
+  let filtered = tests.filter((t) => allowedTestIds.includes(t.id));
+
+  // Filter based on onlineBookingServices
+  if (settings?.onlineBookingServices) {
+    try {
+      const svcs = JSON.parse(settings.onlineBookingServices);
+      filtered = filtered.filter((t) => isTestCategoryEnabled(t.category, t.department, svcs));
+    } catch { /* ignore */ }
+  }
+
+  logger.info({
+    onlineBookingEnabled,
+    allowedTestIdsCount: allowedTestIds.length,
+    allowedPackageIdsCount: allowedPackageIds.length,
+    returnedTestsCount: filtered.length,
+  }, "Public booking tests returned");
+
+  res.json({ tests: filtered });
+});
+
+// GET /api/public/booking/packages
+publicBookingRouter.get("/packages", async (req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  const settings = await getSettings();
+  const sourceHope = String(req.query.source || "").toLowerCase() === "hope";
+
+  const onlineBookingEnabled = !!settings?.onlineBookingEnabled;
+  let allowedPkgIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedPackageIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedPkgIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  // Hope partner curation — when configured, narrow packages to Hope allowlist.
+  if (sourceHope) {
+    try {
+      const parsed = JSON.parse(settings?.hopeBookingAllowedPackageIds || "[]");
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        allowedPkgIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+      }
+    } catch { /* ignore */ }
+  }
+
+  let allowedTestIds: number[] = [];
+  try {
+    const parsed = JSON.parse(settings?.onlineBookingAllowedTestIds || "[]");
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      allowedTestIds = parsed.filter((v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0);
+    }
+  } catch { /* ignore */ }
+
+  // Check if packages service is enabled
+  let isPackagesEnabled = true;
+  if (settings?.onlineBookingServices) {
+    try {
+      const svcs = JSON.parse(settings.onlineBookingServices);
+      if (svcs.packages === false) {
+        isPackagesEnabled = false;
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (!onlineBookingEnabled || allowedPkgIds.length === 0 || !isPackagesEnabled) {
+    logger.info({
+      onlineBookingEnabled,
+      allowedTestIdsCount: allowedTestIds.length,
+      allowedPackageIdsCount: allowedPkgIds.length,
+      returnedTestsCount: 0,
+      returnedPackagesCount: 0,
+      isPackagesEnabled,
+    }, "Public booking packages requested, returning empty");
+    res.json({ packages: [] });
+    return;
+  }
+
+  const pkgs = await db
+    .select({
+      id: packagesTable.id,
+      code: packagesTable.packageCode,
+      name: packagesTable.name,
+      price: packagesTable.price,
+      description: packagesTable.description,
+    })
+    .from(packagesTable)
+    .where(eq(packagesTable.isActive, true))
+    .orderBy(packagesTable.name);
+
+  // Return only whitelisted packages
+  const filtered = pkgs.filter((p) => allowedPkgIds.includes(p.id));
+
+  logger.info({
+    onlineBookingEnabled,
+    allowedTestIdsCount: allowedTestIds.length,
+    allowedPackageIdsCount: allowedPkgIds.length,
+    returnedPackagesCount: filtered.length,
+  }, "Public booking packages returned");
+
+  res.json({ packages: filtered });
+});
+
+// ── POST /api/public/booking/payu-initiate ────────────────────────────────────
+// Creates a pending booking and returns PayU form fields for the frontend to submit.
+publicBookingRouter.post("/payu-initiate", createOrderLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount,
+    notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body as {
+    name: string; phone: string; email?: string; selectedDate: string; timeSlot?: string;
+    testIds?: number[]; packageIds?: number[]; totalAmount: number;
+    notes?: string; isVip?: boolean;
+    ageValue: number; ageUnit?: string; gender: string;
+    referringDoctorId?: number | null; referringDoctorName?: string;
+  };
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  const name = rawName.trim().toUpperCase();
+  if (!selectedDate) {
+    res.status(400).json({ error: "Selected date is required." });
+    return;
+  }
+  if (!Array.isArray(testIds) || !Array.isArray(packageIds) || (testIds.length + packageIds.length) === 0) {
+    res.status(400).json({ error: "Please select at least one test or package." });
+    return;
+  }
+
+  const bookingRef = generateBookingRef();
+  const booking = await reserveOrReject(req, res, { bookingRef, gateway: { payuTxnId: bookingRef } });
+  if (!booking) return;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Invalid total amount." });
+    return;
+  }
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+  const returnUrl = `${base}/api/public/booking/payu-callback`;
+
+  try {
+    const result = await PaymentEngine.initiatePayment("payu", {
+      bookingRef,
+      name,
+      phone: phone.trim(),
+      email: email.trim(),
+      amount,
+      returnUrl,
+    });
+
+    if (!result.success) {
+      await failPendingBooking(booking.id, result.errorMessage || "Could not initiate PayU payment.");
+      res.status(400).json({ error: "Could not initiate PayU payment. Please try again.", details: result.errorMessage });
+      return;
+    }
+
+    res.json(result.rawResponse); // PayU returns { fields, actionUrl }
+  } catch (err: any) {
+    await failPendingBooking(booking.id, "Could not connect to PayU.");
+    logger.error({ err, bookingRef }, "PayU initiate exception");
+    res.status(400).json({ error: "Could not connect to PayU. Please try again." });
+  }
+});
+
+// ── POST /api/public/booking/payu-success ─────────────────────────────────────
+// PayU redirects here after successful payment (form POST, urlencoded body).
+// Must be reachable publicly without CSRF.
+publicBookingRouter.post("/payu-success", async (req, res): Promise<void> => {
+  const body = req.body as Record<string, string>;
+  const { txnid, mihpayid, status, hash: returnedHash, amount, productinfo, firstname, email } = body;
+
+  const salt = process.env.PAYU_MERCHANT_SALT || "";
+  const settings = await getSettings();
+  const merchantKey = settings?.payuMerchantKey || "";
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+
+  // SECURITY FIX: previously `if (salt && merchantKey && txnid) { verify hash }`
+  // — same conditional-skip pattern fixed in the ICICI/HDFC webhooks (see
+  // gateway-webhooks.ts). A forged PayU POST that simply omitted `hash`
+  // (or was sent when PAYU_MERCHANT_SALT was not configured) would skip hash
+  // verification entirely and fall through to being trusted. Hash is now
+  // mandatory: missing salt, merchantKey, or a hash mismatch all redirect
+  // to the failure screen instead of silently proceeding.
+  if (!salt || !merchantKey || !txnid) {
+    res.redirect(getBookingConfirmationUrl(base, "", "payu", true, "gateway_config_missing"));
+    return;
+  }
+  {
+    const expected = payuResponseHash({ key: merchantKey, txnid, amount: amount ?? "", productinfo: productinfo ?? "", firstname: firstname ?? "", email: email ?? "", status: status ?? "", salt });
+    if (expected !== returnedHash) {
+      res.redirect(getBookingConfirmationUrl(base, "", "payu", true, "hash_mismatch"));
+      return;
+    }
+  }
+
+  if (status !== "success") {
+    res.redirect(getBookingConfirmationUrl(base, "", "payu", true, status ?? "unknown"));
+    return;
+  }
+
+  // Find booking by txnid
+  const [booking] = await db
+    .select()
+    .from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.payuTxnId, txnid))
+    .limit(1);
+
+  if (!booking) {
+    res.redirect(getBookingConfirmationUrl(base, "", "payu", true, "not_found"));
+    return;
+  }
+
+  if (booking.status === "paid" || booking.status === "confirmed") {
+    res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, "payu"));
+    return;
+  }
+
+  const payMismatch = capturedMatchesFrozen(booking, amount);
+  if (payMismatch) {
+    await failPendingBooking(booking.id, payMismatch);
+    res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, "payu", true, "amount_mismatch"));
+    return;
+  }
+
+  await db
+    .update(onlineBookingsTable)
+    .set({ payuPaymentId: mihpayid ?? "", status: "paid" })
+    .where(eq(onlineBookingsTable.id, booking.id));
+
+  try {
+    await confirmBookingInternal(booking.id, "Super Admin");
+  } catch (err: any) {
+    logger.error({ err, bookingId: booking.id }, "Auto-confirmation failed for paid PayU booking");
+  }
+
+  res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, "payu"));
+});
+
+// ── POST /api/public/booking/payu-failure ─────────────────────────────────────
+publicBookingRouter.post("/payu-failure", async (req, res): Promise<void> => {
+  const body = req.body as Record<string, string>;
+  const { txnid, error_Message } = body;
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+
+  if (txnid) {
+    const [booking] = await db.select().from(onlineBookingsTable).where(eq(onlineBookingsTable.payuTxnId, txnid)).limit(1);
+    if (booking && booking.status === "pending_payment") {
+      await db.update(onlineBookingsTable).set({ status: "payment_failed", failureReason: error_Message || "Payment cancelled" }).where(eq(onlineBookingsTable.id, booking.id));
+    }
+  }
+
+  res.redirect(getBookingConfirmationUrl(base, "", "payu", true, error_Message ?? "Payment cancelled"));
+});
+
+// ── PhonePe helpers ───────────────────────────────────────────────────────────
+
+const PHONEPE_PROD_BASE = "https://api.phonepe.com/apis/hermes";
+const PHONEPE_STAGING_BASE = "https://api-preprod.phonepe.com/apis/hermes";
+
+function phonepeXVerify(base64Payload: string, endpoint: string, saltKey: string, saltIndex: string): string {
+  const hash = crypto.createHash("sha256").update(base64Payload + endpoint + saltKey).digest("hex");
+  return `${hash}###${saltIndex}`;
+}
+
+// ── POST /api/public/booking/phonepe-initiate ─────────────────────────────────
+// Creates a pending booking and returns the PhonePe redirect URL.
+publicBookingRouter.post("/phonepe-initiate", createOrderLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount,
+    notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body as {
+    name: string; phone: string; email?: string; selectedDate: string; timeSlot?: string;
+    testIds?: number[]; packageIds?: number[]; totalAmount: number;
+    notes?: string; isVip?: boolean;
+    ageValue: number; ageUnit?: string; gender: string;
+    referringDoctorId?: number | null; referringDoctorName?: string;
+  };
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  const name = rawName.trim().toUpperCase();
+  if (!selectedDate) {
+    res.status(400).json({ error: "Selected date is required." });
+    return;
+  }
+  if (!Array.isArray(testIds) || !Array.isArray(packageIds) || (testIds.length + packageIds.length) === 0) {
+    res.status(400).json({ error: "Please select at least one test or package." });
+    return;
+  }
+
+  const bookingRef = generateBookingRef();
+  const booking = await reserveOrReject(req, res, { bookingRef, gateway: { phonepeTransactionId: bookingRef } });
+  if (!booking) return;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Invalid total amount." });
+    return;
+  }
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+  const returnUrl = `${base}/api/public/booking/phonepe-callback`;
+
+  try {
+    const result = await PaymentEngine.initiatePayment("phonepe", {
+      bookingRef,
+      name,
+      phone: phone.trim(),
+      email: email.trim(),
+      amount,
+      returnUrl,
+    });
+
+    if (!result.success) {
+      await failPendingBooking(booking.id, result.errorMessage || "Could not initiate PhonePe payment.");
+      res.status(400).json({ error: "Could not initiate PhonePe payment. Please try again.", details: result.errorMessage });
+      return;
+    }
+
+    await db.update(onlineBookingsTable)
+      .set({ phonepeProviderRefId: result.gatewayTxnId || "" })
+      .where(eq(onlineBookingsTable.id, booking.id));
+
+    res.json({ bookingRef, redirectUrl: result.redirectUrl });
+  } catch (err: any) {
+    await failPendingBooking(booking.id, "Could not connect to PhonePe.");
+    logger.error({ err, bookingRef }, "PhonePe initiate exception");
+    res.status(400).json({ error: "Could not connect to PhonePe. Please try again." });
+  }
+});
+
+// ── GET /api/public/booking/phonepe-callback ──────────────────────────────────
+// PhonePe redirects browser here after payment attempt.
+publicBookingRouter.get("/phonepe-callback", async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  const saltKey = process.env.PHONEPE_API_SECRET || "";
+  const saltIndex = process.env.PHONEPE_SALT_INDEX || "1";
+  const merchantId = process.env.PHONEPE_MERCHANT_ID || settings?.phonepeMerchantId || "";
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+
+  const { merchantTransactionId, code } = req.query as Record<string, string>;
+  if (!merchantTransactionId) {
+    res.redirect(getBookingConfirmationUrl(base, "", "phonepe", true, "missing_txn_id"));
+    return;
+  }
+
+  // Check status with PhonePe server-side
+  const isStaging = process.env.NODE_ENV !== "production";
+  const baseUrl = isStaging ? PHONEPE_STAGING_BASE : PHONEPE_PROD_BASE;
+  const endpoint = `/pg/v1/status/${encodeURIComponent(merchantId)}/${encodeURIComponent(merchantTransactionId)}`;
+  const statusVerify = phonepeXVerify("" , endpoint, saltKey, saltIndex);
+
+  try {
+    const statusRes = await fetch(`${baseUrl}${endpoint}`, {
+      method: "GET",
+      headers: { Accept: "application/json", "X-VERIFY": statusVerify, "X-MERCHANT-ID": merchantId },
+    });
+    const statusData = (await statusRes.json()) as {
+      success: boolean;
+      code: string;
+      data?: { state?: string; responseCode?: string; transactionId?: string };
+    };
+
+    const state = statusData.data?.state || "";
+    if (state === "COMPLETED" || statusData.data?.responseCode === "SUCCESS") {
+      const [booking] = await db.select().from(onlineBookingsTable)
+        .where(eq(onlineBookingsTable.phonepeTransactionId, merchantTransactionId))
+        .limit(1);
+      if (booking && booking.status === "pending_payment") {
+        const payMismatch = capturedMatchesFrozen(booking, frozenBookingAmount(booking));
+        if (payMismatch) {
+          await failPendingBooking(booking.id, payMismatch);
+          res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "phonepe", true, "amount_mismatch"));
+          return;
+        }
+        await db.update(onlineBookingsTable)
+          .set({ status: "paid", phonepeProviderRefId: statusData.data?.transactionId || booking.phonepeProviderRefId })
+          .where(eq(onlineBookingsTable.id, booking.id));
+        
+        try {
+          await confirmBookingInternal(booking.id, "Super Admin");
+        } catch (err: any) {
+          logger.error({ err, bookingId: booking.id }, "Auto-confirmation failed for paid PhonePe booking");
+        }
+      }
+      res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "phonepe"));
+      return;
+    }
+  } catch { /* fall through to failure */ }
+
+  // Mark failed
+  const [booking] = await db.select().from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.phonepeTransactionId, merchantTransactionId))
+    .limit(1);
+  if (booking && booking.status === "pending_payment") {
+    await db.update(onlineBookingsTable).set({ status: "payment_failed", failureReason: code || "Payment not completed" }).where(eq(onlineBookingsTable.id, booking.id));
+  }
+  res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "phonepe", true, code || "Payment not completed"));
+});
+
+// ── BharatPe helpers ─────────────────────────────────────────────────────────────────────────
+
+const BHARATPE_PROD_BASE = "https://api.bharatpe.in/api/v1";
+const BHARATPE_STAGING_BASE = "https://uat-api.bharatpe.in/api/v1";
+
+// ── POST /api/public/booking/bharatpe-initiate ───────────────────────────────────────────────────
+// Creates a pending booking and returns the BharatPe checkout redirect URL.
+publicBookingRouter.post("/bharatpe-initiate", createOrderLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount,
+    notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body as {
+    name: string; phone: string; email?: string; selectedDate: string; timeSlot?: string;
+    testIds?: number[]; packageIds?: number[]; totalAmount: number;
+    notes?: string; isVip?: boolean;
+    ageValue: number; ageUnit?: string; gender: string;
+    referringDoctorId?: number | null; referringDoctorName?: string;
+  };
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  const name = rawName.trim().toUpperCase();
+  if (!selectedDate) {
+    res.status(400).json({ error: "Selected date is required." });
+    return;
+  }
+  if (!Array.isArray(testIds) || !Array.isArray(packageIds) || (testIds.length + packageIds.length) === 0) {
+    res.status(400).json({ error: "Please select at least one test or package." });
+    return;
+  }
+
+  const bookingRef = generateBookingRef();
+  const booking = await reserveOrReject(req, res, { bookingRef, gateway: { bharatpeTransactionId: bookingRef } });
+  if (!booking) return;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Invalid total amount." });
+    return;
+  }
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+  const returnUrl = `${base}/api/public/booking/bharatpe-callback`;
+
+  try {
+    const result = await PaymentEngine.initiatePayment("bharatpe", {
+      bookingRef,
+      name,
+      phone: phone.trim(),
+      email: email.trim(),
+      amount,
+      returnUrl,
+    });
+
+    if (!result.success) {
+      await failPendingBooking(booking.id, result.errorMessage || "Could not initiate BharatPe payment.");
+      res.status(400).json({ error: "Could not initiate BharatPe payment. Please try again.", details: result.errorMessage });
+      return;
+    }
+
+    await db.update(onlineBookingsTable)
+      .set({ bharatpeProviderRefId: result.gatewayTxnId || null })
+      .where(eq(onlineBookingsTable.id, booking.id));
+
+    res.json({ bookingRef, redirectUrl: result.redirectUrl });
+  } catch {
+    await failPendingBooking(booking.id, "Could not connect to BharatPe.");
+    res.status(400).json({ error: "Could not connect to BharatPe. Please try again." });
+    return;
+  }
+});
+
+// ── GET /api/public/booking/bharatpe-callback ────────────────────────────────────────────────────────────
+// BharatPe redirects browser here after payment attempt.
+publicBookingRouter.get("/bharatpe-callback", async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  const apiKey = process.env.BHARATPE_API_KEY || "";
+  const apiSecret = process.env.BHARATPE_API_SECRET || "";
+  const merchantId = process.env.BHARATPE_MERCHANT_ID || settings?.bharatpeMerchantId || "";
+
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+
+  const { merchantTransactionId, status, code } = req.query as Record<string, string>;
+  if (!merchantTransactionId) {
+    res.redirect(getBookingConfirmationUrl(base, "", "bharatpe", true, "missing_txn_id"));
+    return;
+  }
+
+  // Verify status server-side with BharatPe
+  const isStaging = process.env.NODE_ENV !== "production";
+  const bpBase = isStaging ? BHARATPE_STAGING_BASE : BHARATPE_PROD_BASE;
+  const timestamp = String(Date.now());
+  const authPayload = `${merchantId}:${timestamp}`;
+  const authHash = crypto.createHmac("sha256", apiSecret).update(authPayload).digest("hex");
+  const authToken = `${apiKey}:${authHash}:${timestamp}`;
+
+  try {
+    const statusRes = await fetch(`${bpBase}/merchant/transaction/${encodeURIComponent(merchantTransactionId)}/status`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "X-API-KEY": apiKey,
+        "X-MERCHANT-ID": merchantId,
+        Authorization: `Bearer ${authToken}`,
+      },
+    });
+    const statusData = (await statusRes.json()) as {
+      success: boolean;
+      code: string;
+      data?: { status?: string; transactionId?: string };
+    };
+
+    // SECURITY FIX: previously `if (statusData.data?.status === "SUCCESS" || status === "success")`
+    // — the `|| status === "success"` half trusted the ?status= query param from
+    // the browser redirect directly. An attacker who knew any valid
+    // merchantTransactionId could fabricate a redirect to this URL with
+    // ?status=success and bypass the server-side BharatPe status check
+    // entirely (the server-side check would still run first, but if
+    // statusData.data?.status was anything other than "SUCCESS" AND the query
+    // param said "success", the condition was still true). Only the server-side
+    // status response from BharatPe's API is authoritative.
+    if (statusData.data?.status === "SUCCESS") {
+      const [booking] = await db.select().from(onlineBookingsTable)
+        .where(eq(onlineBookingsTable.bharatpeTransactionId, merchantTransactionId))
+        .limit(1);
+      if (booking && booking.status === "pending_payment") {
+        const payMismatch = capturedMatchesFrozen(booking, frozenBookingAmount(booking));
+        if (payMismatch) {
+          await failPendingBooking(booking.id, payMismatch);
+          res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "bharatpe", true, "amount_mismatch"));
+          return;
+        }
+        await db.update(onlineBookingsTable)
+          .set({ status: "paid", bharatpeProviderRefId: statusData.data?.transactionId || booking.bharatpeProviderRefId })
+          .where(eq(onlineBookingsTable.id, booking.id));
+        
+        try {
+          await confirmBookingInternal(booking.id, "Super Admin");
+        } catch (err: any) {
+          logger.error({ err, bookingId: booking.id }, "Auto-confirmation failed for paid BharatPe booking");
+        }
+      }
+      res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "bharatpe"));
+      return;
+    }
+  } catch { /* fall through to failure */ }
+
+  const [booking] = await db.select().from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.bharatpeTransactionId, merchantTransactionId))
+    .limit(1);
+  if (booking && booking.status === "pending_payment") {
+    await db.update(onlineBookingsTable).set({ status: "payment_failed", failureReason: code || "Payment not completed" }).where(eq(onlineBookingsTable.id, booking.id));
+  }
+  res.redirect(getBookingConfirmationUrl(base, merchantTransactionId, "bharatpe", true, code || "Payment not completed"));
+});
+
+// ── ICICI Orange PG helpers ─────────────────────────────────────────────────
+
+const ICICI_UAT_BASE = "https://pgpayuat.icicibank.com";
+const ICICI_PROD_BASE = "https://pgpay.icicibank.com";
+
+function normalizeIciciBaseUrl(input?: string): string {
+  return (input || "https://pgpay.icicibank.com")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/pg\/api\/v2$/i, "")
+    .replace(/\/pg\/api$/i, "");
+}
+
+function getIciciBase() {
+  return normalizeIciciBaseUrl(process.env.ICICI_BASE_URL);
+}
+
+function getIciciPrefix() {
+  return "";
+}
+
+function generateIciciSecureHash(params: Record<string, string>, secretKey: string): string {
+  const keys = Object.keys(params).sort();
+  const hashText = keys.map((k) => params[k]).join("");
+  return crypto.createHmac("sha256", secretKey).update(hashText).digest("hex");
+}
+
+function formatTxnDate(d = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+// ── POST /api/public/booking/icici-initiate ──────────────────────────────────
+publicBookingRouter.post("/icici-initiate", createOrderLimiter, async (req, res): Promise<void> => {
+  console.log("ROUTE HIT: /api/public/booking/icici-initiate");
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount,
+    notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body as {
+    name: string; phone: string; email?: string; selectedDate: string; timeSlot?: string;
+    testIds?: number[]; packageIds?: number[]; totalAmount: number;
+    notes?: string; isVip?: boolean;
+    ageValue: number; ageUnit?: string; gender: string;
+    referringDoctorId?: number | null; referringDoctorName?: string;
+  };
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  const name = rawName.trim().toUpperCase();
+  if (!selectedDate) {
+    res.status(400).json({ error: "Selected date is required." });
+    return;
+  }
+  if (!Array.isArray(testIds) || !Array.isArray(packageIds) || (testIds.length + packageIds.length) === 0) {
+    res.status(400).json({ error: "Please select at least one test or package." });
+    return;
+  }
+
+  const bookingRef = generateBookingRef();
+  const booking = await reserveOrReject(req, res, { bookingRef, gateway: { iciciTransactionId: bookingRef } });
+  if (!booking) return;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Invalid total amount." });
+    return;
+  }
+
+  const base = getIciciPublicBaseUrl();
+  const returnUrl = `${base}/api/public/booking/icici-callback`;
+
+  // Safe logs before calling ICICI
+  const iciciMerchantId = settings?.iciciMerchantId || process.env.ICICI_MERCHANT_ID || "";
+  const rawBase = process.env.ICICI_BASE_URL || (process.env.NODE_ENV === "production" ? "https://pgpay.icicibank.com" : "https://pgpayuat.icicibank.com");
+  const iciciBase = normalizeIciciBaseUrl(rawBase);
+  const finalIciciInitiateUrl = `${iciciBase}/pg/api/v2/initiateSale`;
+
+  logger.info({
+    publicBaseUrlUsed: base,
+    finalReturnUrl: returnUrl,
+    finalCallbackUrl: returnUrl,
+    finalIciciInitiateUrl,
+    merchantId: iciciMerchantId,
+  }, "ICICI payment initiation safe check logs");
+
+  const activeGateway = settings?.activePaymentGateway || "icici";
+
+  try {
+    const result = await PaymentEngine.initiatePayment(activeGateway, {
+      bookingRef,
+      name,
+      phone: phone.trim(),
+      email: email.trim(),
+      amount,
+      returnUrl,
+      reqHeaders: {
+        "x-forwarded-for": (req.headers["x-forwarded-for"] as string) || "",
+        "user-agent": (req.headers["user-agent"] as string) || "",
+        referer: (req.headers["referer"] as string) || (req.headers["referrer"] as string) || "",
+        origin: (req.headers["origin"] as string) || "",
+        "x-client-ip": req.ip || req.socket?.remoteAddress || "",
+      },
+    });
+
+    if (!result.success) {
+      // safe logging on failure
+      const iciciMerchantId = settings?.iciciMerchantId || process.env.ICICI_MERCHANT_ID || "";
+      const selectedServicesCount = testIds.length + packageIds.length;
+      const activeGateway = settings?.activePaymentGateway || "icici";
+      const rawBase = process.env.ICICI_BASE_URL || (process.env.NODE_ENV === "production" ? "https://pgpay.icicibank.com" : "https://pgpayuat.icicibank.com");
+      const iciciBase = normalizeIciciBaseUrl(rawBase);
+      const finalInitiateUrl = `${iciciBase}/pg/api/v2/initiateSale`;
+
+      logger.error({
+        bookingId: bookingRef,
+        amount,
+        selectedServicesCount,
+        activePaymentGateway: activeGateway,
+        iciciMerchantIdExists: !!iciciMerchantId,
+        finalIciciInitiateUrl: finalInitiateUrl,
+        iciciResponseStatus: 400,
+        iciciResponseBody: result.rawResponse,
+      }, "ICICI initiate failed");
+
+      await failPendingBooking(booking.id, result.errorMessage || "Could not initiate ICICI payment.");
+      res.status(400).json({ error: "Could not initiate ICICI payment. Please try again.", details: result.errorMessage });
+      return;
+    }
+
+    await db.update(onlineBookingsTable)
+      .set({ iciciProviderRefId: result.rawResponse?.tranCtx || null })
+      .where(eq(onlineBookingsTable.id, booking.id));
+
+    res.json({ bookingRef, redirectUrl: result.redirectUrl, tranCtx: result.rawResponse?.tranCtx });
+  } catch (err: any) {
+    await failPendingBooking(booking.id, err.message || "Could not connect to ICICI payment gateway.");
+    // safe logging on exception
+    const iciciMerchantId = settings?.iciciMerchantId || process.env.ICICI_MERCHANT_ID || "";
+    const selectedServicesCount = testIds.length + packageIds.length;
+    const activeGateway = settings?.activePaymentGateway || "icici";
+    const rawBase = process.env.ICICI_BASE_URL || (process.env.NODE_ENV === "production" ? "https://pgpay.icicibank.com" : "https://pgpayuat.icicibank.com");
+    const iciciBase = normalizeIciciBaseUrl(rawBase);
+    const finalInitiateUrl = `${iciciBase}/pg/api/v2/initiateSale`;
+
+    logger.error({
+      err: err.message || String(err),
+      bookingId: bookingRef,
+      amount,
+      selectedServicesCount,
+      activePaymentGateway: activeGateway,
+      iciciMerchantIdExists: !!iciciMerchantId,
+      finalIciciInitiateUrl: finalInitiateUrl,
+    }, "ICICI initiateSale exception");
+    res.status(400).json({ error: "Could not connect to ICICI payment gateway. Please try again." });
+  }
+});
+
+// ── ICICI callback handler (shared for GET and POST) ─────────────────────────
+
+function getBookingConfirmationUrl(base: string, ref: string, gateway: string, failed?: boolean, reason?: string): string {
+  const path = `${base}/book`;
+  if (failed) {
+    return `${path}?failed=1&reason=${encodeURIComponent(reason || "Payment not completed")}`;
+  }
+  return `${path}?confirmed=1&ref=${encodeURIComponent(ref)}&gateway=${encodeURIComponent(gateway)}`;
+}
+
+async function handleIciciCallback(req: any, res: any, queryOrBody: Record<string, string>): Promise<void> {
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+
+  logger.info({ keys: Object.keys(queryOrBody), queryOrBody }, "ICICI callback received");
+
+  const { merchantTxnNo, responseCode, respDescription, txnID, status } = queryOrBody;
+  
+  if (merchantTxnNo) {
+    lastIciciTransaction = {
+      txnRef: merchantTxnNo,
+      responseCode: responseCode || status || "unknown",
+      respDescription: respDescription || "callback",
+      timestamp: new Date().toISOString(),
+    };
+
+    const successCodes = ["0000", "000", "success", "SUCCESS", "SUC", "TXN_SUCCESS", "R1000"];
+    recordPaymentDiagnostic({
+      gateway: "icici",
+      stage: "callback",
+      merchantTxnNo,
+      success: successCodes.includes(responseCode) || successCodes.includes(status),
+      responseCode: responseCode || status || null,
+      responseMessage: respDescription || null,
+      responseBody: queryOrBody,
+      req,
+    }).catch(() => {});
+  }
+
+  if (!merchantTxnNo) {
+    res.redirect(getBookingConfirmationUrl(base, "", "icici", true, "missing_txn_id"));
+    return;
+  }
+
+  if (merchantTxnNo.startsWith("BILLPAY-")) {
+    const parts = merchantTxnNo.split("-");
+    const billId = Number(parts[1]);
+    if (!billId || Number.isNaN(billId)) {
+      res.redirect(`${base}/?booking=icici_failed&reason=invalid_bill_id`);
+      return;
+    }
+
+    const [bill] = await db.select().from(billsTable).where(eq(billsTable.id, billId)).limit(1);
+    if (!bill) {
+      res.redirect(`${base}/?booking=icici_failed&reason=bill_not_found`);
+      return;
+    }
+
+    const [logRecord] = await db.select().from(paymentLogsTable).where(eq(paymentLogsTable.bookingRef, merchantTxnNo)).limit(1);
+    const collectAmount = logRecord ? Number(logRecord.amount) : Number(bill.balanceAmount);
+
+    try {
+      const [settings] = await db.select().from(clinicSettingsTable).where(eq(clinicSettingsTable.id, 1)).limit(1);
+      const activeGateway = settings?.activePaymentGateway || "icici";
+      const gateway = logRecord?.gateway || activeGateway;
+      const provider = await PaymentEngine.getProvider(gateway);
+
+      const verification = await PaymentEngine.verifyPayment(
+        gateway,
+        {
+          bookingRef: merchantTxnNo,
+          payload: queryOrBody,
+        },
+        "Billing Desk",
+        collectAmount
+      );
+
+      if (verification.success && verification.status === "paid") {
+        await db.transaction(async (tx) => {
+          // Re-read under FOR UPDATE so cancel-vs-callback cannot resurrect
+          // a cancelled bill after the outer select.
+          const [lockedBill] = await tx
+            .select()
+            .from(billsTable)
+            .where(eq(billsTable.id, billId))
+            .for("update")
+            .limit(1);
+          if (!lockedBill) return;
+          if (lockedBill.status === "cancelled") {
+            logger.warn(
+              { billId, merchantTxnNo },
+              "[icici-callback] Settlement refused — bill is cancelled (terminal)",
+            );
+            return;
+          }
+
+          // F1 canonical idempotency: key by our merchant reference, but also
+          // match the provider txnID in either column so payments recorded by
+          // the S2S webhook (including pre-F1 rows keyed by txnID) dedupe.
+          const knownRefs = [merchantTxnNo, txnID].filter((r): r is string => Boolean(r));
+          const [existingPayment] = await tx.select()
+            .from(paymentsTable)
+            .where(and(
+              eq(paymentsTable.billId, billId),
+              or(
+                inArray(paymentsTable.referenceNumber, knownRefs),
+                inArray(paymentsTable.gatewayTxnId, knownRefs),
+              ),
+            ))
+            .limit(1);
+
+          if (!existingPayment) {
+            // Bill Desk BILLPAY settle — credit initiating cashier (stored at
+            // initiate). Website booking confirmation below still uses Super Admin.
+            const collectorName = resolveBillDeskCollector({
+              requestPayload: logRecord?.requestPayload,
+              billCreatedByName: lockedBill.createdByName,
+            });
+            const [insertedPay] = await tx.insert(paymentsTable).values({
+              billId,
+              amount: collectAmount.toFixed(2),
+              method: `Online (${provider.displayName})`,
+              referenceNumber: merchantTxnNo,
+              gatewayTxnId: txnID || null,
+              settlementStatus: "captured",
+              notes: `Paid online via ${provider.displayName}. txnID: ${txnID || ""}`,
+              recordedByName: collectorName,
+            }).returning({ id: paymentsTable.id });
+
+            const newPaid = Number(lockedBill.paidAmount) + collectAmount;
+            const refundAmount = Number(lockedBill.refundAmount || 0);
+            const newBalance = Math.max(0, Number(lockedBill.totalAmount) - newPaid - refundAmount);
+            const newStatus = newBalance <= 0.01 ? "paid" : "partial";
+            await tx.update(billsTable).set({
+              paidAmount: newPaid.toFixed(2),
+              balanceAmount: newBalance.toFixed(2),
+              status: newStatus,
+              updatedAt: new Date(),
+            }).where(eq(billsTable.id, billId));
+
+            autoVoucherForPayment({
+              billId,
+              amount: collectAmount,
+              method: `Online (${provider.displayName})`,
+              billNumber: lockedBill.billNumber,
+              patientName: logRecord ? logRecord.patientName : "Billing Desk Online",
+              performedBy: collectorName,
+              paymentId: insertedPay?.id,
+            }).catch(() => {});
+          }
+        });
+      }
+      res.redirect(`${base}/?booking=icici_success&ref=${merchantTxnNo}`);
+      return;
+    } catch (err: any) {
+      logger.error({ err, merchantTxnNo }, "ICICI billing callback verification exception");
+      res.redirect(`${base}/?booking=icici_failed&reason=${encodeURIComponent(err.message || "Payment verification error")}`);
+      return;
+    }
+  }
+
+  const [booking] = await db.select().from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.iciciTransactionId, merchantTxnNo))
+    .limit(1);
+
+  if (!booking) {
+    res.redirect(getBookingConfirmationUrl(base, "", "icici", true, "booking_not_found"));
+    return;
+  }
+
+  const [settings] = await db.select().from(clinicSettingsTable).where(eq(clinicSettingsTable.id, 1)).limit(1);
+  const activeGateway = settings?.activePaymentGateway || "icici";
+  const [logRecord] = await db.select().from(paymentLogsTable).where(eq(paymentLogsTable.bookingRef, merchantTxnNo)).limit(1);
+  const gateway = logRecord?.gateway || activeGateway;
+  const provider = await PaymentEngine.getProvider(gateway);
+
+  // If already paid, skip verification
+  if (booking.status === "paid" || booking.status === "confirmed") {
+    res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, gateway));
+    return;
+  }
+
+  try {
+    const verification = await PaymentEngine.verifyPayment(
+      gateway,
+      {
+        bookingRef: merchantTxnNo,
+        payload: queryOrBody,
+      },
+      booking.name,
+      frozenBookingAmount(booking)
+    );
+
+    if (verification.success && verification.status === "paid") {
+      const payMismatch = capturedMatchesFrozen(booking, frozenBookingAmount(booking));
+      if (payMismatch) {
+        await failPendingBooking(booking.id, payMismatch);
+        res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, gateway, true, "amount_mismatch"));
+        return;
+      }
+      await db.update(onlineBookingsTable)
+        .set({ status: "paid", iciciProviderRefId: verification.providerRefId || booking.iciciProviderRefId })
+        .where(eq(onlineBookingsTable.id, booking.id));
+      
+      try {
+        await confirmBookingInternal(booking.id, "Super Admin");
+      } catch (err: any) {
+        logger.error({ err, bookingId: booking.id }, `Auto-confirmation failed for paid ${provider.displayName} booking`);
+      }
+
+      res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, gateway));
+      return;
+    } else {
+      if (booking.status === "pending_payment") {
+        await db.update(onlineBookingsTable)
+          .set({ status: "payment_failed", failureReason: verification.errorMessage || "Payment verification failed" })
+          .where(eq(onlineBookingsTable.id, booking.id));
+      }
+      res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, gateway, true, verification.errorMessage || "Payment not completed"));
+      return;
+    }
+  } catch (err: any) {
+    logger.error({ err, merchantTxnNo }, `${provider.displayName} callback verification exception`);
+    res.redirect(getBookingConfirmationUrl(base, booking.bookingRef, gateway, true, err.message || "Payment verification error"));
+    return;
+  }
+}
+
+publicBookingRouter.get("/icici-callback", async (req, res): Promise<void> => {
+  const merged = { ...(req.query as Record<string, string>), ...(req.body as Record<string, string>) };
+  await handleIciciCallback(req, res, merged);
+});
+
+publicBookingRouter.post("/icici-callback", async (req, res): Promise<void> => {
+  const merged = { ...(req.query as Record<string, string>), ...(req.body as Record<string, string>) };
+  await handleIciciCallback(req, res, merged);
+});
+
+/**
+ * QR bridge — phones scan a caredeoghar.com URL (bank-whitelisted domain),
+ * then we send them to the ICICI hosted payment page. Encoding the raw ICICI
+ * HPP URL in the QR causes "Domain Validation Fail" on many phone browsers;
+ * the Orange Pay button works because it navigates from caredeoghar.com first.
+ *
+ * Serves a short HTML page (meta-refresh + JS + tap button) so camera-QR apps
+ * that don't follow bare 302s still land on payment.
+ */
+publicBookingRouter.get("/icici-pay/:txnRef", async (req, res): Promise<void> => {
+  const txnRef = String(req.params.txnRef || "").trim();
+  if (!txnRef || txnRef.length > 80 || !/^[A-Za-z0-9._-]+$/.test(txnRef)) {
+    res.status(400).type("html").send("<!doctype html><title>Invalid</title><p>Invalid payment link.</p>");
+    return;
+  }
+
+  const [logRecord] = await db.select()
+    .from(paymentLogsTable)
+    .where(eq(paymentLogsTable.bookingRef, txnRef))
+    .limit(1);
+
+  if (!logRecord) {
+    res.status(404).type("html").send("<!doctype html><title>Not found</title><p>Payment session not found. Ask the counter to start payment again.</p>");
+    return;
+  }
+
+  if (logRecord.status === "success") {
+    res.type("html").send("<!doctype html><title>Paid</title><p style='font-family:sans-serif;padding:24px'>This payment is already complete. You can close this page.</p>");
+    return;
+  }
+  if (logRecord.status === "failed" || logRecord.status === "expired") {
+    res.status(410).type("html").send("<!doctype html><title>Expired</title><p style='font-family:sans-serif;padding:24px'>This payment link is no longer valid. Ask the counter to retry.</p>");
+    return;
+  }
+
+  let redirectUrl = "";
+  try {
+    const reqPayload = JSON.parse(logRecord.requestPayload || "{}") as { redirectUrl?: string; expiryTime?: string };
+    if (reqPayload.expiryTime && new Date(reqPayload.expiryTime) < new Date()) {
+      res.status(410).type("html").send("<!doctype html><title>Expired</title><p style='font-family:sans-serif;padding:24px'>This payment link has expired. Ask the counter to retry.</p>");
+      return;
+    }
+    if (typeof reqPayload.redirectUrl === "string" && /^https?:\/\//i.test(reqPayload.redirectUrl)) {
+      redirectUrl = reqPayload.redirectUrl;
+    }
+  } catch { /* fall through */ }
+
+  if (!redirectUrl) {
+    try {
+      const resp = JSON.parse(logRecord.responsePayload || "{}") as { redirectURI?: string; tranCtx?: string };
+      if (resp.redirectURI && resp.tranCtx) {
+        redirectUrl = assembleIciciRedirectUrl(resp.redirectURI, resp.tranCtx);
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (!redirectUrl || !/^https?:\/\//i.test(redirectUrl)) {
+    res.status(502).type("html").send("<!doctype html><title>Unavailable</title><p style='font-family:sans-serif;padding:24px'>Payment page is not ready. Ask the counter to retry Online Payment.</p>");
+    return;
+  }
+
+  // Escape for HTML attribute / JS string
+  const safeHref = redirectUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  const safeJs = JSON.stringify(redirectUrl);
+
+  res
+    .status(200)
+    .type("html")
+    .setHeader("Cache-Control", "no-store")
+    .send(`<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="refresh" content="0;url=${safeHref}"/>
+<title>Care Diagnostics — Secure Payment</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fff7ed;color:#0f172a}
+  .card{max-width:360px;padding:28px 22px;text-align:center}
+  h1{font-size:20px;margin:0 0 8px}
+  p{font-size:14px;color:#64748b;margin:0 0 18px;line-height:1.4}
+  a.btn{display:inline-block;background:#FF6600;color:#fff;font-weight:700;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:15px}
+</style>
+</head><body>
+<div class="card">
+  <h1>Opening ICICI Orange Pay…</h1>
+  <p>If nothing happens, tap the button below to continue securely.</p>
+  <a class="btn" href="${safeHref}" rel="noopener">Continue to payment</a>
+</div>
+<script>location.replace(${safeJs});</script>
+</body></html>`);
+});
+
+// ── POST /api/public/booking/create-order (Razorpay ─ kept for backwards compat) ──
+publicBookingRouter.post("/create-order", createOrderLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const keyId = process.env.RAZORPAY_KEY_ID || settings.razorpayKeyId;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+  if (!keyId || !keySecret) {
+    res.status(503).json({ error: "Payment gateway not configured. Please contact the clinic." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount,
+    notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body as {
+    name: string; phone: string; email?: string; selectedDate: string; timeSlot?: string;
+    testIds?: number[]; packageIds?: number[]; totalAmount: number;
+    notes?: string; isVip?: boolean;
+    ageValue: number; ageUnit?: string; gender: string;
+    referringDoctorId?: number | null; referringDoctorName?: string;
+  };
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  const name = rawName.trim().toUpperCase();
+  if (!selectedDate) {
+    res.status(400).json({ error: "Selected date is required." });
+    return;
+  }
+  if (!Array.isArray(testIds) || !Array.isArray(packageIds) || (testIds.length + packageIds.length) === 0) {
+    res.status(400).json({ error: "Please select at least one test or package." });
+    return;
+  }
+
+  const bookingRef = generateBookingRef();
+  const booking = await reserveOrReject(req, res, { bookingRef });
+  if (!booking) return;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Invalid total amount." });
+    return;
+  }
+
+  const amountPaise = Math.round(amount * 100);
+
+  const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  let razorpayOrderId = "";
+  try {
+    const rpRes = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Basic ${auth}` },
+      body: JSON.stringify({
+        amount: amountPaise, currency: "INR", receipt: bookingRef,
+        notes: { patient_name: name, patient_phone: phone, booking_ref: bookingRef },
+      }),
+    });
+    if (!rpRes.ok) {
+      const err = await rpRes.json().catch(() => ({}));
+      await failPendingBooking(booking.id, "Payment gateway error.");
+      res.status(400).json({ error: "Payment gateway error. Please try again.", details: (err as { error?: { description?: string } }).error?.description });
+      return;
+    }
+    const rpData = (await rpRes.json()) as { id: string };
+    razorpayOrderId = rpData.id;
+  } catch {
+    await failPendingBooking(booking.id, "Could not connect to payment gateway.");
+    res.status(400).json({ error: "Could not connect to payment gateway. Please try again." });
+    return;
+  }
+
+  await db.update(onlineBookingsTable)
+    .set({ razorpayOrderId })
+    .where(eq(onlineBookingsTable.id, booking.id));
+
+  res.json({ bookingRef, razorpayOrderId, amountPaise, keyId });
+});
+
+// ── POST /api/public/booking/verify-payment (Razorpay) ───────────────────────
+publicBookingRouter.post("/verify-payment", bookingLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+  if (!keySecret) {
+    res.status(503).json({ error: "Payment gateway not configured." });
+    return;
+  }
+
+  const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body as {
+    razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string;
+  };
+
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    res.status(400).json({ error: "Missing payment details." });
+    return;
+  }
+
+  const expected = crypto.createHmac("sha256", keySecret).update(`${razorpayOrderId}|${razorpayPaymentId}`).digest("hex");
+  if (expected !== razorpaySignature) {
+    res.status(400).json({ error: "Payment verification failed. Please contact the clinic." });
+    return;
+  }
+
+  const [booking] = await db.select().from(onlineBookingsTable).where(eq(onlineBookingsTable.razorpayOrderId, razorpayOrderId)).limit(1);
+  if (!booking) { res.status(404).json({ error: "Booking not found." }); return; }
+  if (booking.status === "paid" || booking.status === "confirmed") {
+    res.json({ success: true, bookingRef: booking.bookingRef, alreadyPaid: true });
+    return;
+  }
+
+  const payMismatch = capturedMatchesFrozen(booking, frozenBookingAmount(booking));
+  if (payMismatch) {
+    await failPendingBooking(booking.id, payMismatch);
+    res.status(400).json({ error: payMismatch });
+    return;
+  }
+
+  await db.update(onlineBookingsTable).set({ razorpayPaymentId, razorpaySignature, status: "paid" }).where(eq(onlineBookingsTable.id, booking.id));
+  
+  try {
+    await confirmBookingInternal(booking.id, "Super Admin");
+  } catch (err: any) {
+    logger.error({ err, bookingId: booking.id }, "Auto-confirmation failed for paid Razorpay booking");
+  }
+
+  res.json({ success: true, bookingRef: booking.bookingRef });
+});
+
+// ── Retired OTP endpoints (mobile login) ─────────────────────────────────────
+// SECURITY_FINDING_PUBLIC_BOOKING_PHI_EXPOSURE remediation: the old flow
+// echoed the OTP code in the response (never delivering it anywhere) and
+// issued no session — a bare phone number unlocked PHI. Replaced by
+// /api/patient/send-otp + /api/patient/verify-otp (patientPortal.ts): codes
+// hashed server-side, delivered via WhatsApp, never echoed; verified logins
+// mint server-side patient_sessions tokens. These stubs return 410 so any
+// stale client fails loudly instead of silently insecurely.
+publicBookingRouter.post("/send-otp", bookingLimiter, async (_req, res): Promise<void> => {
+  res.status(410).json({ error: "This login method has been retired. Please update the app." });
+});
+
+publicBookingRouter.post("/verify-otp", bookingLimiter, async (_req, res): Promise<void> => {
+  res.status(410).json({ error: "This login method has been retired. Please update the app." });
+});
+
+// ── POST /api/public/booking/qr-initiate ─────────────────────────────────────
+// Creates a pending booking for QR/UPI payment. The user scans the QR and pays,
+// then a staff member confirms the booking from the ERP. This allows working
+// online bookings even before payment-gateway credentials are approved.
+publicBookingRouter.post("/qr-initiate", createOrderLimiter, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  if (!settings?.onlineBookingEnabled) {
+    res.status(403).json({ error: "Online booking is currently disabled." });
+    return;
+  }
+
+  const {
+    name: rawName, phone, email = "", selectedDate, timeSlot = "",
+    testIds = [], packageIds = [], totalAmount, notes = "", isVip = false,
+    ageValue, ageUnit = "years", gender,
+    referringDoctorId = null, referringDoctorName = "",
+  } = req.body || {};
+
+  const validationError = validateSelfRegistration({
+    name: rawName,
+    phone,
+    gender,
+    ageValue,
+    ageUnit,
+  });
+  if (validationError) {
+    res.status(400).json({ error: validationError });
+    return;
+  }
+
+  if (!selectedDate) {
+    res.status(400).json({ error: "Please fill all required fields and select at least one test." });
+    return;
+  }
+  const name = String(rawName).trim().toUpperCase();
+
+  const booking = await reserveOrReject(req, res);
+  if (!booking) return;
+  const bookingRef = booking.bookingRef;
+  const amount = frozenBookingAmount(booking);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await failPendingBooking(booking.id, "Invalid total amount.");
+    res.status(400).json({ error: "Please fill all required fields and select at least one test." });
+    return;
+  }
+
+  // Build a dynamic UPI intent URL for the exact amount
+  const vpa = settings.upiVpa || settings.kioskUpiVpa || "";
+  const upiName = settings.kioskUpiName || settings.name || "Care Diagnostics";
+  const upiUrl = vpa
+    ? `upi://pay?pa=${encodeURIComponent(vpa)}&pn=${encodeURIComponent(upiName)}&am=${encodeURIComponent(String(amount.toFixed(2)))}&cu=INR&tn=${encodeURIComponent("Care Diagnostics booking " + bookingRef)}`
+    : "";
+
+  res.json({
+    bookingRef,
+    amount,
+    upiVpa: vpa,
+    upiName,
+    upiUrl,
+    upiQrImageUrl: settings.upiQrImageUrl || "",
+    clinicName: settings.name || "Care Diagnostics",
+  });
+});
+
+// ── POST /api/public/booking/qr-confirm ─────────────────────────────────────
+// Patient self-declares "I have paid" after scanning the QR code. This is
+// UNVERIFIED — nobody has checked that the money actually arrived. It must
+// NOT create a bill or mark the booking "confirmed": those require an actual
+// staff member to look at the clinic's bank/UPI app and manually confirm via
+// the staff-authenticated POST /api/online-bookings/:id/confirm (see
+// onlineBookingsRouter, requireStaffAuth-gated), which is what actually
+// calls confirmBookingInternal() and creates the bill.
+//
+// Root-cause fix: this handler previously called confirmBookingInternal()
+// directly — with no staff involvement — immediately creating a bill with
+// status "paid" and the full amount marked received, based purely on the
+// patient's own click. The ERP staff UI (OnlineBookings.tsx) already has a
+// "Paid – Awaiting Confirm" queue and a "Confirm" button specifically for
+// this — status "paid" was always meant to be an intermediate, staff-
+// actionable state, not a final one. This handler now stops there instead
+// of skipping straight through to "confirmed".
+publicBookingRouter.post("/qr-confirm", bookingLimiter, async (req, res): Promise<void> => {
+  const { bookingRef } = req.body || {};
+  if (!bookingRef) { res.status(400).json({ error: "Booking reference required" }); return; }
+
+  const [booking] = await db.select().from(onlineBookingsTable)
+    .where(eq(onlineBookingsTable.bookingRef, bookingRef)).limit(1);
+
+  if (!booking) { res.status(404).json({ error: "Booking not found" }); return; }
+
+  if (booking.status === "paid" || booking.status === "confirmed") {
+    res.json({ success: true, alreadyPaid: true, bookingRef, status: booking.status });
+    return;
+  }
+
+  await db.update(onlineBookingsTable)
+    .set({ status: "paid" })
+    .where(eq(onlineBookingsTable.id, booking.id));
+
+  // Intentionally does NOT call confirmBookingInternal — no bill is created
+  // and no queue token is issued until staff manually verifies the payment
+  // and confirms via the ERP. The patient's confirmation screen already
+  // correctly shows "Booking Received — pending payment confirmation from
+  // staff" (isUnconfirmedQr in book.tsx, based on the absence of any
+  // gateway transaction ID, which is unaffected by this change).
+  res.json({ success: true, bookingRef, status: "paid" });
+});
+
+// ── ICICI Diagnostics routes ──────────────────────────────────────────────────
+import { requireStaffAuth } from "../middleware/requireStaffAuth";
+import JSZip from "jszip";
+
+// GET /icici-diagnostics — full troubleshooting dashboard header (env, URLs, ids, build, last success/failure)
+publicBookingRouter.get("/icici-diagnostics", requireStaffAuth, async (req, res): Promise<void> => {
+  const settings = await getSettings();
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+  const returnUrl = `${base}/api/public/booking/icici-callback`;
+  const iciciBase = getIciciBase();
+  const initiateSaleUrl = `${iciciBase}${getIciciPrefix()}/pg/api/v2/initiateSale`;
+  const commandUrl = `${iciciBase}/pg/api/command`;
+
+  const merchantId = process.env.ICICI_MERCHANT_ID || settings?.iciciMerchantId || "";
+  const aggregatorId = process.env.ICICI_AGGREGATOR_ID || settings?.iciciAggregatorId || "";
+
+  let lastSuccessAt: string | null = null;
+  let lastFailureAt: string | null = null;
+  try {
+    const stats = await getLastSuccessAndFailure("icici");
+    lastSuccessAt = stats.lastSuccessAt;
+    lastFailureAt = stats.lastFailureAt;
+  } catch { /* diagnostics table may not exist yet on older deployments — non-fatal */ }
+
+  res.json({
+    // Environment
+    environment: process.env.NODE_ENV === "production" ? "production" : "uat/test",
+    iciciMode: process.env.NODE_ENV === "production" ? "production" : "uat/test",
+
+    // Merchant identity
+    merchantId,
+    aggregatorId,
+
+    // URLs
+    baseUrl: iciciBase,
+    initiateSaleUrl,
+    commandUrl,
+    callbackUrl: returnUrl,
+    returnUrl,
+    publicBaseUrl: process.env.PUBLIC_BASE_URL || process.env.BASE_URL || null,
+    resolvedPublicBaseUrl: base,
+
+    // Build / deploy identity
+    gitCommit: (process.env.GIT_COMMIT || "unknown").slice(0, 12),
+    dockerImageVersion: process.env.BUILD_NUMBER || "unknown",
+    buildTimestamp: process.env.BUILD_DATE || "unknown",
+
+    // Timeline
+    lastSuccessfulPaymentAt: lastSuccessAt,
+    lastFailedPaymentAt: lastFailureAt,
+    lastTransaction: lastIciciTransaction,
+  });
+});
+
+// GET /icici-diagnostics/history — last 50 attempts (summary rows for a list view)
+publicBookingRouter.get("/icici-diagnostics/history", requireStaffAuth, async (req, res): Promise<void> => {
+  try {
+    const rows = await getRecentDiagnostics("icici", 50);
+    res.json({
+      count: rows.length,
+      attempts: rows.map((r) => ({
+        id: r.id,
+        stage: r.stage,
+        success: r.success,
+        merchantTxnNo: r.merchantTxnNo,
+        bookingRef: r.bookingRef,
+        amount: r.amount,
+        responseCode: r.responseCode,
+        responseMessage: r.responseMessage,
+        httpStatus: r.httpStatus,
+        redirectUri: r.redirectUri,
+        clientIp: r.clientIp,
+        createdAt: r.createdAt,
+      })),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Could not load diagnostics history.", details: err.message });
+  }
+});
+
+// GET /icici-diagnostics/history/:id — full raw detail for one attempt (request, response, headers, timing)
+publicBookingRouter.get("/icici-diagnostics/history/:id", requireStaffAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid diagnostic id." });
+    return;
+  }
+  try {
+    const row = await getDiagnosticById(id);
+    if (!row) {
+      res.status(404).json({ error: "Diagnostic record not found." });
+      return;
+    }
+    res.json({
+      ...row,
+      requestPayload: row.requestPayload ? JSON.parse(row.requestPayload) : null,
+      requestHeaders: row.requestHeaders ? JSON.parse(row.requestHeaders) : null,
+      responseBody: row.responseBody ? tryParseJson(row.responseBody) : null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Could not load diagnostic detail.", details: err.message });
+  }
+});
+
+function tryParseJson(text: string): unknown {
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+// GET /icici-diagnostics/export — downloadable ZIP bundle for sending to ICICI support
+publicBookingRouter.get("/icici-diagnostics/export", requireStaffAuth, async (req, res): Promise<void> => {
+  try {
+    const settings = await getSettings();
+    const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+    const iciciBase = getIciciBase();
+    const rows = await getRecentDiagnostics("icici", 50);
+
+    const zip = new JSZip();
+
+    // 1. Environment snapshot (no secrets)
+    zip.file("environment_snapshot.json", JSON.stringify({
+      environment: process.env.NODE_ENV === "production" ? "production" : "uat/test",
+      merchantId: process.env.ICICI_MERCHANT_ID || settings?.iciciMerchantId || "",
+      aggregatorId: process.env.ICICI_AGGREGATOR_ID || settings?.iciciAggregatorId || "",
+      baseUrl: iciciBase,
+      initiateSaleUrl: `${iciciBase}/pg/api/v2/initiateSale`,
+      commandUrl: `${iciciBase}/pg/api/command`,
+      callbackUrl: `${base}/api/public/booking/icici-callback`,
+      publicBaseUrl: process.env.PUBLIC_BASE_URL || process.env.BASE_URL || null,
+      gitCommit: process.env.GIT_COMMIT || "unknown",
+      dockerImageVersion: process.env.BUILD_NUMBER || "unknown",
+      buildTimestamp: process.env.BUILD_DATE || "unknown",
+      exportedAt: new Date().toISOString(),
+    }, null, 2));
+
+    // 2. Build version info
+    try {
+      const versionRes = await fetch(`${base}/api/system/version`);
+      const versionJson = await versionRes.json();
+      zip.file("build_version.json", JSON.stringify(versionJson, null, 2));
+    } catch {
+      zip.file("build_version.json", JSON.stringify({ note: "Could not fetch /api/system/version at export time." }));
+    }
+
+    // 3. Last 50 attempts — request payload, response payload, headers, timing
+    const historyFolder = zip.folder("payment_attempts");
+    for (const r of rows) {
+      const fileName = `${r.id}_${r.merchantTxnNo || "unknown"}_${r.stage}.json`;
+      historyFolder?.file(fileName, JSON.stringify({
+        id: r.id,
+        stage: r.stage,
+        success: r.success,
+        merchantTxnNo: r.merchantTxnNo,
+        bookingRef: r.bookingRef,
+        amount: r.amount,
+        currency: r.currency,
+        httpStatus: r.httpStatus,
+        responseCode: r.responseCode,
+        responseMessage: r.responseMessage,
+        requestUrl: r.requestUrl,
+        requestPayload: r.requestPayload ? tryParseJson(r.requestPayload) : null,
+        requestHeaders: r.requestHeaders ? tryParseJson(r.requestHeaders) : null,
+        responseBody: r.responseBody ? tryParseJson(r.responseBody) : null,
+        redirectUri: r.redirectUri,
+        tranCtx: r.tranCtx,
+        secureHashMasked: r.secureHashMasked,
+        merchantId: r.merchantId,
+        aggregatorId: r.aggregatorId,
+        returnUrl: r.returnUrl,
+        callbackUrl: r.callbackUrl,
+        publicBaseUrl: r.publicBaseUrl,
+        clientIp: r.clientIp,
+        forwardedFor: r.forwardedFor,
+        userAgent: r.userAgent,
+        referer: r.referer,
+        origin: r.origin,
+        gitCommit: r.gitCommit,
+        dockerImageVersion: r.dockerImageVersion,
+        buildTimestamp: r.buildTimestamp,
+        environment: r.environment,
+        durationMs: r.durationMs,
+        createdAt: r.createdAt,
+      }, null, 2));
+    }
+
+    // 4. Summary README
+    zip.file("README.txt", [
+      "Care Diagnostics — ICICI Orange Pay Diagnostic Bundle",
+      `Exported: ${new Date().toISOString()}`,
+      `Attempts included: ${rows.length} (most recent first)`,
+      "",
+      "Contents:",
+      "  environment_snapshot.json — current merchant/URL/build configuration (no secrets)",
+      "  build_version.json        — ERP version, git commit, schema status",
+      "  payment_attempts/         — one file per attempt: full request + response",
+      "",
+      "Share this bundle with ICICI Orange Pay support for troubleshooting.",
+    ].join("\n"));
+
+    const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+    const fileName = `icici-diagnostics-${new Date().toISOString().slice(0, 10)}.zip`;
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send(buffer);
+  } catch (err: any) {
+    logger.error({ err }, "Failed to build ICICI diagnostic export bundle");
+    res.status(500).json({ error: "Could not build diagnostic bundle.", details: err.message });
+  }
+});
+
+// POST /icici-diagnostics/run — quick reachability check for our own callback URL
+publicBookingRouter.post("/icici-diagnostics/run", requireStaffAuth, async (req, res): Promise<void> => {
+  const base = getPublicBase(req as Parameters<typeof getPublicBase>[0]);
+  const returnUrl = `${base}/api/public/booking/icici-callback`;
+  
+  let reachabilityStatus = "unknown";
+  let reachabilityError = null;
+  
+  try {
+    const checkRes = await fetch(returnUrl, {
+      method: "GET",
+      headers: { "User-Agent": "ERP-Diagnostic-Check" }
+    });
+    reachabilityStatus = `reachable (status: ${checkRes.status})`;
+  } catch (err: any) {
+    reachabilityStatus = "unreachable";
+    reachabilityError = err.message || String(err);
+  }
+
+  res.json({
+    success: reachabilityStatus.startsWith("reachable"),
+    reachabilityStatus,
+    reachabilityError,
+    timestamp: new Date().toISOString(),
+  });
+});
+

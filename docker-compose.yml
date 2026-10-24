@@ -1,0 +1,649 @@
+# =============================================================================
+# Diagnostics ERP
+#
+# Schema update flow (automatic, every deployment):
+#   diagnostics-db (healthy) → diagnostics-db-patch-v2 → diagnostics-schema-verify → diagnostics-api → diagnostics-web
+#
+# diagnostics-db-patch-v2 is the SINGLE automatic schema container. It:
+#   1. Waits for PostgreSQL
+#   2. Bootstraps Drizzle migration tracking (idempotent)
+#   3. Applies Drizzle .sql migration files in order (skips already-applied)
+#   4. Applies imperative ADD COLUMN IF NOT EXISTS patches
+#   5. Applies feature migrations from migrations/ (Phase 1: MRI protocols, Phase 2: neuro prompts)
+#   All steps are idempotent. Safe to run on every deployment.
+#
+# diagnostics-schema-verify runs after diagnostics-db-patch-v2 and confirms the schema
+# actually matches what the application expects before diagnostics-api starts —
+# a safety check, not a migration step itself.
+#
+# diagnostics-migrate is MANUAL/EMERGENCY ONLY (profiles: [manual] — never starts
+# during a normal `docker compose up`):
+#   docker compose --profile manual run --rm diagnostics-migrate
+#   (Runs Drizzle TypeScript migrator — same migrations, alternative path.
+#   Use only when debugging a migration issue outside the normal flow.)
+#
+# diagnostics-migrate is ALSO the approved way to run one-off, owner-reviewed data
+# scripts against production (e.g. Phase F template consolidation, blank-
+# accession USG stamp backfill) — same container, same DATABASE_URL, no
+# separate infrastructure:
+#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:assess
+#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:execute
+#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:rollback
+#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:dry-run
+#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:execute
+#
+# See SYNOLOGY_DB_MIGRATION_DEPLOYMENT.md for full deployment instructions.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Database
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: diagnostics-db
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    ports:
+      # Bind the published Postgres port to LOOPBACK by default.
+      #
+      # This was "${DB_HOST_PORT:-5433}:5432", which docker binds to 0.0.0.0 —
+      # the database was reachable from every machine on the clinic network
+      # (and from the internet if the NAS forwards the port), with the default
+      # password `changeme` still in place:
+      #
+      #   psql -h <nas-ip> -p 5400 -U erp -d diagnostic_erp
+      #
+      # That is full read/write on patients, bills and reports, bypassing every
+      # permission check, rate limit and audit trail in the application —
+      # nothing in the ERP would even log it. SOP/RECOVERY/07_SECURITY/
+      # ERP_SECURITY_AUDIT.md already rated this High and recommended exactly
+      # this change; it was never applied.
+      #
+      # Nothing in the repo needs the host port: all 11 maintenance scripts
+      # reach the database with `docker exec`, and the api container connects
+      # over the compose network, not the host. So loopback costs nothing here.
+      #
+      # DEPLOYMENT.md documents this port as "access from Windows PC". If you
+      # still need that, do NOT set 0.0.0.0 — bind to the Tailscale interface
+      # instead, which is authenticated and not exposed to the LAN:
+      #
+      #   DB_BIND_ADDR=100.x.y.z      # this host's Tailscale IP
+      #
+      # Setting DB_BIND_ADDR=0.0.0.0 restores the old, exposed behaviour and
+      # should only ever be paired with a strong DB_PASSWORD.
+      - "${DB_BIND_ADDR:-127.0.0.1}:${DB_HOST_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: ${DB_USER:-erp}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: ${DB_NAME:-diagnostic_erp}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-erp} -d ${DB_NAME:-diagnostic_erp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------------------
+  # Primary (and only) automatic schema container
+  #
+  # Runs docker/db-patch-entrypoint.sh which:
+  #   Step 1 — waits for PostgreSQL
+  #   Step 2 — bootstraps drizzle.__drizzle_migrations tracking table
+  #   Step 3 — applies Drizzle SQL migration files in journal order
+  #   Step 4 — applies imperative ADD COLUMN IF NOT EXISTS column patch
+  #   Step 5 — applies feature migrations (migrations/ directory):
+  #             seed_mri_protocols.sql      (Phase 1: mri_protocol_specs + seed data)
+  #             seed_neuro_prompt_library.sql (Phase 2: neuro AI prompt library)
+  #             Add new .sql files to migrations/ for future phases.
+  #
+  # Bind mounts (all read-only):
+  #   docker/db-patch-entrypoint.sh → /db-patch-entrypoint.sh
+  #   lib/db/drizzle/               → /migrations/drizzle/
+  #   migrations/                   → /migrations/feature/
+  #
+  # restart: "no" — runs once per deployment, exits 0 on success.
+  # ---------------------------------------------------------------------------
+  db-patch-v2:
+    image: postgres:16-alpine
+    container_name: diagnostics-db-patch-v2
+    restart: "no"
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-changeme}
+      DB_HOST: db
+      DB_USER: ${DB_USER:-erp}
+      DB_NAME: ${DB_NAME:-diagnostic_erp}
+      # Identity stamp — used by the deployment guard to fail loudly instead
+      # of running migrations against the wrong database (see system_database_
+      # identity in docker/db-patch-entrypoint.sh and docs/DEPLOYMENT.md).
+      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-production}
+      # Version metadata — stored in schema_deploy_state by the patch script
+      ERP_VERSION: ${ERP_VERSION:-2.0.0}
+      BUILD_NUMBER: ${BUILD_NUMBER:-0}
+      RELEASE_NAME: ${RELEASE_NAME:-}
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      GIT_BRANCH: ${GIT_BRANCH:-unknown}
+      GIT_TAG: ${GIT_TAG:-unknown}
+      BUILD_DATE: ${BUILD_DATE:-unknown}
+    volumes:
+      # Entrypoint script (read-only)
+      - ./docker/db-patch-entrypoint.sh:/db-patch-entrypoint.sh:ro
+      # Drizzle migration SQL files (read-only)
+      - ./lib/db/drizzle:/migrations/drizzle:ro
+      # Feature migration SQL files — Phase 1 (MRI protocols), Phase 2 (neuro prompts), future phases
+      - ./migrations:/migrations/feature:ro
+    entrypoint: ["sh", "/db-patch-entrypoint.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Schema verifier — runs after db-patch-v2, before diagnostics-api.
+  # Uses the migrate image (Node.js + full workspace) to run
+  # scripts/db-schema-verify.cjs, which parses ALL migration SQL files
+  # (CREATE/ADD/DROP/RENAME COLUMN, RENAME TABLE, ALTER COLUMN TYPE) and
+  # compares the result against the live DB.
+  #
+  # READ-ONLY BY DEFAULT: this container reports schema drift but never
+  # mutates the schema unless SCHEMA_REPAIR=true is set below. diagnostics-db-patch-v2
+  # is the single source of truth for applying schema changes — this
+  # container's job is to confirm the result matches, not to fix it.
+  # Drift alone does not block diagnostics-api from starting (see
+  # STARTUP_SCHEMA_VERIFICATION.md after each deploy for details); set
+  # SCHEMA_VERIFY_STRICT=true to restore the old "any drift blocks
+  # deployment" behaviour. A DB identity mismatch (wrong database entirely)
+  # always blocks regardless of these settings.
+  # ---------------------------------------------------------------------------
+  schema-verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    container_name: diagnostics-schema-verify
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      NODE_ENV: production
+      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      # Auto-repair is OFF by default. Set to "true" only when you've reviewed
+      # STARTUP_SCHEMA_VERIFICATION.md and specifically want ADD COLUMN/CREATE
+      # TABLE/CREATE INDEX IF NOT EXISTS repairs applied on this deploy.
+      SCHEMA_REPAIR: ${SCHEMA_REPAIR:-false}
+      # When true, schema drift found in (non-repair) verify mode blocks
+      # diagnostics-api from starting, same as the old default behaviour.
+      SCHEMA_VERIFY_STRICT: ${SCHEMA_VERIFY_STRICT:-false}
+      # Pass git metadata so startup report includes commit/branch info
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      GIT_BRANCH: ${GIT_BRANCH:-unknown}
+    volumes:
+      # NOTE: scripts/ is intentionally NOT bind-mounted here. scripts/ is its
+      # own pnpm workspace package with dependencies (e.g. pg) installed into
+      # scripts/node_modules at image build time. Bind-mounting the host copy
+      # over it would replace that built node_modules with the bare host
+      # folder (no node_modules on host — deps only exist inside the image),
+      # causing "Cannot find module 'pg'". The script is already baked into
+      # the image from the build context; no mount needed.
+      # Mount migration SQL files read-only
+      - ./lib/db/drizzle:/repo/lib/db/drizzle:ro
+      - ./migrations:/repo/migrations:ro
+      - ./lib/db/drizzle/meta:/repo/lib/db/drizzle/meta:ro
+      # Mount .git read-only so verifier can read commit hash if env vars not set
+      - ./.git:/repo/.git:ro
+      # Mount output directory (writable) so startup MD is written to repo root
+      - ./:/repo/output:rw
+    working_dir: /repo/output
+    command: ["node", "/repo/scripts/db-schema-verify.cjs", "--verbose"]
+    depends_on:
+      db:
+        condition: service_healthy
+      db-patch-v2:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # API server — starts only after both db-patch-v2 and schema-verify complete
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+      args:
+        # Version metadata baked into the image at build time.
+        # deploy-synology.sh exports these AND upserts them into .env so both
+        # `sudo VAR=… docker compose` and Container Manager rebuilds interpolate
+        # real values. ERP_VERSION / BUILD_NUMBER / RELEASE_NAME come from
+        # version.json via bump-build.cjs; GIT_* / BUILD_DATE from live Git.
+        ERP_VERSION: ${ERP_VERSION:-2.0.0}
+        BUILD_NUMBER: ${BUILD_NUMBER:-0}
+        RELEASE_NAME: ${RELEASE_NAME:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        GIT_BRANCH: ${GIT_BRANCH:-unknown}
+        GIT_TAG: ${GIT_TAG:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: diagnostics-api
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    labels:
+      com.diagnostics.version: ${ERP_VERSION:-2.0.0}
+      com.diagnostics.build: ${BUILD_NUMBER:-0}
+      com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
+    environment:
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      NODE_ENV: production
+      PORT: "8200"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Kolkata}
+      # Redis for caching (feature flags, sessions, rate limiting)
+      REDIS_URL: redis://redis:6379
+      # Identity stamp checked (read-only) at startup before any compatibility
+      # patches run — see runStartupMigrations() in src/index.ts. Must match
+      # the same APP_NAME used by diagnostics-db-patch-v2 / diagnostics-schema-verify.
+      APP_NAME: ${APP_NAME:-diagnostics-erp}
+
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env — use a 64-char random string}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env — use a 64-char random string}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+
+      # Super Admin USB pen-drive gate. Must be listed here — Compose does NOT
+      # auto-inject every .env key into the container. Without these, diagnostics-api
+      # sees empty SUPER_ADMIN_USB_* even when .env on disk is correct, so
+      # usb/verify and usbPin auto-login fail (PIN is required / invalid key).
+      SUPER_ADMIN_USB_KEY: ${SUPER_ADMIN_USB_KEY:-}
+      SUPER_ADMIN_USB_PIN: ${SUPER_ADMIN_USB_PIN:-}
+
+      # ── Scheduled jobs ─────────────────────────────────────────────────────
+      # Neither of these was passed into the container before, so there was NO
+      # way to run any scheduled job in production:
+      #
+      #   ENABLE_SCHEDULERS — gates most in-process cron timers (index.ts).
+      #     Unset = billing/PACS/backup/audit timers stay unregistered.
+      #     Overnight AI drain (dicom_retry_queue / ai_shadow_pipeline) now
+      #     starts even when this is unset — do not rely on this flag for MRI
+      #     drafts. Set to 1 on exactly ONE always-on instance for the other
+      #     crons; never on an autoscale replica, or those jobs double-fire.
+      #
+      #   CRON_SECRET — bearer secret for POST /api/internal/cron/* , the
+      #     external trigger path (NAS Task Scheduler / curl). The guard returns
+      #     503 when it is unset, so those endpoints were unusable too.
+      #     Either mechanism works; set at least one or nothing runs.
+      ENABLE_SCHEDULERS: ${ENABLE_SCHEDULERS:-}
+      CRON_SECRET: ${CRON_SECRET:-}
+      # Bearer secret for n8n's WhatsApp automation triggers
+      # (POST /api/internal/automations/whatsapp/*) — deliberately separate
+      # from CRON_SECRET (see internal-automations-whatsapp.ts). Same
+      # fail-closed-when-unset guard as CRON_SECRET above: unset means those
+      # endpoints return 503, not an open door. There is no DB-settings
+      # equivalent for this one (unlike WhatsApp credentials, which live in
+      # the unified Admin -> Integrations -> WhatsApp settings page) — it
+      # must be set here or n8n can never reach the dispatch/health endpoints.
+      WHATSAPP_AUTOMATION_SECRET: ${WHATSAPP_AUTOMATION_SECRET:-}
+      # Static key for CARE Reporting Studio server-to-server bridge
+      # (GET/POST /api/internal/reporting-studio/*). Sent as x-api-key.
+      # Unset → those endpoints return 503. Generate: openssl rand -hex 24
+      REPORTING_STUDIO_API_KEY: ${REPORTING_STUDIO_API_KEY:-}
+      # Age in hours after which the dead-man alert fires (default 26).
+      BACKUP_DEADMAN_MAX_AGE_HOURS: ${BACKUP_DEADMAN_MAX_AGE_HOURS:-}
+      # Dedicated backup encryption key (lib/backupCrypto.ts resolveBackupPassphrase).
+      # This was NOT passed into the container before, so setting it in .env had
+      # no effect whatsoever and every backup silently fell back to encrypting
+      # with SESSION_SECRET (confirmed in production: "key=SESSION_SECRET").
+      #
+      # That matters on rotation: candidatePassphrases() only ever tries
+      # BACKUP_PASSPHRASE and the CURRENT SESSION_SECRET — there is no
+      # previous-secret slot — so rotating SESSION_SECRET without this set makes
+      # the app unable to decrypt every older .enc file. Set this to the
+      # PREVIOUS SESSION_SECRET when rotating and older backups stay readable.
+      BACKUP_PASSPHRASE: ${BACKUP_PASSPHRASE:-}
+
+      OBJECT_STORAGE_DIR: ${OBJECT_STORAGE_DIR:-/app/data/object-storage}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://localhost}
+
+      # ── Hope Hospital integration ──────────────────────────────────────────
+      # When any of these are set, diagnostics-api entrypoint + startup bootstrap
+      # register the HOPE partner and enable ff_hope_care_referrals (idempotent).
+      # Template: deploy/synology/care.env (keys matched to Hope hope.env).
+      INTEGRATION_HOPE_CALLBACK_URL: ${INTEGRATION_HOPE_CALLBACK_URL:-}
+      INTEGRATION_HOPE_SIGNING_SECRET: ${INTEGRATION_HOPE_SIGNING_SECRET:-}
+      HOPE_CARE_INTEGRATION_FORCE: ${HOPE_CARE_INTEGRATION_FORCE:-}
+      HOPE_PARTNER_KEY: ${HOPE_PARTNER_KEY:-}
+
+      ICICI_BASE_URL: ${ICICI_BASE_URL:-https://pgpay.icicibank.com}
+      ICICI_URL_PREFIX: ${ICICI_URL_PREFIX:-/pg/api/v2}
+      ICICI_MERCHANT_ID: ${ICICI_MERCHANT_ID:-100000000455452}
+      ICICI_AGGREGATOR_ID: ${ICICI_AGGREGATOR_ID:-100000000455451}
+      ICICI_SECRET_KEY: ${ICICI_SECRET_KEY:?ICICI_SECRET_KEY must be set in .env}
+
+      FINGERPRINT_BRIDGE_SECRET: ${FINGERPRINT_BRIDGE_SECRET:-}
+      # Bootstrap admin safety (see .env.example for full explanation).
+      # MUST be false/unset in production after the first successful admin
+      # login — leaving it true resets the admin PIN back to default on
+      # every container restart.
+      BOOTSTRAP_ADMIN_FORCE: ${BOOTSTRAP_ADMIN_FORCE:-false}
+      ORTHANC_URL: ${ORTHANC_URL:-}
+      STAMP_ACCESSION_FROM_BILL: ${STAMP_ACCESSION_FROM_BILL:-false}
+      # Internal Docker service name for server-side health probes (never use LAN IP here)
+      ORTHANC_INTERNAL_URL: ${ORTHANC_INTERNAL_URL:-http://care-orthanc:8042}
+      # ── Orthanc → ERP study sync: RUN EXACTLY ONE ─────────────────────────
+      # Two implementations of the same job exist:
+      #   1. care-erp-sync (the care_erp_sync.py container in the SEPARATE
+      #      care-pacs compose project). It sits on care-pacs-net, so
+      #      `care-orthanc` resolves for it, and it is the one actually working.
+      #   2. this ERP's in-process poller (lib/pacs/orthancChangesPoller.ts).
+      # care-pacs is a different compose project with its own bridge network, so
+      # `care-orthanc` does NOT resolve from diagnostics-api — the in-process poller
+      # just fails every 20s (getaddrinfo ENOTFOUND care-orthanc) and logs.
+      #
+      # Set this to false whenever care-erp-sync is deployed — which is exactly
+      # what that script's own header instructs, to avoid double-sync. This var
+      # was already read by the code but never passed into the container, so it
+      # could not be set at all.
+      ORTHANC_CHANGES_POLLER: ${ORTHANC_CHANGES_POLLER:-}
+      ORTHANC_POLL_INTERVAL_MS: ${ORTHANC_POLL_INTERVAL_MS:-}
+      # Required for health checks and DICOM probes to reach LAN IPs (modalities, PACS)
+      ALLOW_PRIVATE_IPS: ${ALLOW_PRIVATE_IPS:-true}
+      # Optional: Ollama AI URL (leave blank if not installed)
+      OLLAMA_URL: ${OLLAMA_URL:-}
+      # ── Local AI / PaddleOCR worker (Windows PC on LAN) ─────────────────────
+      # Synology diagnostics-api → Windows Ollama :11434 + OCR worker :8090.
+      # See docs/ai-ocr/AI_OCR_PIPELINE.md. Rollback: OCR_ENGINE=tesseract|vision.
+      OLLAMA_PRIMARY_URL: ${OLLAMA_PRIMARY_URL:-}
+      OLLAMA_FALLBACK_URL: ${OLLAMA_FALLBACK_URL:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-}
+      OCR_ENGINE: ${OCR_ENGINE:-paddle}
+      OCR_PROFILE: ${OCR_PROFILE:-fast}
+      OCR_DEVICE: ${OCR_DEVICE:-cpu}
+      OCR_LOW_CONFIDENCE_THRESHOLD: ${OCR_LOW_CONFIDENCE_THRESHOLD:-0.80}
+      OCR_RETRY_ACCURATE: ${OCR_RETRY_ACCURATE:-true}
+      OCR_TESSERACT_FALLBACK: ${OCR_TESSERACT_FALLBACK:-true}
+      OCR_VISION_FALLBACK: ${OCR_VISION_FALLBACK:-false}
+      OCR_WORKER_URL: ${OCR_WORKER_URL:-}
+      OCR_WORKER_TOKEN: ${OCR_WORKER_TOKEN:-}
+      OCR_WORKER_CONCURRENCY: ${OCR_WORKER_CONCURRENCY:-1}
+      AI_MODE: ${AI_MODE:-AUTO}
+      AI_MODEL_FAST: ${AI_MODEL_FAST:-gemma3:4b}
+      AI_MODEL_STANDARD: ${AI_MODEL_STANDARD:-gemma3:4b}
+      AI_MODEL_LARGE: ${AI_MODEL_LARGE:-gemma3:12b}
+      # Overnight MRI drafts: Qwen3-VL 8B. Compose does not auto-inject .env —
+      # OLLAMA_NUM_CTX / OLLAMA_THINK must be listed here or the container never sees them.
+      AI_MODEL_VISION: ${AI_MODEL_VISION:-qwen3-vl:8b}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-16384}
+      OLLAMA_THINK: ${OLLAMA_THINK:-0}
+      # Qwen Model Studio (Alibaba DashScope OpenAI-compatible). Compose does NOT
+      # auto-inject .env — list these or diagnostics-api never sees QWEN_* even when the
+      # host .env is correct. QWEN_BASE_URL may be the intl default or a workspace
+      # Singapore MaaS URL ending in /compatible-mode/v1 (code does not re-append).
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-}
+      AI_TIMEOUT_FAST_SECONDS: ${AI_TIMEOUT_FAST_SECONDS:-120}
+      AI_TIMEOUT_LARGE_SECONDS: ${AI_TIMEOUT_LARGE_SECONDS:-300}
+      AI_CONCURRENCY: ${AI_CONCURRENCY:-1}
+      AI_TEMPERATURE_EXTRACTION: ${AI_TEMPERATURE_EXTRACTION:-0}
+      AI_TEMPERATURE_DRAFT: ${AI_TEMPERATURE_DRAFT:-0.1}
+      ORTHANC_USERNAME: ${ORTHANC_USERNAME:-}
+      ORTHANC_PASSWORD: ${ORTHANC_PASSWORD:-}
+      # Shared folder for Orthanc worklists plugin (.wl files). When set, billing
+      # auto-publishes ERP patient/doctor names + accession to the modality MWL.
+      # Mount the same host path into Orthanc's worklists Database directory.
+      # Shared with care-pacs Orthanc worklists plugin (host path must match).
+      # Live env uses /orthanc-worklists; compose also aliases /orthanc-mwl/worklists.
+      ORTHANC_WORKLIST_DIR: ${ORTHANC_WORKLIST_DIR:-/orthanc-worklists}
+      # Optional override. Default staging is <ORTHANC_WORKLIST_DIR>/staging on the
+      # same bind mount (required for atomic rename). Do not point this at a
+      # different Docker volume — that reproduces production EXDEV.
+      ORTHANC_WORKLIST_STAGING_DIR: ${ORTHANC_WORKLIST_STAGING_DIR:-}
+      ORTHANC_WORKLIST_BAD_DIR: ${ORTHANC_WORKLIST_BAD_DIR:-/worklists-bad}
+      PACS_PROVIDER: ${PACS_PROVIDER:-orthanc}
+      PACS_VIEWER_TYPE: ${PACS_VIEWER_TYPE:-ohif}
+      OHIF_URL: ${OHIF_URL:-}
+      # Browser/Weasis-reachable WADO URL (distinct from ORTHANC_INTERNAL_URL,
+      # which is container-to-container only) — never a Docker bridge IP.
+      WEASIS_WADO_PUBLIC_URL: ${WEASIS_WADO_PUBLIC_URL:-}
+      # Optional: dashboard health-check probe override (see .env.example)
+      OHIF_INTERNAL_URL: ${OHIF_INTERNAL_URL:-}
+      WADO_URL: ${WADO_URL:-}
+    volumes:
+      - object_storage:/app/data/object-storage
+      # Persistent uploads tree (Docker named volume → container /app/data/uploads).
+      # Includes radiology-key-images/ (Phase 1 frozen evidence). Host path is the
+      # Docker volume data dir (Synology typically under /volume1/@docker/volumes/
+      # <project>_uploads_data/_data). DB backup alone is NOT sufficient for
+      # frozen key-image evidence — include this volume in backup/restore.
+      - uploads_data:/app/data/uploads
+      # Backup destination — was completely MISSING, and it is the reason
+      # every "successful" scheduled backup has never actually reached the
+      # NAS.
+      #
+      # Backup & Replication jobs are configured (via the admin UI) with a
+      # destinationPath like /volume1/docker/backups/db. That path is
+      # meaningful only on the HOST. Without a matching bind mount, the same
+      # string is just an ordinary path INSIDE the container — encryptBackupFile
+      # (cron.ts) happily mkdir's it and writes the .enc file there, the job
+      # logs "success", the SHA-256 matches, the dead-man check stays green —
+      # and the file lives entirely in the container's ephemeral writable
+      # layer. It is not on this NAS. It is deleted the moment this container
+      # is recreated (an image update, `docker compose up --build`, even a
+      # crash-restart under some storage drivers), with no error anywhere.
+      #
+      # Default matches the destinationPath already configured on the
+      # existing Nightly/config/DB jobs, so this requires NO change to those
+      # job rows — the same string now resolves to a real, persistent
+      # directory on the NAS instead of a phantom one inside the container.
+      # Override BACKUP_HOST_DIR in .env only if your jobs use a different
+      # destinationPath.
+      - ${BACKUP_HOST_DIR:-/volume1/docker/backups}:/volume1/docker/backups
+      # Staging for atomic MWL publish lives UNDER the live worklists mount
+      # (<ORTHANC_WORKLIST_DIR>/staging) so rename() is same-filesystem.
+      # Do NOT bind a separate host path for staging — that caused production EXDEV.
+      # Modality Worklist (.wl) — same host folder Orthanc worklists plugin reads.
+      # care-pacs mounts this at /var/lib/orthanc/worklists.
+      # Live .env may set ORTHANC_WORKLIST_DIR=/orthanc-worklists OR /orthanc-mwl/worklists;
+      # bind both paths to the same NAS folder so dump2dcm and Orthanc see the same files.
+      - ${ORTHANC_WORKLIST_HOST_DIR:-/volume1/docker/care-pacs/orthanc/worklists}:/orthanc-mwl/worklists
+      - ${ORTHANC_WORKLIST_HOST_DIR:-/volume1/docker/care-pacs/orthanc/worklists}:/orthanc-worklists
+      # mwl-guard quarantine (read-only). Without this mount, Settings reports 0 quarantined
+      # even when hundreds of invalid .wl files sit on the NAS. Never copy these back.
+      - ${ORTHANC_WORKLIST_BAD_HOST_DIR:-/volume1/docker/care-pacs/orthanc/worklists-bad}:/worklists-bad:ro
+    healthcheck:
+      # ── Liveness probe (process alive + port responding) ───────────────────
+      # Hits GET /health — registered on the Express app with no auth, no
+      # rate-limit, and no database dependency. Returns {"ok":true,...} as
+      # soon as Node is listening. This is intentionally a liveness probe,
+      # not a readiness probe:
+      #
+      #   WHY NOT /api/health/schema:
+      #     That endpoint checks that db-patch-v2 ran AND critical schema
+      #     columns exist (schema_deploy_state table, db_patch_ok=true flag,
+      #     etc.). If those checks fail — which they do on any fresh database
+      #     where schema_deploy_state was not yet created — the container
+      #     returns 503 forever, permanently marking itself unhealthy. A
+      #     Docker HEALTHCHECK is a liveness probe; permanently failing it
+      #     causes Docker to restart the container in a crash-loop. The
+      #     schema check belongs in the diagnostics-web depends_on condition, which
+      #     is where it has always lived and continues to live (see below).
+      #
+      #   WHY JSON ARRAY FORMAT (not YAML block-list):
+      #     The CMD-SHELL block-list format ("- CMD-SHELL" / "- command") is
+      #     known to be parsed inconsistently by older Docker Engine versions
+      #     and Synology Container Manager. The JSON array ["CMD-SHELL", "..."]
+      #     is the canonical format in the Docker Compose spec and is
+      #     universally supported.
+      #
+      # Timing:
+      #   start_period: 60s  — allows in-process startup tasks to complete
+      #     (bootstrap admin seed, PACS settings seed, runtime column patches)
+      #     before the first check fires. The logs show these complete before
+      #     "Server listening" is printed, so 60s is deliberately conservative.
+      #   interval: 15s      — check frequency after the start period.
+      #   timeout: 10s       — maximum time for a single check to respond.
+      #   retries: 5         — 5 consecutive failures (75s after start_period)
+      #     required before Docker marks the container unhealthy. Tolerates
+      #     brief transient failures without triggering false unhealthy states.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      db:
+        condition: service_healthy
+      db-patch-v2:
+        condition: service_completed_successfully
+      # Previously MISSING: diagnostics-api never actually waited on schema-verify
+      # completing, despite comments elsewhere claiming it did — the DB
+      # identity check and SCHEMA_VERIFY_STRICT mode are meaningless safety
+      # guards without this. In the default (non-strict) mode, ordinary
+      # schema drift still exits 0 quickly here, so this adds no meaningful
+      # delay to a normal deploy — it only actually blocks on a real
+      # DB-identity mismatch or an explicit SCHEMA_VERIFY_STRICT=true.
+      schema-verify:
+        condition: service_completed_successfully
+      # Redis is best-effort — if it fails to start, the API still works
+      # (just without caching). We don't block startup on Redis health.
+      redis:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Web / nginx
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+      args:
+        # Stamp the diagnostic-erp SPA with the same commit as diagnostics-api.
+        # Canonical env: GIT_COMMIT (set by deploy-synology.sh). The Vite
+        # resolver also accepts CARE_GIT_SHA / VITE_GIT_COMMIT as aliases.
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    container_name: diagnostics-web
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Build traceability for the static nginx image, matching the api
+    # service's labels. The SPA also bakes VITE_GIT_COMMIT at build time;
+    # Settings → About compares that to GET /api/health build.commit.
+    labels:
+      com.diagnostics.version: ${ERP_VERSION:-2.0.0}
+      com.diagnostics.build: ${BUILD_NUMBER:-0}
+      com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
+    ports:
+      - "${HOST_PORT:-3100}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    # Previously MISSING — the web/nginx container had no health check, so
+    # Container Manager reported it healthy the instant the process started,
+    # even if nginx was mis-configured. GET /nginx-health is answered by nginx
+    # itself (no api upstream), so this reflects "nginx is serving" without
+    # coupling to the api container (which has its own health gate above).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:80/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Manual/emergency migration container — NOT part of normal deployment.
+  #
+  # diagnostics-db-patch-v2 (above) already runs all automatic, safe production
+  # migrations on every deployment — idempotent Drizzle .sql migrations,
+  # imperative ADD COLUMN IF NOT EXISTS patches, and feature migrations from
+  # migrations/*.sql. Normal Synology Container Manager rebuilds should
+  # NEVER need this service.
+  #
+  # diagnostics-migrate exists only for manual/emergency use: running the Drizzle
+  # TypeScript migrator directly (same migrations, alternative execution
+  # path) when debugging a migration issue outside the normal flow.
+  #
+  # `profiles: [manual]` ensures this service is excluded from a normal
+  # `docker compose up` / `docker compose up -d` — Compose only starts
+  # services tagged with a profile when that profile is explicitly
+  # requested. This prevents it from ever running duplicate/competing
+  # migrations alongside diagnostics-db-patch-v2 during a routine rebuild.
+  #
+  # Run manually (only when genuinely needed):
+  #   docker compose --profile manual run --rm diagnostics-migrate
+  # ---------------------------------------------------------------------------
+  migrate:
+    profiles:
+      - manual
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    container_name: diagnostics-migrate
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      NODE_ENV: production
+      APP_NAME: ${APP_NAME:-diagnostics-erp}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ===========================================================================
+  # NOTE: A standalone "Federated Radiology Service" (separate container +
+  # database at artifacts/radiology-service) was scaffolded here previously
+  # but never built out. Radiology reporting is fully integrated into the
+  # main ERP/API instead (Reporting Workspace, Quick Select, Protocol
+  # Engine — see artifacts/diagnostic-erp/src/pages/RadiologyReportingWorkspace.tsx).
+  # The obsolete radiology-db/radiology services and their volume were
+  # removed on 2026-07-07 since artifacts/radiology-service does not exist
+  # and nothing in the running app builds or depends on them.
+  # ===========================================================================
+
+# Add the BOUNDARY_API_KEY to the diagnostics-api service's environment in your
+# .env file so both containers share the same secret:
+#   BOUNDARY_API_KEY=some-long-random-string
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Redis — in-memory cache for feature flags, session lookups, and rate limiting.
+  # Caches GET /api/feature-flags (the #1 most-called endpoint, 76% of all
+  # requests in production logs) so it hits the DB only once per 60s instead of
+  # 300+ times/minute. Also available for future use: session cache, rate
+  # limiting, queue token cache.
+  # ───────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: diagnostics-redis
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    # No port published — only accessible within the Docker network (diagnostics-api connects via redis:6379)
+    # If you need external access for debugging, uncomment:
+    # ports:
+    #   - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - default
+
+volumes:
+  db_data:
+    external: true
+    name: diagnostics_main_db_data
+  object_storage:
+  uploads_data:

@@ -1,0 +1,182 @@
+/**
+ * Phase 10A: Lesion Tracker — longitudinal lesion monitoring across studies.
+ * All features OFF by default. Radiologist is always final authority.
+ */
+
+import {
+  pgTable, serial, integer, text, timestamp, boolean, real, index,
+} from "drizzle-orm/pg-core";
+
+// ── radiology_lesions — master lesion registry ──
+export const radiologyLesionsTable = pgTable(
+  "radiology_lesions",
+  {
+    id: serial("id").primaryKey(),
+    patientId: integer("patient_id").notNull(),
+    // Identifiers
+    lesionLabel: text("lesion_label").notNull(),
+    location: text("location").notNull(),
+    organ: text("organ"),
+    subLocation: text("sub_location"),
+    // Modality context
+    modality: text("modality").notNull(),
+    bodyPart: text("body_part"),
+    // First detection
+    firstStudyId: integer("first_study_id"),
+    firstOrderId: integer("first_order_id"),
+    firstDetectedAt: timestamp("first_detected_at"),
+    firstDetectedBy: text("first_detected_by"),
+    // Current state
+    status: text("status").notNull().default("active"),
+    isResolved: boolean("is_resolved").notNull().default(false),
+    resolvedAt: timestamp("resolved_at"),
+    resolvedBy: text("resolved_by"),
+    // Classification
+    lesionType: text("lesion_type"),
+    classification: text("classification"),
+    classificationValue: text("classification_value"),
+    morphology: text("morphology"),
+    // Notes
+    notes: text("notes"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (t) => ({
+    patientIdx: index("radiology_lesions_patient_idx").on(t.patientId),
+    statusIdx: index("radiology_lesions_status_idx").on(t.status),
+  }),
+);
+
+// ── radiology_lesion_timeline — per-study measurements for each lesion ──
+export const radiologyLesionTimelineTable = pgTable(
+  "radiology_lesion_timeline",
+  {
+    id: serial("id").primaryKey(),
+    lesionId: integer("lesion_id").notNull(),
+    patientId: integer("patient_id").notNull(),
+    studyId: integer("study_id"),
+    orderId: integer("order_id"),
+    // Measurement
+    measurementMm: real("measurement_mm"),
+    measurementMm2: real("measurement_mm2"),
+    measurementMm3: real("measurement_mm3"),
+    volumeCc: real("volume_cc"),
+    // Image reference
+    seriesNumber: text("series_number"),
+    imageNumber: text("image_number"),
+    sliceLocation: text("slice_location"),
+    // Status assessment
+    changeStatus: text("change_status"),
+    changePercent: real("change_percent"),
+    // Signal/density/enhancement
+    signalCharacteristics: text("signal_characteristics"),
+    enhancement: text("enhancement"),
+    // Reporter
+    reportedBy: text("reported_by"),
+    reportedAt: timestamp("reported_at"),
+    notes: text("notes"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => ({
+    lesionIdx: index("radiology_lesion_timeline_lesion_idx").on(t.lesionId),
+    patientIdx: index("radiology_lesion_timeline_patient_idx").on(t.patientId),
+    studyIdx: index("radiology_lesion_timeline_study_idx").on(t.studyId),
+  }),
+);
+
+// ── radiology_measurements — structured measurement records linked to study ──
+export const radiologyMeasurementsTable = pgTable(
+  "radiology_measurements",
+  {
+    id: serial("id").primaryKey(),
+    patientId: integer("patient_id").notNull(),
+    studyId: integer("study_id"),
+    orderId: integer("order_id"),
+    modality: text("modality").notNull(),
+    bodyPart: text("body_part").notNull(),
+    measurementType: text("measurement_type").notNull(),
+    label: text("label").notNull(),
+    // Canonical Universal Measurement Registry id (e.g. "CBD"); nullable —
+    // labels outside the registry save exactly as before.
+    measurementId: text("measurement_id"),
+    value: text("value").notNull(),
+    unit: text("unit"),
+    normalRangeLow: real("normal_range_low"),
+    normalRangeHigh: real("normal_range_high"),
+    isAbnormal: boolean("is_abnormal"),
+    notes: text("notes"),
+    reportedBy: text("reported_by"),
+    reportedAt: timestamp("reported_at"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => ({
+    patientIdx: index("radiology_measurements_patient_idx").on(t.patientId),
+    studyIdx: index("radiology_measurements_study_idx").on(t.studyId),
+    modalityIdx: index("radiology_measurements_modality_idx").on(t.modality),
+  }),
+);
+
+// ── viewer_measurements — centralized bridge for viewer imported measurements ──
+export const viewerMeasurementsTable = pgTable(
+  "viewer_measurements",
+  {
+    id: serial("id").primaryKey(),
+    patientId: integer("patient_id").notNull(),
+    studyId: integer("study_id"),
+    orderId: integer("order_id"),
+    studyInstanceUID: text("study_instance_uid").notNull(),
+    seriesInstanceUID: text("series_instance_uid"),
+    sopInstanceUID: text("sop_instance_uid"),
+    frameNumber: integer("frame_number").default(1),
+    viewerName: text("viewer_name").notNull(), // "OHIF" | "Weasis" | "DICOM SR" | "manual" | "AI"
+    measurementType: text("measurement_type").notNull(), // "linear" | "area" | "volume" | "ellipse"
+    // Canonical Universal Measurement Registry id, when the exporting bridge
+    // (DICOM SR concept, AI, or manual pick) knows the anatomical concept —
+    // the viewer's caliper kind alone carries no semantic identity.
+    measurementId: text("measurement_id"),
+    value: text("value").notNull(),
+    unit: text("unit").notNull(),
+    sliceNumber: integer("slice_number"),
+    imageCoordinates: text("image_coordinates"), // JSON string
+    confidence: real("confidence").default(1.0),
+    status: text("status").notNull().default("pending"), // "pending" | "imported" | "ignored"
+    importedBy: text("imported_by"),
+    importTime: timestamp("import_time"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (t) => ({
+    studyUidIdx: index("viewer_measurements_study_uid_idx").on(t.studyInstanceUID),
+    patientIdx: index("viewer_measurements_patient_idx").on(t.patientId),
+  }),
+);
+
+export type ViewerMeasurement = typeof viewerMeasurementsTable.$inferSelect;
+
+// ── radiology_copilot_logs — audit log of dismissals/acceptances ──
+export const radiologyCopilotLogsTable = pgTable(
+  "radiology_copilot_logs",
+  {
+    id: serial("id").primaryKey(),
+    staffName: text("staff_name").notNull(),
+    studyInstanceUID: text("study_instance_uid"),
+    suggestionType: text("suggestion_type").notNull(), // "clinical" | "checklist" | "contradiction" | "comparison"
+    suggestionContent: text("suggestion_content").notNull(),
+    action: text("action").notNull(), // "dismissed" | "accepted"
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  }
+);
+
+// ── radiology_user_copilot_profiles — radiologist private preferences/learning profiles ──
+export const radiologyUserCopilotProfilesTable = pgTable(
+  "radiology_user_copilot_profiles",
+  {
+    id: serial("id").primaryKey(),
+    staffName: text("staff_name").notNull().unique(),
+    ignoredWarnings: text("ignored_warnings").array(),
+    favoriteTemplates: text("favorite_templates").array(),
+    favoriteChocolateBox: text("favorite_chocolate_box").array(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  }
+);
+

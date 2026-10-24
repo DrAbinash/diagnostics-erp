@@ -1,0 +1,4222 @@
+/**
+ * Radiology Report Generator API
+ *
+ * Provides template library, voice-text cleanup, HTML report generation,
+ * draft save/restore, key image upload, and final report save integration.
+ *
+ * All endpoints require a valid staff session — mounted with requireStaffAuth
+ * + requireStaffPermission("/orders") in routes/index.ts.
+ *
+ * Endpoints (relative to /api/radiology/report-generator):
+ *   GET  /templates
+ *   POST /voice-cleanup
+ *   POST /generate
+ *   POST /save-draft
+ *   GET  /drafts
+ *   GET  /drafts/:id
+ *   POST /key-images           (multipart/form-data)
+ *   GET  /key-images
+ *   PUT  /key-images/:id
+ *   DELETE /key-images/:id
+ */
+
+import { Router, type Request, type Response } from "express";
+import path from "node:path";
+import fs from "node:fs/promises";
+import multer from "multer";
+import { z } from "zod";
+import { db } from "@workspace/db";
+import { buildSpinalCanalApTableHtml } from "../lib/spinalCanalApTable";
+import {
+  radiologyReportDraftsTable,
+  radiologyVoiceLogsTable,
+  radiologyReportKeyImagesTable,
+  radiologyStudiesTable,
+  radiologyWorklistTable,
+  patientsTable,
+  radiologyTextMacrosTable,
+  radiologyReportPreferencesTable,
+  radiologyImageReferencesTable,
+  radiologyNormalSnippetsTable,
+  radiologistStylePreferencesTable,
+  radiologistVoicePreferencesTable,
+  radiologyReportLifecycleLogTable,
+  clinicSettingsTable,
+  spinalMeasurementsTable,
+  radiologySmartMacrosTable,
+  radiologyInstitutionalStylesTable,
+  mriProtocolSpecsTable,
+  mriProtocolQualityResultsTable,
+  reportFindingInstancesTable,
+  pacsSettingsTable,
+  testsTable,
+  doctorsTable,
+} from "@workspace/db/schema";
+import { eq, and, desc, isNull, asc, ilike, or, inArray, sql } from "drizzle-orm";
+import { requireAdminRole, type StaffAuthRequest } from "../middleware/requireStaffAuth";
+import {
+  escapeHtml, renderReportDocument, formatReportDate, formatReportDateShort,
+  type ReportDocumentModel, type ReportKeyImageModel,
+} from "../lib/reportPresentation";
+import { formatAgeAtExamination, formatDocumentedStudyAge } from "../lib/reportAge";
+import { normalizeStudyDate } from "../lib/reportStudyIdentity";
+import {
+  collapseSpacedOutLetters,
+  enrichReferringDoctorWithDegree,
+} from "../lib/doctorDegreeLookup";
+import { resolveTemplateForRender } from "../lib/presentationTemplateStore";
+import { parseImageFraming, serializeImageFraming } from "../lib/imageFraming";
+import {
+  REPORT_HEADER_SCALE_KEY,
+  REPORT_LOGO_SCALE_KEY,
+  REPORT_FOOTER_SCALE_KEY,
+} from "../lib/reportLetterheadScale";
+import {
+  applyInstitutionalTemplateOverrides,
+  buildReportSurfaceCss,
+  parseReportFormatNudge,
+} from "../lib/institutionalReportStyle";
+import {
+  resolveDraftPrintKeyImagesDetailed,
+  frozenIntegrityBannerHtml,
+  detachKeyImagesFromObservation,
+  isSafeKeyImageFilename,
+  FROZEN_KEY_IMAGE_DIR,
+  FROZEN_KEY_IMAGE_URL_PREFIX,
+  normalizeKeyImageForPrint,
+  parseViewportSnapshotJson,
+  parseAnnotationMetadataJson,
+  parseCapturedAt,
+  parseViewer,
+  parseModality,
+  isReasonableDicomUid,
+} from "../lib/frozenKeyImages";
+import {
+  KEY_IMAGE_GRANT_QUERY_PARAM,
+  mintKeyImageGrant,
+} from "../lib/keyImageAccessToken";
+import { randomUUID } from "node:crypto";
+import sharp from "sharp";
+import {
+  fmtServerHeading,
+  parseHeadingCase,
+  parseImpressionBullets,
+  parseImpressionStyle,
+  renderImpressionSectionHtml,
+} from "../lib/impressionFormatting";
+import { reconcileAccessionVsReferringDoctor } from "../lib/pacs/dicomNameNormalize";
+import { isFeatureEnabledServer } from "../lib/featureFlags";
+import { checkWriteLock } from "../lib/studyLocks";
+import {
+  authoriseComposeSaveTx,
+  recordComposeReceiptTx,
+} from "../lib/reportComposer/composePersistence";
+import {
+  RadiologyIdentityError,
+  assertDraftWritable,
+  assertImageUidBelongsToDraft,
+  imageRefsLocked as draftImageRefsLocked,
+  resolveWorklistFromStudyRef,
+} from "../lib/radiologyIdentity";
+import {
+  verifyImageIdentityClaim,
+  type VerifiedIdentity,
+  type IdentityVerdict,
+} from "../lib/imageIdentity";
+import { regenerateDraftStructuredJson } from "../lib/radiologyStructuredJsonCache";
+import { fetchPrintImageBytes } from "../lib/reportImages";
+import {
+  persistCareStructuredJsonPatch,
+} from "../lib/persistCareStructuredFormatState";
+import {
+  buildCareStructuredJsonPatch,
+  CARE_STRUCTURED_FORMAT_STATE_KIND,
+  extractCareRegionTransitions,
+  extractCareCanalApProvenance,
+} from "../lib/structuredJsonColumn";
+// The printed page and the workspace PDF must state the same documented
+// reporting region, so the rule that decides it lives in the shared package
+// neither app owns (`lib/report-quality/src/reportingScope.ts`).
+import { reportedScopeNote } from "@workspace/report-quality";
+import {
+  checkDraftStructuredJsonDrift,
+  scanDraftsForStructuredJsonDrift,
+} from "../lib/radiologyStructuredJsonDrift";
+import {
+  buildAndValidateDraftD1Document,
+  type DraftD1Source,
+} from "../lib/radiologyD1DraftWriter";
+import { CatalogStoreFindingResolver } from "../lib/radiologyFindingMaterializer";
+import { DrizzleCatalogStore } from "../lib/radiologyCatalog/drizzleStore";
+import { DrizzleStructuredReportCatalogPort } from "../lib/structuredReport/catalogAccess";
+import { radiologyQuickFindingsTable } from "@workspace/db/schema";
+
+// ── Upload directory ──────────────────────────────────────────────────────────
+// Persistent in Docker via uploads_data → /app/data/uploads (incl. radiology-key-images).
+const KEY_IMAGE_DIR = FROZEN_KEY_IMAGE_DIR;
+
+const ALLOWED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MIME_TO_EXT: Record<string, string> = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+};
+const MAX_KEY_IMAGE_BYTES = 8 * 1024 * 1024;
+/** Pre-normalize inbound edge cap (reject absurd uploads before sharp work). */
+const MAX_KEY_IMAGE_EDGE_PX = 8192;
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: async (_req, _file, cb) => {
+      try {
+        await fs.mkdir(KEY_IMAGE_DIR, { recursive: true });
+        cb(null, KEY_IMAGE_DIR);
+      } catch (e) {
+        cb(e as Error, KEY_IMAGE_DIR);
+      }
+    },
+    filename: (_req, file, cb) => {
+      const ext = MIME_TO_EXT[file.mimetype] ?? ".jpg";
+      cb(null, `${randomUUID()}${ext}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_IMAGE_MIME.has(file.mimetype)) cb(null, true);
+    else cb(new Error("Only JPG, PNG, and WebP images are accepted"));
+  },
+  limits: { fileSize: MAX_KEY_IMAGE_BYTES },
+});
+
+async function keyImagesLocked(draftId: number): Promise<boolean> {
+  return draftImageRefsLocked(draftId);
+}
+const KEY_IMAGE_LOCKED_MSG = "Report finalized — its images can no longer be modified";
+
+async function unlinkKeyImageArtifacts(...absPaths: Array<string | null | undefined>): Promise<void> {
+  for (const p of absPaths) {
+    if (!p) continue;
+    await fs.unlink(p).catch(() => undefined);
+  }
+}
+
+/** Draft must exist for read paths (FINAL drafts remain readable). */
+async function assertDraftExists(draftId: number): Promise<void> {
+  const [draft] = await db
+    .select({ id: radiologyReportDraftsTable.id })
+    .from(radiologyReportDraftsTable)
+    .where(eq(radiologyReportDraftsTable.id, draftId))
+    .limit(1);
+  if (!draft) {
+    throw new RadiologyIdentityError(404, "DRAFT_NOT_FOUND", "Draft not found.");
+  }
+}
+
+/**
+ * When the draft already has an observation ledger, reject observationIds that
+ * are not present on that ledger. Empty/missing ledgers allow the link (capture
+ * may happen before the observation is persisted).
+ */
+async function assertObservationBelongsToDraft(draftId: number, observationId: string | null): Promise<void> {
+  if (!observationId) return;
+  const [draft] = await db
+    .select({ structuredJson: radiologyReportDraftsTable.structuredJson })
+    .from(radiologyReportDraftsTable)
+    .where(eq(radiologyReportDraftsTable.id, draftId))
+    .limit(1);
+  if (!draft?.structuredJson) return;
+  let parsed: unknown = draft.structuredJson;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return;
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const root = parsed as Record<string, unknown>;
+  const ledger =
+    (root.observationLedger as Record<string, unknown> | undefined) ||
+    (root.kind === "care.observation_ledger.v1" ? root : null) ||
+    (Array.isArray(root.parts)
+      ? (root.parts as Array<Record<string, unknown>>).find((p) => p?.kind === "care.observation_ledger.v1")
+      : null);
+  if (!ledger || typeof ledger !== "object") return;
+  const patches = Array.isArray((ledger as { patches?: unknown }).patches)
+    ? ((ledger as { patches: Array<{ id?: string }> }).patches)
+    : [];
+  if (patches.length === 0) return;
+  const ids = new Set(patches.map((p) => p?.id).filter(Boolean));
+  if (!ids.has(observationId)) {
+    throw new RadiologyIdentityError(
+      400,
+      "OBSERVATION_NOT_ON_DRAFT",
+      "observationId does not belong to this draft's observation ledger.",
+    );
+  }
+}
+
+async function makeKeyImageThumbnail(absPath: string): Promise<string | null> {
+  try {
+    const thumbName = `${path.parse(absPath).name}-thumb.jpg`;
+    const thumbPath = path.join(KEY_IMAGE_DIR, thumbName);
+    await sharp(absPath)
+      .rotate()
+      .resize({ width: 240, height: 240, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toFile(thumbPath);
+    return `/uploads/radiology-key-images/${thumbName}`;
+  } catch {
+    return null;
+  }
+}
+
+async function validateStoredImage(absPath: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const meta = await sharp(absPath).metadata();
+    const w = meta.width ?? 0;
+    const h = meta.height ?? 0;
+    if (w < 1 || h < 1) return { ok: false, error: "Invalid image dimensions" };
+    if (w > MAX_KEY_IMAGE_EDGE_PX || h > MAX_KEY_IMAGE_EDGE_PX) {
+      return { ok: false, error: `Image dimensions exceed ${MAX_KEY_IMAGE_EDGE_PX}px` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "Unreadable image file" };
+  }
+}
+
+// ── Template library ──────────────────────────────────────────────────────────
+
+export interface ReportTemplate {
+  templateId: string;
+  modality: string;
+  studyName: string;
+  technique: string;
+  sections: string[];
+  /** Links to mri_protocol_specs.protocol_key — undefined for non-MRI templates */
+  protocolId?: string;
+  /** Ordered QA checklist item IDs the radiologist should tick before signing */
+  qualityChecklist?: string[];
+}
+
+export const RADIOLOGY_TEMPLATES: Record<string, ReportTemplate> = {
+  MRI_BRAIN_PLAIN: {
+    templateId: "MRI_BRAIN_PLAIN",
+    modality: "MRI",
+    studyName: "MRI BRAIN PLAIN",
+    protocolId: "MRI_BRAIN_PLAIN",
+    technique:
+      "MRI of brain has been performed on a 3T scanner without intravenous contrast. " +
+      "Sequences acquired: T1-weighted sagittal (localiser, TR ~500 ms / TE ~20 ms, 5 mm), " +
+      "T2-weighted axial FSE (TR 4000–5000 ms / TE 100–120 ms, 5 mm / 1 mm gap, foramen magnum to vertex), " +
+      "FLAIR axial (TR ~8500 ms / TE ~120 ms / TI ~2300 ms, 5 mm — CSF-suppressed), " +
+      "DWI axial echo-planar (b = 0 & 1000 s/mm²) with corresponding ADC map, " +
+      "GRE / SWI axial (susceptibility-weighted for haemorrhage, calcification, iron deposition), " +
+      "and MR angiography TOF (non-contrast, Circle of Willis and major intracranial branches).",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "BRAIN PARENCHYMA",
+      "WHITE MATTER",
+      "VENTRICULAR SYSTEM / CSF SPACES",
+      "POSTERIOR FOSSA",
+      "MIDLINE STRUCTURES",
+      "SELLAR / PARASELLAR REGION",
+      "ORBITS / PNS / MASTOIDS",
+      "VASCULAR FLOW VOIDS / MRA",
+      "MENINGES & EXTRAAXIAL SPACES",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "snr_adequate",
+      "coverage_complete",
+      "all_sequences_present",
+      "flair_csf_suppression",
+      "dwi_adc_pair",
+      "swi_blurring",
+    ],
+  },
+  MRI_BRAIN_CONTRAST: {
+    templateId: "MRI_BRAIN_CONTRAST",
+    modality: "MRI",
+    studyName: "MRI BRAIN WITH CONTRAST",
+    protocolId: "MRI_BRAIN_CONTRAST",
+    technique:
+      "MRI of brain has been performed on a 3T scanner with gadolinium-based contrast (0.1 mmol/kg IV). " +
+      "Pre-contrast sequences: T1-weighted sagittal (localiser), T2-weighted axial FSE (TR 4000–5000 ms / TE 100–120 ms, 5 mm), " +
+      "FLAIR axial (TR ~8500 ms / TE ~120 ms / TI ~2300 ms), " +
+      "DWI axial echo-planar (b = 0 & 1000 s/mm²) with ADC map, " +
+      "GRE / SWI axial. " +
+      "Post-contrast sequences (5–10 min post-injection): T1-weighted axial, sagittal and coronal with fat saturation where appropriate. " +
+      "Enhancement pattern, BBB integrity and leptomeningeal involvement assessed on delayed T1W series.",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "BRAIN PARENCHYMA",
+      "WHITE MATTER",
+      "VENTRICULAR SYSTEM / CSF SPACES",
+      "POST-CONTRAST ENHANCEMENT PATTERN",
+      "MENINGES & LEPTOMENINGEAL SPACES",
+      "POSTERIOR FOSSA",
+      "MIDLINE STRUCTURES",
+      "SELLAR / PARASELLAR REGION",
+      "ORBITS / PNS / MASTOIDS",
+      "VASCULAR FLOW VOIDS / MRA",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "snr_adequate",
+      "coverage_complete",
+      "all_sequences_present",
+      "contrast_timing",
+      "flair_csf_suppression",
+      "dwi_adc_pair",
+      "post_gd_fat_sat",
+    ],
+  },
+  MRI_STROKE_PROTOCOL: {
+    templateId: "MRI_STROKE_PROTOCOL",
+    modality: "MRI",
+    studyName: "MRI BRAIN STROKE PROTOCOL",
+    protocolId: "MRI_STROKE_PROTOCOL",
+    technique:
+      "MRI brain stroke protocol performed on a 3T scanner. " +
+      "Rapid acquisition order: DWI axial (b = 0 & 1000 s/mm²) with ADC map — performed first to detect acute restriction; " +
+      "FLAIR axial (TR ~8500 ms / TE ~120 ms / TI ~2300 ms) — FLAIR-DWI mismatch assessed for tissue at risk; " +
+      "T2-weighted axial FSE; " +
+      "GRE / SWI axial — haemorrhagic transformation, microbleeds, vessel susceptibility sign; " +
+      "MRA TOF (Circle of Willis + posterior circulation) — vessel occlusion / stenosis; " +
+      "T1-weighted axial (baseline, post-contrast if indicated). " +
+      "Total target door-to-image time: ≤ 20 minutes.",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "DWI / ADC — RESTRICTED DIFFUSION",
+      "FLAIR / T2 — ESTABLISHED INFARCT vs DWI MISMATCH",
+      "GRE / SWI — HAEMORRHAGE & VESSEL SIGN",
+      "MRA — VESSEL OCCLUSION / STENOSIS",
+      "POSTERIOR FOSSA & BRAINSTEM",
+      "EXTRA-AXIAL SPACES & MIDLINE",
+      "THROMBOLYSIS / THROMBECTOMY ELIGIBILITY",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "dwi_adc_pair",
+      "flair_csf_suppression",
+      "swi_blurring",
+      "mra_coverage",
+      "acquisition_time_target",
+    ],
+  },
+  MRI_LS_SPINE: {
+    templateId: "MRI_LS_SPINE",
+    modality: "MRI",
+    studyName: "MRI LUMBOSACRAL SPINE",
+    protocolId: "MRI_LS_SPINE",
+    technique:
+      "MRI of lumbosacral spine performed on a 3T scanner without intravenous contrast. " +
+      "Sequences: T1-weighted sagittal FSE (TR ~500–700 ms / TE ~10–20 ms, 4 mm, L1 to S2), " +
+      "T2-weighted sagittal FSE (TR 3000–4000 ms / TE 100–120 ms, 4 mm — disc hydration and cord signal), " +
+      "STIR sagittal (TR ~3000 ms / TI ~150 ms — bone marrow oedema, infective/malignant change), " +
+      "T2-weighted axial FSE (3–4 mm, individual disc levels L2–3 through L5–S1). " +
+      "Axial sequences angled parallel to each disc endplate. " +
+      "Canal diameter, cord conus, foraminal dimensions and disc morphology assessed on all sequences.",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "ALIGNMENT & CURVATURE",
+      "VERTEBRAL BODIES & BONE MARROW",
+      "INTERVERTEBRAL DISCS (L1–2 through L5–S1)",
+      "SPINAL CANAL DIMENSIONS",
+      "CONUS MEDULLARIS & CAUDA EQUINA",
+      "NEURAL FORAMINA",
+      "FACET JOINTS & POSTERIOR ELEMENTS",
+      "PARASPINAL SOFT TISSUES",
+      "SACROILIAC JOINTS",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "coverage_complete",
+      "all_sequences_present",
+      "axial_disc_angulation",
+      "stir_fat_suppression",
+      "conus_visualised",
+    ],
+  },
+  MRI_CERVICAL_SPINE: {
+    templateId: "MRI_CERVICAL_SPINE",
+    modality: "MRI",
+    studyName: "MRI CERVICAL SPINE",
+    protocolId: "MRI_CERVICAL_SPINE",
+    technique:
+      "MRI of cervical spine performed on a 3T scanner without contrast. " +
+      "Sequences: T1-weighted sagittal FSE (4 mm, C0 to T1 coverage), " +
+      "T2-weighted sagittal FSE (TR 3000–4500 ms / TE 100–120 ms, 3–4 mm — cord signal, disc), " +
+      "STIR sagittal (bone marrow oedema, cord contusion in trauma), " +
+      "T2-weighted axial FSE (3 mm, C2–3 through C7–T1, angled to disc endplates), " +
+      "GRE axial (optional — cord haemorrhage in trauma, myelopathy). " +
+      "Craniocervical junction (foramen magnum, C1–C2) included on sagittal series.",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "ALIGNMENT & CURVATURE",
+      "VERTEBRAL BODIES & BONE MARROW",
+      "INTERVERTEBRAL DISCS (C2–3 through C7–T1)",
+      "SPINAL CANAL & CORD SIGNAL",
+      "NEURAL FORAMINA (bilateral)",
+      "CRANIOCERVICAL JUNCTION",
+      "PARASPINAL SOFT TISSUES",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "coverage_complete",
+      "all_sequences_present",
+      "craniocervical_junction_included",
+      "axial_disc_angulation",
+      "stir_fat_suppression",
+    ],
+  },
+  MRI_DORSAL_SPINE: {
+    templateId: "MRI_DORSAL_SPINE",
+    modality: "MRI",
+    studyName: "MRI DORSAL SPINE",
+    protocolId: "MRI_DORSAL_SPINE",
+    technique:
+      "MRI of dorsal (thoracic) spine performed on a 3T scanner without contrast. " +
+      "Sequences: T1-weighted sagittal FSE (4 mm, T1 to T12–L1 junction), " +
+      "T2-weighted sagittal FSE (TR 3000–4000 ms / TE 100–120 ms, 4 mm — cord signal, disc), " +
+      "STIR sagittal (bone marrow oedema, vertebral collapse signal), " +
+      "T2-weighted axial FSE (4 mm, selected levels with pathology or all levels for cord pathology). " +
+      "Cord calibre, signal intensity and conus level documented.",
+    sections: [
+      "QUALITY ASSESSMENT",
+      "ALIGNMENT & CURVATURE (Scoliosis / Kyphosis)",
+      "VERTEBRAL BODIES & BONE MARROW",
+      "INTERVERTEBRAL DISCS",
+      "SPINAL CANAL & CORD SIGNAL",
+      "NEURAL FORAMINA",
+      "PARASPINAL SOFT TISSUES",
+    ],
+    qualityChecklist: [
+      "motion_artifact",
+      "coverage_complete",
+      "all_sequences_present",
+      "stir_fat_suppression",
+    ],
+  },
+  MRI_WHOLE_SPINE: {
+    templateId: "MRI_WHOLE_SPINE",
+    modality: "MRI",
+    studyName: "MRI WHOLE SPINE SCREENING",
+    technique:
+      "Whole spine MRI screening performed on 3 Tesla MRI scanner with standard T1 and T2 sequences in sagittal plane covering cervical, dorsal and lumbosacral spine.",
+    sections: [
+      "CERVICAL SPINE",
+      "DORSAL SPINE",
+      "LUMBOSACRAL SPINE",
+      "SPINAL CORD",
+      "ALIGNMENT OVERVIEW",
+    ],
+  },
+  MRI_KNEE: {
+    templateId: "MRI_KNEE",
+    modality: "MRI",
+    studyName: "MRI KNEE",
+    protocolId: "MRI_KNEE",
+    technique:
+      "MRI of knee performed on a 3T scanner without contrast using a dedicated knee coil. " +
+      "Sequences: PD-weighted sagittal FSE with fat saturation (3 mm, lateral to medial, for cartilage and menisci), " +
+      "PD-weighted coronal FSE with fat saturation (3 mm, ligaments and meniscal horns), " +
+      "T2-weighted axial FSE with fat saturation (4 mm, cartilage, bursae, Hoffa's fat), " +
+      "T1-weighted sagittal FSE (3 mm, bone marrow, anatomic reference). " +
+      "ACL, PCL, menisci and articular cartilage graded on standard scoring (0–3 for menisci; ICRS 0–4 for cartilage).",
+    sections: [
+      "MEDIAL MENISCUS",
+      "LATERAL MENISCUS",
+      "ANTERIOR CRUCIATE LIGAMENT",
+      "POSTERIOR CRUCIATE LIGAMENT",
+      "MEDIAL COLLATERAL LIGAMENT",
+      "LATERAL COLLATERAL LIGAMENT",
+      "ARTICULAR CARTILAGE",
+      "JOINT SPACE / EFFUSION",
+      "BONES",
+      "PATELLAR / EXTENSOR MECHANISM",
+    ],
+  },
+  CT_BRAIN: {
+    templateId: "CT_BRAIN",
+    modality: "CT",
+    studyName: "CT BRAIN",
+    technique:
+      "Non-contrast CT brain has been performed with axial sections (5 mm) and multiplanar reconstruction.",
+    sections: [
+      "CEREBRAL PARENCHYMA",
+      "VENTRICULAR SYSTEM",
+      "EXTRA-AXIAL SPACES",
+      "POSTERIOR FOSSA",
+      "MIDLINE STRUCTURES",
+      "BONES / SCALP",
+    ],
+  },
+  CT_BRAIN_TRAUMA: {
+    templateId: "CT_BRAIN_TRAUMA",
+    modality: "CT",
+    studyName: "CT BRAIN TRAUMA",
+    technique:
+      "Non-contrast CT brain with bone and soft tissue algorithms has been performed with axial sections and multiplanar reconstruction for trauma evaluation.",
+    sections: [
+      "SCALP / SOFT TISSUE",
+      "SKULL BONES",
+      "EXTRA-AXIAL COLLECTIONS",
+      "CEREBRAL PARENCHYMA",
+      "VENTRICULAR SYSTEM",
+      "POSTERIOR FOSSA",
+      "MIDLINE SHIFT",
+    ],
+  },
+  CT_CHEST: {
+    templateId: "CT_CHEST",
+    modality: "CT",
+    studyName: "CT CHEST",
+    technique:
+      "CT chest has been performed with axial sections and multiplanar reconstruction in lung and mediastinal windows.",
+    sections: [
+      "LUNG PARENCHYMA",
+      "BRONCHI / AIRWAYS",
+      "PLEURA",
+      "MEDIASTINUM",
+      "CARDIAC SILHOUETTE",
+      "CHEST WALL / RIBS",
+      "UPPER ABDOMEN (imaged portion)",
+    ],
+  },
+  HRCT_THORAX: {
+    templateId: "HRCT_THORAX",
+    modality: "CT",
+    studyName: "HRCT THORAX",
+    technique:
+      "High-resolution CT thorax has been performed using thin sections (1 mm) in inspiration and expiration phases with multiplanar reconstruction in lung and mediastinal windows.",
+    sections: [
+      "LUNG PARENCHYMA — UPPER LOBES",
+      "LUNG PARENCHYMA — MIDDLE / LINGULA",
+      "LUNG PARENCHYMA — LOWER LOBES",
+      "SECONDARY PULMONARY LOBULE PATTERN",
+      "AIRSPACE DISEASE",
+      "PLEURA",
+      "MEDIASTINUM / LYMPH NODES",
+      "CHEST WALL",
+    ],
+  },
+  CT_ABDOMEN_PELVIS: {
+    templateId: "CT_ABDOMEN_PELVIS",
+    modality: "CT",
+    studyName: "CT ABDOMEN AND PELVIS",
+    technique:
+      "CECT abdomen and pelvis performed in portovenous phase with oral and IV contrast; axial sections with coronal and sagittal reconstructions.",
+    sections: [
+      "LIVER",
+      "GALL BLADDER / BILE DUCTS",
+      "PANCREAS",
+      "SPLEEN",
+      "ADRENAL GLANDS",
+      "KIDNEYS",
+      "URINARY BLADDER",
+      "BOWEL / MESENTERY",
+      "LYMPH NODES",
+      "PERITONEUM / ASCITES",
+      "PELVIS (if included)",
+      "BONES (imaged portion)",
+    ],
+  },
+  CT_KUB: {
+    templateId: "CT_KUB",
+    modality: "CT",
+    studyName: "CT KUB (NCCT)",
+    technique:
+      "Non-contrast CT of kidneys, ureters, and urinary bladder performed in supine position with axial sections and multiplanar reconstruction.",
+    sections: [
+      "RIGHT KIDNEY",
+      "LEFT KIDNEY",
+      "RIGHT URETER",
+      "LEFT URETER",
+      "URINARY BLADDER",
+      "SURROUNDING STRUCTURES",
+    ],
+  },
+  CT_NECK: {
+    templateId: "CT_NECK",
+    modality: "CT",
+    studyName: "CT NECK",
+    technique:
+      "CECT neck performed with IV contrast in axial sections and multiplanar reconstruction.",
+    sections: [
+      "NECK SOFT TISSUES",
+      "LYMPH NODES",
+      "THYROID GLAND",
+      "LARYNX / HYPOPHARYNX",
+      "VESSELS",
+      "BONES",
+    ],
+  },
+  USG_ABDOMEN: {
+    templateId: "USG_ABDOMEN",
+    modality: "USG",
+    studyName: "ULTRASOUND WHOLE ABDOMEN",
+    technique:
+      "Ultrasound examination of the whole abdomen performed using curvilinear probe (3.5–5 MHz) in B-mode.",
+    sections: [
+      "LIVER",
+      "GALL BLADDER / CBD",
+      "PANCREAS",
+      "SPLEEN",
+      "KIDNEYS",
+      "URINARY BLADDER",
+      "PROSTATE (if applicable)",
+      "FREE FLUID / ASCITES",
+    ],
+  },
+  USG_KUB: {
+    templateId: "USG_KUB",
+    modality: "USG",
+    studyName: "ULTRASOUND KUB",
+    technique:
+      "Ultrasound examination of kidneys, urinary bladder, and prostate performed using curvilinear probe.",
+    sections: [
+      "RIGHT KIDNEY",
+      "LEFT KIDNEY",
+      "URINARY BLADDER",
+      "PROSTATE / UTERUS",
+      "PERINEPHRIC REGION",
+    ],
+  },
+  USG_PELVIS: {
+    templateId: "USG_PELVIS",
+    modality: "USG",
+    studyName: "ULTRASOUND PELVIS",
+    technique:
+      "Transabdominal pelvic ultrasound performed using curvilinear probe with adequate bladder distension.",
+    sections: [
+      "UTERUS",
+      "ENDOMETRIUM",
+      "OVARIES",
+      "ADNEXA",
+      "POUCH OF DOUGLAS",
+      "URINARY BLADDER",
+    ],
+  },
+  USG_OBSTETRIC: {
+    templateId: "USG_OBSTETRIC",
+    modality: "USG",
+    studyName: "OBSTETRIC ULTRASOUND",
+    technique:
+      "Transabdominal obstetric ultrasound performed using curvilinear probe.",
+    sections: [
+      "FETAL BIOMETRY",
+      "FETAL CARDIAC ACTIVITY",
+      "FETAL POSITION / PRESENTATION",
+      "PLACENTA",
+      "AMNIOTIC FLUID",
+      "CERVIX",
+      "FETAL ANATOMY SURVEY",
+    ],
+  },
+  USG_SCROTUM: {
+    templateId: "USG_SCROTUM",
+    modality: "USG",
+    studyName: "ULTRASOUND SCROTUM",
+    technique:
+      "High-frequency ultrasound of the scrotum performed using linear probe (7–15 MHz) in B-mode with color Doppler.",
+    sections: [
+      "RIGHT TESTIS / EPIDIDYMIS",
+      "LEFT TESTIS / EPIDIDYMIS",
+      "VASCULARITY (Doppler)",
+      "SCROTAL SAC / HYDROCELE",
+    ],
+  },
+  USG_NECK_THYROID: {
+    templateId: "USG_NECK_THYROID",
+    modality: "USG",
+    studyName: "ULTRASOUND NECK / THYROID",
+    technique:
+      "High-frequency ultrasound of the neck and thyroid performed using linear probe (7–15 MHz) in B-mode with color Doppler.",
+    sections: [
+      "RIGHT LOBE OF THYROID",
+      "LEFT LOBE OF THYROID",
+      "ISTHMUS",
+      "PARATHYROID REGION",
+      "CERVICAL LYMPH NODES",
+      "VASCULARITY",
+    ],
+  },
+  DOPPLER_LOWER_LIMB: {
+    templateId: "DOPPLER_LOWER_LIMB",
+    modality: "USG",
+    studyName: "DOPPLER LOWER LIMB",
+    technique:
+      "Color duplex Doppler study of the bilateral lower limb arteries/veins performed using linear and curvilinear probes.",
+    sections: [
+      "RIGHT LOWER LIMB",
+      "LEFT LOWER LIMB",
+      "DEEP VENOUS SYSTEM",
+      "SUPERFICIAL VENOUS SYSTEM",
+      "ARTERIAL FLOW",
+      "COMPRESSIBILITY / AUGMENTATION",
+    ],
+  },
+  XRAY_CHEST_PA: {
+    templateId: "XRAY_CHEST_PA",
+    modality: "X-RAY",
+    studyName: "X-RAY CHEST PA VIEW",
+    technique:
+      "Digital radiograph of the chest has been obtained in standard PA projection, erect position.",
+    sections: [
+      "LUNG FIELDS",
+      "HILUM",
+      "CARDIOMEDIASTINAL SILHOUETTE",
+      "PLEURA / COSTOPHRENIC ANGLES",
+      "DIAPHRAGM",
+      "BONES / SOFT TISSUES",
+    ],
+  },
+  XRAY_CERVICAL_SPINE: {
+    templateId: "XRAY_CERVICAL_SPINE",
+    modality: "X-RAY",
+    studyName: "X-RAY CERVICAL SPINE",
+    technique:
+      "Digital radiographs of the cervical spine obtained in AP and lateral projections; oblique views if requested.",
+    sections: [
+      "ALIGNMENT",
+      "VERTEBRAL BODIES",
+      "DISC SPACES",
+      "NEURAL FORAMINA",
+      "POSTERIOR ELEMENTS",
+      "SOFT TISSUES",
+    ],
+  },
+  XRAY_LS_SPINE: {
+    templateId: "XRAY_LS_SPINE",
+    modality: "X-RAY",
+    studyName: "X-RAY LUMBOSACRAL SPINE",
+    technique:
+      "Digital radiographs of the lumbosacral spine obtained in AP and lateral projections.",
+    sections: [
+      "ALIGNMENT / CURVATURE",
+      "VERTEBRAL BODIES",
+      "DISC SPACES",
+      "SACROILIAC JOINTS",
+      "POSTERIOR ELEMENTS",
+      "SOFT TISSUES",
+    ],
+  },
+  XRAY_KNEE: {
+    templateId: "XRAY_KNEE",
+    modality: "X-RAY",
+    studyName: "X-RAY KNEE",
+    technique:
+      "Digital radiographs of the knee joint obtained in weight-bearing AP and lateral projections; skyline view if requested.",
+    sections: [
+      "JOINT SPACE",
+      "FEMORAL CONDYLES",
+      "TIBIAL PLATEAU",
+      "PATELLA",
+      "SOFT TISSUES",
+    ],
+  },
+  XRAY_SHOULDER: {
+    templateId: "XRAY_SHOULDER",
+    modality: "X-RAY",
+    studyName: "X-RAY SHOULDER",
+    technique:
+      "Digital radiographs of the shoulder obtained in AP and axillary / scapular-Y projections.",
+    sections: [
+      "GLENOHUMERAL JOINT SPACE",
+      "HUMERUS",
+      "ACROMIOCLAVICULAR JOINT",
+      "CLAVICLE / SCAPULA",
+      "SOFT TISSUES",
+    ],
+  },
+  XRAY_PNS: {
+    templateId: "XRAY_PNS",
+    modality: "X-RAY",
+    studyName: "X-RAY PARANASAL SINUSES",
+    technique:
+      "Digital radiographs of the paranasal sinuses obtained in Waters and Caldwell projections.",
+    sections: [
+      "MAXILLARY SINUSES",
+      "FRONTAL SINUSES",
+      "ETHMOID SINUSES",
+      "SPHENOID SINUS",
+      "NASAL SEPTUM",
+      "SOFT TISSUES",
+    ],
+  },
+  XRAY_ABDOMEN: {
+    templateId: "XRAY_ABDOMEN",
+    modality: "X-RAY",
+    studyName: "X-RAY ABDOMEN",
+    technique:
+      "Digital radiograph of the abdomen obtained in erect and supine AP projections.",
+    sections: [
+      "BOWEL GAS PATTERN",
+      "AIR-FLUID LEVELS",
+      "FREE GAS",
+      "CALCIFICATIONS",
+      "SOLID ORGANS (visible)",
+      "BONES (imaged portion)",
+    ],
+  },
+};
+
+// ── Voice cleanup ─────────────────────────────────────────────────────────────
+
+function cleanVoiceText(raw: string): string {
+  return String(raw ?? "")
+    // ── Punctuation commands ──────────────────────────────────────────────
+    .replace(/\bcomma\b/gi, ",")
+    .replace(/\bfull[- ]?stop\b/gi, ".")
+    .replace(/\bperiod\b/gi, ".")
+    .replace(/\bnew[- ]?line\b/gi, "\n")
+    .replace(/\bnew[- ]?paragraph\b/gi, "\n\n")
+    .replace(/\bcolon\b/gi, ":")
+    .replace(/\bsemicolon\b/gi, ";")
+    .replace(/\bhyphen\b/gi, "-")
+    .replace(/\bdash\b/gi, "—")
+    .replace(/\bopen[- ]?bracket\b/gi, "(")
+    .replace(/\bclose[- ]?bracket\b/gi, ")")
+    // ── MRI sequences ─────────────────────────────────────────────────────
+    .replace(/\bt[- ]?1[- ]?w\b/gi, "T1W")
+    .replace(/\bt[- ]?2[- ]?w\b/gi, "T2W")
+    .replace(/\bt[- ]?1\b/gi, "T1")
+    .replace(/\bt[- ]?2\b/gi, "T2")
+    .replace(/\bflair\b/gi, "FLAIR")
+    .replace(/\bdwi\b/gi, "DWI")
+    .replace(/\badc\b/gi, "ADC")
+    .replace(/\bswi\b/gi, "SWI")
+    .replace(/\bgre\b/gi, "GRE")
+    .replace(/\bmra\b/gi, "MRA")
+    // ── Modality abbreviations ─────────────────────────────────────────────
+    .replace(/\bmri\b/gi, "MRI")
+    .replace(/\bct\b/gi, "CT")
+    .replace(/\busg\b/gi, "USG")
+    .replace(/\bpet\b/gi, "PET")
+    // ── Signal / echogenicity terms ────────────────────────────────────────
+    .replace(/\bfazekas\b/gi, "Fazekas")
+    .replace(/\bhyperintense\b/gi, "hyperintense")
+    .replace(/\bhypointense\b/gi, "hypointense")
+    .replace(/\bisointense\b/gi, "isointense")
+    .replace(/\bhyper[- ]?echoic\b/gi, "hyperechoic")
+    .replace(/\bhypo[- ]?echoic\b/gi, "hypoechoic")
+    .replace(/\biso[- ]?echoic\b/gi, "isoechoic")
+    // ── Anatomical terms ──────────────────────────────────────────────────
+    .replace(/\blacunar\b/gi, "lacunar")
+    .replace(/\bthecal sac\b/gi, "thecal sac")
+    .replace(/\bforaminal\b/gi, "foraminal")
+    .replace(/\bligamentum flavum\b/gi, "ligamentum flavum")
+    .replace(/\bposterior fossa\b/gi, "posterior fossa")
+    // ── Measurements ──────────────────────────────────────────────────────
+    .replace(/\bcentimeter(s)?\b/gi, "cm")
+    .replace(/\bmillimeter(s)?\b/gi, "mm")
+    // ── Grades ────────────────────────────────────────────────────────────
+    .replace(/\bgrade (one|1)\b/gi, "Grade 1")
+    .replace(/\bgrade (two|2)\b/gi, "Grade 2")
+    .replace(/\bgrade (three|3)\b/gi, "Grade 3")
+    .replace(/\bgrade (four|4)\b/gi, "Grade 4")
+    // ── Cleanup whitespace ────────────────────────────────────────────────
+    .replace(/\s+([,.])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ── HTML report builder ───────────────────────────────────────────────────────
+
+function escHtml(v: string): string {
+  return String(v ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function hasReportDemographyValue(v: string | null | undefined): boolean {
+  return String(v ?? "").trim().length > 0;
+}
+
+function formatReportAgeSexLine(age: string | null | undefined, sex: string | null | undefined): string {
+  const a = String(age ?? "").trim();
+  const s = String(sex ?? "").trim();
+  if (!a && !s) return "";
+  if (a && s) return `${a}/${s}`;
+  return a || s;
+}
+
+function buildClassicPatientHeaderHtml(input: {
+  patientName?: string | null;
+  age?: string | null;
+  sex?: string | null;
+  patientId?: string | null;
+  accessionNumber?: string | null;
+  referringDoctor?: string | null;
+  studyDate?: string | null;
+}): string {
+  const line1Parts: string[] = [];
+  if (hasReportDemographyValue(input.patientName)) {
+    line1Parts.push(`NAME: ${escHtml(String(input.patientName).trim())}`);
+  }
+  const ageSex = formatReportAgeSexLine(input.age, input.sex);
+  if (ageSex) line1Parts.push(`AGE/SEX: ${escHtml(ageSex)}`);
+  if (hasReportDemographyValue(input.patientId)) {
+    line1Parts.push(`UHID: ${escHtml(String(input.patientId).trim())}`);
+  }
+  if (hasReportDemographyValue(input.accessionNumber)) {
+    line1Parts.push(`ACC: ${escHtml(String(input.accessionNumber).trim())}`);
+  }
+  const line2Parts: string[] = [];
+  if (hasReportDemographyValue(input.referringDoctor)) {
+    line2Parts.push(`REF. BY: ${escHtml(String(input.referringDoctor).trim())}`);
+  }
+  if (hasReportDemographyValue(input.studyDate)) {
+    line2Parts.push(`DATE: ${escHtml(String(input.studyDate).trim())}`);
+  }
+  return [line1Parts.join(" &nbsp;&nbsp; "), line2Parts.join(" &nbsp;&nbsp; ")]
+    .filter(Boolean)
+    .map((line) => `<p style="margin:0 0 2px;"><strong>${line}</strong></p>`)
+    .join("\n");
+}
+
+// Preference-aware section heading formatter
+  function fmtHeading(text: string, headingCase: "all_caps" | "title_case"): string {
+    if (headingCase === "all_caps") return text.toUpperCase();
+    return text.replace(/\w\S*/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+  }
+
+  function buildReportHtml(input: {
+    patientName?: string;
+    age?: string;
+    sex?: string;
+    patientId?: string;
+    referringDoctor?: string;
+    accessionNumber?: string;
+    studyDate?: string;
+    clinicalHistory?: string;
+    findingsSections?: Record<string, string>;
+    rawFindings?: string;
+    impression?: string[];
+    recommendation?: string;
+    template: ReportTemplate;
+    keyImages?: Array<{ imageUrl: string; caption: string; includeInReport: boolean }>;
+    measurements?: Array<{ label: string; value: string }>;
+    preferences?: {
+      headingCase?: "all_caps" | "title_case";
+      sectionSpacing?: "spaced" | "compact";
+      impressionStyle?: "bulleted" | "numbered" | "plain";
+      showEndOfReportFooter?: boolean;
+      footerText?: string | null;
+      headerLine1?: string | null;
+      headerLine2Source?: "template_name" | "custom";
+      headerLine2Custom?: string | null;
+      printMode?: "letterhead" | "plain_paper";
+    };
+    clinicSettings?: {
+      name: string; address: string; phone: string; email: string; logoDataUrl: string | null;
+    };
+    institutionalStyle?: typeof radiologyInstitutionalStylesTable.$inferSelect | null;
+  }): string {
+    const t = input.template;
+    const sections = input.findingsSections ?? {};
+    const impressionBullets = (input.impression ?? []).filter(Boolean);
+    const includedImages = (input.keyImages ?? []).filter((img) => img.includeInReport);
+    
+    const style = input.institutionalStyle;
+    const prefs = input.preferences ?? {};
+    
+    const ss = style ? style.spacing : (prefs.sectionSpacing ?? "spaced");
+    const sp = ss === "compact" ? "2px" : ss === "comfortable" ? "18px" : "10px";
+    const sp2 = ss === "compact" ? "4px" : ss === "comfortable" ? "20px" : "12px";
+    const lineHt = ss === "compact" ? "1.2" : ss === "comfortable" ? "1.7" : "1.45";
+
+    const headingStyle = style ? style.headingStyle : "underlined";
+    const hc = prefs.headingCase ?? "all_caps";
+
+    function fmtHeadingHtml(titleText: string): string {
+      const formatted = fmtHeading(titleText, hc);
+      switch (headingStyle) {
+        case "bold": return `<strong>${escHtml(formatted)}</strong>`;
+        case "underlined": return `<u>${escHtml(formatted)}</u>`;
+        case "bold_underlined": return `<strong><u>${escHtml(formatted)}</u></strong>`;
+        case "plain":
+        default: return escHtml(formatted);
+      }
+    }
+
+    const fontSzOption = style ? style.fontSize : "standard";
+    const fontSzVal = fontSzOption === "small" ? "11px" : fontSzOption === "large" ? "15px" : "13px";
+
+    const marginOption = style ? style.margins : "standard";
+    const paddingVal = marginOption === "narrow" ? "10px" : marginOption === "wide" ? "40px" : "20px";
+    const maxWVal = marginOption === "narrow" ? "800px" : marginOption === "wide" ? "640px" : "720px";
+
+    const abnormalEmphasis = style ? style.abnormalEmphasis : "bold_abnormal";
+    
+    function highlightAbnormalTerms(text: string): string {
+      const terms = [
+        "fracture", "hemorrhage", "mass", "lesion", "abnormal", "acute",
+        "stenosis", "herniation", "tear", "infarct", "ischemia", "embolism",
+        "clot", "rupture", "deviation", "effusion", "edema", "nodule", "cysts"
+      ];
+      let result = text;
+      for (const term of terms) {
+        const re = new RegExp(`\\b(${term}s?)\\b(?![^<]*>)(?![^<>]*<\\/[b|strong])`, "gi");
+        result = result.replace(re, '<strong class="findings-abnormal abnormal-term">$1</strong>');
+      }
+      return result;
+    }
+
+    const sectionsHtml = t.sections
+      .map((name) => {
+        let content = sections[name] ?? input.rawFindings ?? "";
+        if (abnormalEmphasis === "bold_abnormal" || abnormalEmphasis === "bold_both") {
+          content = highlightAbnormalTerms(content);
+        }
+        const title = fmtHeadingHtml(name);
+        return `<p style="margin:${sp} 0;">${title}<br/>${content.replaceAll("\n", "<br/>") || "<em style='color:#aaa;'>—</em>"}</p>`;
+      })
+      .join("\n");
+
+    const imagesHtml =
+      includedImages.length > 0
+        ? `<h3 style="margin:${sp2} 0 ${sp};">${fmtHeadingHtml("Key Images")}</h3>
+  <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:8px 0;">
+  ${includedImages
+    .map(
+      (img) => `  <figure style="margin:0;text-align:center;page-break-inside:avoid;">
+      <img src="${escHtml(img.imageUrl)}" style="max-width:100%;max-height:220px;object-fit:contain;border:1px solid #ccc;border-radius:4px;" />
+      <figcaption style="font-size:11px;color:#555;margin-top:4px;">${escHtml(img.caption)}</figcaption>
+    </figure>`,
+    )
+    .join("\n")}
+  </div>`
+        : "";
+
+    const ist = prefs.impressionStyle ?? "bulleted";
+    let impressionHtml = "";
+    if (impressionBullets.length > 0) {
+      const processedBullets = impressionBullets.map((b) => {
+        let txt = escHtml(b);
+        if (abnormalEmphasis === "bold_impression" || abnormalEmphasis === "bold_both") {
+          txt = `<strong>${txt}</strong>`;
+        }
+        return txt;
+      });
+      if (ist === "numbered") {
+        impressionHtml = `<ol style="margin:4px 0 0 22px;padding:0;">${processedBullets.map((b) => `<li>${b}</li>`).join("")}</ol>`;
+      } else if (ist === "plain") {
+        impressionHtml = `<p style="margin:4px 0;">${processedBullets.join("; ")}</p>`;
+      } else {
+        impressionHtml = `<ul style="margin:4px 0 0 18px;padding:0;">${processedBullets.map((b) => `<li>${b}</li>`).join("")}</ul>`;
+      }
+    } else {
+      impressionHtml = `<p style="margin:4px 0;color:#aaa;"><em>Draft impression — not verified.</em></p>`;
+    }
+
+    const line2 = prefs.headerLine2Source === "custom" && prefs.headerLine2Custom
+      ? prefs.headerLine2Custom
+      : t.studyName;
+
+    const layoutOption = style ? style.printLayout : (prefs.printMode || "letterhead");
+    const isPlainPaper = layoutOption === "a4_plain";
+    const isHalfPage = layoutOption === "half_page";
+    const isLetterhead = layoutOption === "letterhead";
+
+    const c = input.clinicSettings;
+
+    const ptHeader = isPlainPaper && c
+      ? `<div style="text-align:center;margin-bottom:8px;">
+        <h1 style="font-size:18px;margin:0 0 2px;letter-spacing:1px;">${escHtml(c.name)}</h1>
+        <p style="font-size:11px;margin:0 0 1px;color:#333;">${escHtml(c.address)}</p>
+        <p style="font-size:11px;margin:0 0 1px;color:#333;">Ph: ${escHtml(c.phone)}${c.email ? ` | Email: ${escHtml(c.email)}` : ""}</p>
+        ${c.logoDataUrl ? `<img src="${escHtml(c.logoDataUrl)}" style="max-height:40px;margin:4px 0;" />` : ""}
+        <hr style="border:none;border-top:2px solid #000;margin:6px 0;" />
+      </div>`
+      : "";
+
+    const ptFooter = isPlainPaper && c
+      ? `<div style="margin-top:12px;border-top:1px solid #999;padding-top:6px;">
+        <p style="font-size:11px;color:#333;margin:0 0 2px;"><strong>${escHtml(c.name)}</strong></p>
+        <p style="font-size:10px;color:#555;margin:0;">${escHtml(c.address)} | Ph: ${escHtml(c.phone)}</p>
+        <p style="font-size:10px;color:#666;font-style:italic;margin:4px 0 0;">Please correlate with clinical history and findings. Report issued by authorized radiologist only.</p>
+      </div>`
+      : "";
+
+    const reconciledIds = reconcileAccessionVsReferringDoctor({
+      accessionNumber: input.accessionNumber,
+      referringDoctor: input.referringDoctor,
+    });
+
+    const headerHtml = prefs.headerLine1
+      ? `<p style="margin:0 0 2px;"><strong>${escHtml(prefs.headerLine1)}</strong></p>
+    <p style="margin:0 0 2px;"><strong>${escHtml(line2)}</strong></p>`
+      : buildClassicPatientHeaderHtml({
+        patientName: input.patientName,
+        age: input.age,
+        sex: input.sex,
+        patientId: input.patientId,
+        accessionNumber: reconciledIds.accessionNumber,
+        referringDoctor: reconciledIds.referringDoctor,
+        studyDate: input.studyDate,
+      });
+
+    const footerBlock = (!isPlainPaper && prefs.showEndOfReportFooter !== false)
+      ? `<hr style="border:none;border-top:1px solid #999;margin:${sp2} 0 4px;" />
+    ${prefs.footerText ? `<p style="font-size:11px;color:#444;margin:0 0 2px;">${escHtml(prefs.footerText)}</p>` : ""}
+    <p style="font-size:11px;color:#666;font-style:italic;margin:0;">Please correlate with clinical history and findings. Report issued by authorized radiologist only.</p>`
+      : "";
+
+    const sectionOrderRaw = style ? style.sectionOrder : "Technique,Findings,Impression";
+    const sectionOrder = sectionOrderRaw.split(",").map((s) => s.trim().toLowerCase());
+    
+    const renderClinicalHistory = () => {
+      const showHist = style ? style.showClinicalHistory : true;
+      if (showHist && input.clinicalHistory) {
+        return `<h3 style="margin:${sp} 0 ${sp};">${fmtHeadingHtml("Clinical History")}</h3><p style="margin:0 0 ${sp};">${escHtml(input.clinicalHistory)}</p>`;
+      }
+      return "";
+    };
+
+    const renderTechnique = () => {
+      return `<h3 style="margin:${sp} 0 ${sp};">${fmtHeadingHtml("Technique")}</h3><p style="margin:0 0 ${sp};">${escHtml(t.technique)}</p>`;
+    };
+
+    const renderFindings = () => {
+      return `<h3 style="margin:${sp} 0 ${sp};">${fmtHeadingHtml("Findings / Observation")}</h3>\n${sectionsHtml}`;
+    };
+
+    const renderImpression = () => {
+      return `<h3 style="margin:${sp2} 0 ${sp};">${fmtHeadingHtml("Impression")}</h3>\n${impressionHtml}`;
+    };
+
+    const renderRecommendation = () => {
+      const showRec = style ? style.showRecommendation : true;
+      if (showRec) {
+        return `<h3 style="margin:${sp2} 0 ${sp};">${fmtHeadingHtml("Recommendation")}</h3><p style="margin:0 0 ${sp};">${escHtml(input.recommendation ?? "Please correlate with clinical findings.")}</p>`;
+      }
+      return "";
+    };
+
+    const renderComparison = () => {
+      return "";
+    };
+
+    const renderMeasurements = () => {
+      const rows = input.measurements;
+      if (!rows?.length) return "";
+      const body = rows
+        .map((r) => `<tr><td style="border:1px solid #333;padding:2px 6px;">${escHtml(r.label)}</td><td style="border:1px solid #333;padding:2px 6px;">${escHtml(r.value)}</td></tr>`)
+        .join("");
+      return `<h3 style="margin:${sp2} 0 ${sp};">${fmtHeadingHtml("Measurements")}</h3>
+<table style="border-collapse:collapse;margin:0 0 ${sp};font-size:11px;"><thead><tr><th style="border:1px solid #333;padding:2px 6px;text-align:left;">Measurement</th><th style="border:1px solid #333;padding:2px 6px;text-align:left;">Value</th></tr></thead><tbody>${body}</tbody></table>`;
+    };
+
+    const renderCriticalCommunication = () => {
+      return "";
+    };
+
+    const renderMap: Record<string, () => string> = {
+      "clinical history": renderClinicalHistory,
+      "clinical_history": renderClinicalHistory,
+      "technique": renderTechnique,
+      "findings": renderFindings,
+      "impression": renderImpression,
+      "recommendation": renderRecommendation,
+      "comparison": renderComparison,
+      "measurements": renderMeasurements,
+      "critical communication": renderCriticalCommunication,
+      "critical_communication": renderCriticalCommunication,
+    };
+
+    let bodySectionsHtml = "";
+    for (const secKey of sectionOrder) {
+      const fn = renderMap[secKey];
+      if (fn) {
+        bodySectionsHtml += fn();
+      }
+    }
+    if (!sectionOrder.includes("clinical history") && !sectionOrder.includes("clinical_history")) {
+      bodySectionsHtml = renderClinicalHistory() + bodySectionsHtml;
+    }
+    if (!sectionOrder.includes("recommendation")) {
+      bodySectionsHtml = bodySectionsHtml + renderRecommendation();
+    }
+
+    const topGapStyle = isLetterhead ? "padding-top: 100px;" : "";
+    const containerStyle = isHalfPage 
+      ? `font-family:Arial,sans-serif;font-size:${fontSzVal};line-height:${lineHt};color:#111;max-width:${maxWVal};margin:0 auto;padding:${paddingVal};border:1px dashed #ccc;height:50%;`
+      : `font-family:Arial,sans-serif;font-size:${fontSzVal};line-height:${lineHt};color:#111;max-width:${maxWVal};margin:0 auto;padding:${paddingVal};${topGapStyle}`;
+
+    const contentBody = `<div style="${containerStyle}">
+    ${headerHtml}
+    <hr style="border:none;border-top:2px solid #000;margin:6px 0;" />
+    <h2 style="text-align:center;text-decoration:underline;font-size:15px;margin:8px 0;"><strong>${escHtml(t.studyName)}</strong></h2>
+    ${bodySectionsHtml}
+    ${imagesHtml}
+    ${footerBlock}
+  </div>`;
+
+    if (!isPlainPaper) return contentBody.trim();
+
+    return `<div style="font-family:Arial,sans-serif;font-size:${fontSzVal};line-height:${lineHt};color:#111;">
+      ${ptHeader}
+      ${contentBody}
+      ${ptFooter}
+    </div>`.trim();
+  }
+
+// ── Router ────────────────────────────────────────────────────────────────────
+
+export const radiologyReportGeneratorRouter = Router();
+
+// GET /templates
+radiologyReportGeneratorRouter.get("/templates", (_req: Request, res: Response) => {
+  res.json({ success: true, templates: Object.values(RADIOLOGY_TEMPLATES) });
+});
+
+// GET /protocols — list all MRI protocol specs from DB (active only)
+// Falls back to an empty array if table not yet migrated, so the UI degrades gracefully.
+radiologyReportGeneratorRouter.get("/protocols", async (_req: Request, res: Response) => {
+  try {
+    const protocols = await db
+      .select()
+      .from(mriProtocolSpecsTable)
+      .where(eq(mriProtocolSpecsTable.isActive, true))
+      .orderBy(mriProtocolSpecsTable.modality, mriProtocolSpecsTable.name);
+    res.json({ success: true, protocols });
+  } catch (err) {
+    // Table may not exist yet on older deployments — return empty gracefully
+    console.warn("[mri-protocols] Table not migrated yet, returning empty:", (err as Error).message);
+    res.json({ success: true, protocols: [] });
+  }
+});
+
+// GET /protocols/:key — get one protocol by protocol_key (e.g. "MRI_BRAIN_PLAIN")
+radiologyReportGeneratorRouter.get("/protocols/:key", async (req: Request, res: Response) => {
+  const key = String(req.params.key);
+  try {
+    const [protocol] = await db
+      .select()
+      .from(mriProtocolSpecsTable)
+      .where(eq(mriProtocolSpecsTable.protocolKey, key))
+      .limit(1);
+    if (!protocol) {
+      res.status(404).json({ success: false, error: "Protocol not found" });
+      return;
+    }
+    res.json({ success: true, protocol });
+  } catch (err) {
+    console.warn("[mri-protocols] Fetch error:", (err as Error).message);
+    res.status(500).json({ success: false, error: "Protocol lookup failed" });
+  }
+});
+
+// POST /protocols/quality-result — save radiologist QA assessment for a study
+const QualityResultBody = z.object({
+  studyId: z.number().int().positive(),
+  draftId: z.number().int().positive().optional(),
+  protocolId: z.number().int().positive(),
+  results: z.record(z.enum(["pass", "fail", "na"])),
+  overallGrade: z.enum(["acceptable", "suboptimal", "non-diagnostic"]).default("acceptable"),
+  qualityNotes: z.string().max(2000).optional(),
+});
+
+radiologyReportGeneratorRouter.post(
+  "/protocols/quality-result",
+  async (req: StaffAuthRequest, res: Response) => {
+    const parsed = QualityResultBody.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, error: parsed.error.flatten() });
+      return;
+    }
+    const { studyId, draftId, protocolId, results, overallGrade, qualityNotes } = parsed.data;
+    try {
+      const [inserted] = await db
+        .insert(mriProtocolQualityResultsTable)
+        .values({
+          studyId,
+          draftId: draftId ?? null,
+          protocolId,
+          results,
+          overallGrade,
+          qualityNotes: qualityNotes ?? null,
+          completedBy: req.staffSession?.subjectName ?? "unknown",
+        })
+        .returning();
+      res.json({ success: true, result: inserted });
+    } catch (err) {
+      console.error("[mri-quality-result] Save error:", err);
+      res.status(500).json({ success: false, error: "Failed to save quality result" });
+    }
+  },
+);
+
+// POST /voice-cleanup
+const VoiceCleanupBody = z.object({
+  rawTranscript: z.string().min(1).max(10_000),
+  draftId: z.number().int().optional(),
+  studyId: z.number().int().optional(),
+  patientId: z.number().int().optional(),
+  targetField: z.string().max(100).optional(),
+});
+
+radiologyReportGeneratorRouter.post("/voice-cleanup", async (req: StaffAuthRequest, res: Response) => {
+  const parsed = VoiceCleanupBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "rawTranscript is required" });
+    return;
+  }
+
+  const { rawTranscript, draftId, studyId, patientId, targetField } = parsed.data;
+  const cleanedText = cleanVoiceText(rawTranscript);
+  const structuredPoints = cleanedText
+    .split(/[;\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // Audit log — fire-and-forget, do not block response
+  void db
+    .insert(radiologyVoiceLogsTable)
+    .values({
+      draftId: draftId ?? null,
+      studyId: studyId ?? null,
+      patientId: patientId ?? null,
+      targetField: targetField ?? null,
+      rawTranscript,
+      cleanedText,
+      createdBy: req.staffSession?.subjectName ?? null,
+    })
+    .catch(() => undefined);
+
+  res.json({ success: true, cleanedText, structuredPoints });
+});
+
+// POST /generate — build HTML preview (does not persist)
+const GenerateBody = z.object({
+  templateId: z.string(),
+  patientName: z.string().optional(),
+  age: z.string().optional(),
+  sex: z.string().optional(),
+  patientId: z.union([z.string(), z.number()]).optional(),
+  referringDoctor: z.string().optional(),
+  accessionNumber: z.string().optional(),
+  studyDate: z.string().optional(),
+  clinicalHistory: z.string().optional(),
+  findingsSections: z.record(z.string()).optional(),
+  rawFindings: z.string().optional(),
+  impression: z.array(z.string()).optional(),
+  recommendation: z.string().optional(),
+  keyImages: z
+    .array(
+      z.object({
+        imageUrl: z.string(),
+        caption: z.string().default(""),
+        includeInReport: z.boolean().default(true),
+      }),
+    )
+    .optional(),
+  preferences: z.object({
+    headingCase: z.enum(["all_caps", "title_case"]).optional(),
+    sectionSpacing: z.enum(["spaced", "compact"]).optional(),
+    impressionStyle: z.enum(["bulleted", "numbered", "plain"]).optional(),
+    showEndOfReportFooter: z.boolean().optional(),
+    footerText: z.string().optional().nullable(),
+    headerLine1: z.string().optional().nullable(),
+    headerLine2Source: z.enum(["template_name", "custom"]).optional(),
+    headerLine2Custom: z.string().optional().nullable(),
+    printMode: z.enum(["letterhead", "plain_paper"]).optional(),
+  }).optional(),
+});
+
+radiologyReportGeneratorRouter.post("/generate", async (req: Request, res: Response) => {
+  const parsed = GenerateBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "Invalid request", details: parsed.error.issues });
+    return;
+  }
+
+  const data = parsed.data;
+  const template = RADIOLOGY_TEMPLATES[data.templateId] ?? Object.values(RADIOLOGY_TEMPLATES)[0]!;
+
+  // Fetch clinic settings for plain-paper print mode
+  let clinicSettings: { name: string; address: string; phone: string; email: string; logoDataUrl: string | null } | undefined;
+  if (data.preferences?.printMode === "plain_paper") {
+    const [clinic] = await db.select().from(clinicSettingsTable).limit(1);
+    if (clinic) {
+      clinicSettings = {
+        name: clinic.name || "Care Diagnostics",
+        address: clinic.address || "",
+        phone: clinic.phone || "",
+        email: clinic.email || "",
+        logoDataUrl: clinic.logoDataUrl || null,
+      };
+    }
+  }
+
+  // Fetch active institutional style
+  let institutionalStyle = null;
+  try {
+    const [style] = await db.select().from(radiologyInstitutionalStylesTable).limit(1);
+    if (style) {
+      institutionalStyle = style;
+    }
+  } catch (e) {
+    // ignore query error
+  }
+
+  const html = buildReportHtml({
+    ...data,
+    patientId: data.patientId != null ? String(data.patientId) : undefined,
+    template,
+    preferences: data.preferences,
+    clinicSettings,
+    institutionalStyle,
+  });
+
+  const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+  res.json({
+    success: true,
+    title: template.studyName,
+    formattedReportHtml: html,
+    formattedReportText: text,
+  });
+});
+
+// POST /save-draft
+//
+// `findings` (Radiology Roadmap Ticket A3.1) carries the structured Quick
+// Select selection — {findingId, params} per selected finding — that
+// RadiologyReportingWorkspace.tsx serializes into every save. Since Ticket
+// A3.2, when present and `ff_radiology_structured_core` is enabled, it is
+// also dual-written into report_finding_instances — see the block after the
+// legacy draft save below. `values` (used for both the insert and update
+// branches) is still built as an explicit field list that never references
+// `rest.findings`, so the legacy draft row itself is entirely unaffected by
+// this field either way. `params` is intentionally loosely typed (not
+// pinned to AbnormalityInstance's exact shape) so this schema doesn't need
+// to change in lockstep with future frontend parameter-shape evolution.
+// ── Ticket D3 — truthful source assembly for the canonical D1 document ────────
+// Pure helpers that turn the just-saved draft row (+ its PACS worklist row, when
+// linked, which carries the DICOM study identifiers) into a DraftD1Source.
+// Every value is sourced truthfully or left null/"" so the pure adapter
+// (radiologyD1DraftWriter.ts) SKIPS rather than fabricate — see that module's
+// HONEST SCOPE header.
+
+function d3ToIsoOrEmpty(v: unknown): string {
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === "string" && v.length > 0 && !Number.isNaN(new Date(v).getTime())) {
+    return new Date(v).toISOString();
+  }
+  return "";
+}
+
+// DICOM StudyDate is "YYYYMMDD"; the worklist column is free text and may
+// already be ISO. Returns a valid ISO-8601 datetime, or "" (→ adapter skips).
+function d3DicomDateToIso(v: string | null | undefined): string {
+  if (!v) return "";
+  const m = /^(\d{4})(\d{2})(\d{2})$/.exec(v.trim());
+  if (m) return `${m[1]}-${m[2]}-${m[3]}T00:00:00Z`;
+  return d3ToIsoOrEmpty(v);
+}
+
+interface D3DraftRow {
+  id: number;
+  worklistId: number | null;
+  patientId: number | null;
+  templateId: string | null;
+  modality: string | null;
+  studyName: string | null;
+  createdBy: string | null;
+  createdAt: Date | string | null;
+  updatedAt: Date | string | null;
+}
+interface D3WorklistRow {
+  patientId: number | null;
+  studyInstanceUID: string | null;
+  accessionNumber: string | null;
+  studyDate: string | null;
+  studyDescription: string | null;
+  referringDoctor: string | null;
+  assignedRadiologist: string | null;
+}
+
+function buildD1DraftSource(
+  draft: D3DraftRow,
+  findings: Array<{ findingId: number; params?: Record<string, unknown> }>,
+  worklist: D3WorklistRow | null,
+): DraftD1Source {
+  const patientRefValue =
+    draft.patientId != null ? String(draft.patientId)
+    : worklist?.patientId != null ? String(worklist.patientId)
+    : "";
+  const identifiers = worklist
+    ? {
+        studyInstanceUid: worklist.studyInstanceUID ?? "",
+        accessionNumber: worklist.accessionNumber ?? "",
+        patientRefValue,
+        studyDatetimeIso: d3DicomDateToIso(worklist.studyDate),
+        referringPhysician: worklist.referringDoctor ?? "",
+        performingPhysician: worklist.assignedRadiologist ?? "",
+      }
+    : null;
+  return {
+    draftId: draft.id,
+    createdBy: draft.createdBy ?? null,
+    createdAtIso: d3ToIsoOrEmpty(draft.createdAt),
+    updatedAtIso: d3ToIsoOrEmpty(draft.updatedAt),
+    modality: draft.modality ?? null,
+    // body_region has no dedicated column; the PACS study description is the
+    // closest truthful value (null → adapter skips, e.g. manual drafts).
+    bodyRegion: worklist?.studyDescription ?? null,
+    studyType: draft.studyName ?? null,
+    templateId: draft.templateId ?? null,
+    identifiers,
+    // The B1/B2 catalog is currently unversioned (report_finding_instances.
+    // catalog_version defaults "0"); "0" is the truthful current label, not a
+    // placeholder pretending to be a real version.
+    catalogSchemaVersion: "0",
+    contentPackVersions: {},
+    aiRulesVersions: {},
+    findingSelections: findings.map((f) => ({
+      findingId: f.findingId,
+      params: f.params ?? {},
+      source: "quickselect",
+    })),
+  };
+}
+
+// Ticket M1.4 — this schema previously rejected the canonical workspace's
+// actual payload two ways (verified empirically before the fix):
+//   1. every empty field is sent as `null` (`clinicalHistory: clinicalHistory
+//      || null`, `patientId: entry?.patientId ?? null`, …) and `.optional()`
+//      does not accept null → 400 "Invalid request";
+//   2. the workspace's structured sections are `{ [label]: { normal, text } }`
+//      objects, not the legacy generator's `{ [label]: string }` → 400.
+// So "Save Draft" from RadiologyReportingWorkspace could never succeed. The
+// fields are now nullish and findingsSections accepts BOTH section shapes
+// (each page round-trips its own shape through the same JSON text column —
+// nothing server-side reads inside it).
+const SaveDraftBody = z.object({
+  id: z.number().int().nullish(),
+  studyId: z.number().int().nullish(),
+  worklistId: z.number().int().nullish(),
+  patientId: z.number().int().nullish(),
+  templateId: z.string().nullish(),
+  modality: z.string().nullish(),
+  studyName: z.string().nullish(),
+  clinicalHistory: z.string().nullish(),
+  technique: z.string().nullish(),
+  rawFindings: z.string().nullish(),
+  findingsSections: z.record(
+    z.union([
+      z.string(),
+      z.object({ normal: z.boolean(), text: z.string() }).passthrough(),
+    ]),
+  ).nullish(),
+  impression: z.array(z.string()).nullish(),
+  recommendation: z.string().nullish(),
+  formattedReportHtml: z.string().nullish(),
+  formattedReportText: z.string().nullish(),
+  aiContributionPct: z.number().min(0).max(100).nullish(),
+  findings: z.array(
+    z.object({
+      findingId: z.number().int(),
+      params: z.record(z.unknown()).optional(),
+    }).passthrough(),
+  ).nullish(),
+  // P1 — radiologist structured-format field values. Namespaced inside
+  // structured_json by persistCareStructuredJsonPatch so A4's cache array is
+  // preserved (envelope) rather than overwritten.
+  structuredFormatState: z.object({
+    kind: z.literal(CARE_STRUCTURED_FORMAT_STATE_KIND),
+    formatId: z.number().int(),
+    formatVersion: z.number().int().optional(),
+    values: z.record(z.union([
+      z.string(),
+      z.array(z.string()),
+      z.boolean(),
+      z.number(),
+      z.null(),
+    ])),
+    updatedAt: z.string().optional(),
+  }).nullish(),
+  observationLedger: z.unknown().optional(),
+  viewerMeasurements: z.unknown().optional(),
+  canalApProvenance: z.unknown().optional(),
+  // MRI Brain vascular acquisition state (mra/mrv) — additive envelope key
+  // (careVascularTechnique). Absent while untouched, so existing drafts are
+  // written exactly as before.
+  vascularTechnique: z.unknown().optional(),
+  // Spine reporting capture state (vertebral numbering, available sequences,
+  // screening selections and `impressionOrderFrozen`) — stored verbatim as the
+  // structured_json key `spineReporting`, which is the key the workspace's own
+  // reader asks for. Declared here because an undeclared request field is
+  // stripped by this schema before anything else sees it: every save was sending
+  // it and nothing was storing it, so a reopen re-derived the state from defaults
+  // and the §37 priority sorter was free to re-shuffle an Impression the
+  // radiologist had arranged by hand.
+  spineReporting: z.unknown().optional(),
+  // ADR-004 region-transition history — additive envelope key
+  // (careRegionTransitions). Absent on every save that has never re-regioned a report, so
+  // those requests are byte-identical to what they were before this field existed.
+  regionTransitions: z.array(z.unknown()).optional(),
+  // Applied whole-report format identity — additive structured_json envelope
+  // key (careReportFormatIdentity) so save → reopen keeps the baseline format
+  // banner and the workspace never re-bootstraps a saved report.
+  reportFormatIdentity: z.object({
+    kind: z.literal("care.report_format_identity.v1"),
+    name: z.string().min(1),
+    reportTitle: z.string().optional(),
+    appliedAt: z.string().optional(),
+    formatId: z.string().optional(),
+    formatRevision: z.string().optional(),
+    baselineManifestVersion: z.number().int().positive().optional(),
+    baselineManifestRevision: z.string().optional(),
+  }).nullish(),
+  /** Abnormal-pattern markers. Stored as structuredJson.careAppliedPatterns. */
+  appliedPatterns: z.array(z.object({
+    patternId: z.string().min(1),
+    version: z.number().int().positive(),
+    bundleId: z.string().min(1),
+    appliedAt: z.string().min(1),
+  })).nullish(),
+  /** Combined-report second worklist row. Stored as structuredJson.linkedStudyId. */
+  linkedStudy: z.object({
+    studyId: z.union([z.number().int().positive(), z.string().min(1)]),
+    title: z.string().min(1),
+    modality: z.string().nullish(),
+    studyDescription: z.string().nullish(),
+    region: z.string().nullish(),
+    accessionNumber: z.string().nullish(),
+    studyInstanceUID: z.string().nullish(),
+  }).nullish(),
+  /**
+   * PROMPT 4 — present only on the save that persists an accepted AI draft.
+   *
+   * It names the Composer job this save is writing for, and the narrative this
+   * editor believes it is replacing. The job id is a reference the server looks
+   * up (`radiology_report_compose_jobs`), and `previous` is checked against the
+   * row rather than believed: it can only authorise a write if the saved report
+   * already holds it. Ordinary autosaves never send this, and their behaviour is
+   * unchanged, byte for byte — the AI apply is the only flow allowed to be
+   * refused here, because refusing it costs nothing (the text stays in the
+   * editor and the next autosave persists it), whereas letting a stale draft
+   * overwrite a newer report costs a patient's report.
+   */
+  composer: z.object({
+    jobId: z.number().int().positive(),
+    previous: z.object({
+      findings: z.string(),
+      impression: z.string(),
+      recommendation: z.string(),
+    }),
+  }).nullish(),
+});
+
+radiologyReportGeneratorRouter.post("/save-draft", async (req: StaffAuthRequest, res: Response) => {
+  const parsed = SaveDraftBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "Invalid request" });
+    return;
+  }
+
+  const { id, ...rest } = parsed.data;
+  const author = req.staffSession?.subjectName ?? null;
+  const sectionsForStore: Record<string, unknown> = rest.findingsSections
+    ? { ...rest.findingsSections }
+    : {};
+  if (rest.technique?.trim()) {
+    sectionsForStore.Technique = rest.technique.trim();
+  }
+
+  // M1.6A — respect active study locks: a draft save against a worklist row
+  // that ANOTHER user actively holds is refused, so two radiologists can
+  // never silently overwrite each other's in-progress report. Unlocked, own,
+  // or expired locks never block (pre-lock flows keep working unchanged).
+  if (rest.worklistId != null && req.staffSession) {
+    const gate = await checkWriteLock(rest.worklistId, req.staffSession.subjectId);
+    if (gate.blocked) {
+      res.status(409).json({
+        success: false,
+        error: "LOCKED_BY_OTHER",
+        lockedBy: gate.lockedBy,
+        message: `This study is currently being reported by ${gate.lockedBy}. Your text was not saved to the shared draft.`,
+      });
+      return;
+    }
+  }
+
+  try {
+    await assertDraftWritable({
+      draftId: id ?? null,
+      worklistId: rest.worklistId ?? null,
+      studyId: rest.studyId ?? null,
+      patientId: rest.patientId ?? null,
+    });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+
+  // Derive study/worklist/patient from the resolved worklist so a delayed
+  // Patient A autosave cannot write into Patient B's draft identity.
+  let studyId = rest.studyId ?? null;
+  let worklistId = rest.worklistId ?? null;
+  let patientId = rest.patientId ?? null;
+  const resolvedWorklist = worklistId
+    ? (await db.select().from(radiologyWorklistTable).where(eq(radiologyWorklistTable.id, worklistId)).limit(1))[0]
+    : await resolveWorklistFromStudyRef(studyId);
+  if (resolvedWorklist) {
+    worklistId = resolvedWorklist.id;
+    studyId = resolvedWorklist.id;
+    patientId = resolvedWorklist.patientId ?? patientId;
+  }
+
+  // `rest.findings` (A3.1) is intentionally not read anywhere below —
+  // accepted by the schema above, ignored by this handler until A3.2.
+  const values = {
+    studyId,
+    worklistId,
+    patientId,
+    templateId: rest.templateId ?? null,
+    modality: rest.modality ?? null,
+    studyName: rest.studyName ?? null,
+    clinicalHistory: rest.clinicalHistory ?? null,
+    rawFindings: rest.rawFindings ?? null,
+    findingsSections: Object.keys(sectionsForStore).length > 0
+      ? JSON.stringify(sectionsForStore)
+      : null,
+    impression: rest.impression ? JSON.stringify(rest.impression) : null,
+    recommendation: rest.recommendation ?? null,
+    formattedReportHtml: rest.formattedReportHtml ?? null,
+    formattedReportText: rest.formattedReportText ?? null,
+    aiContributionPct: rest.aiContributionPct ?? null,
+  };
+
+  // Branch unification (Ticket A3.2): both the insert and update paths now
+  // resolve to a single `draft`, with exactly one response point below. This
+  // replaces the old shape where each branch called res.json() independently
+  // — needed so the structured-findings dual-write that follows has one
+  // unambiguous place to hang off, after the legacy save has fully committed
+  // and before the single response is sent. No behavior change: same two
+  // queries, same values, same response shape as before.
+  //
+  // PROMPT 4 adds one branch to that: a save carrying `composer` (the reporting
+  // workspace persisting an accepted AI draft) runs the same write inside a
+  // transaction that first compares the saved report against the job's
+  // server-derived baseline, and then records the token of what it wrote. An
+  // ordinary save — every autosave, every manual Save, every other surface —
+  // takes the two queries below exactly as before, with no lock and no gate.
+  const composerTag = rest.composer ?? null;
+  // `db` and a `db.transaction()` handle share every query method; only the pool
+  // reference differs, so omitting it is the type that accepts both.
+  type DraftExecutor = Omit<typeof db, "$client">;
+  const writeDraftRow = (executor: DraftExecutor) =>
+    id
+      ? executor
+          .update(radiologyReportDraftsTable)
+          .set(values)
+          .where(eq(radiologyReportDraftsTable.id, id))
+          .returning()
+          .then((rows) => rows[0])
+      : executor
+          .insert(radiologyReportDraftsTable)
+          .values({ ...values, createdBy: author })
+          .returning()
+          .then((rows) => rows[0]);
+
+  let draft: typeof radiologyReportDraftsTable.$inferSelect | undefined;
+  if (composerTag && worklistId != null) {
+    const outcome = await db.transaction(async (tx) => {
+      const gate = await authoriseComposeSaveTx(tx, {
+        jobId: composerTag.jobId,
+        worklistId,
+        patientId,
+        previous: composerTag.previous,
+      });
+      if ("refuse" in gate) return { kind: "refused" as const, refusal: gate.refuse };
+      const row = await writeDraftRow(tx);
+      if (gate.proceed === "composer") {
+        const receipt = await recordComposeReceiptTx(tx, { jobId: composerTag.jobId, worklistId, patientId });
+        if (!receipt.ok) {
+          return {
+            kind: "refused" as const,
+            refusal: { ok: false as const, code: receipt.code, message: receipt.message },
+          };
+        }
+      }
+      return { kind: "saved" as const, row };
+    });
+    if (outcome.kind === "refused") {
+      res.status(409).json({
+        success: false,
+        error: outcome.refusal.code,
+        code: outcome.refusal.code,
+        message: outcome.refusal.message,
+      });
+      return;
+    }
+    draft = outcome.row;
+  } else {
+    draft = await writeDraftRow(db);
+  }
+
+  // Ticket A3.2 — dual-write the structured Quick Select findings into
+  // report_finding_instances, gated on ff_radiology_structured_core (default
+  // OFF). Runs in its own transaction, entirely separate from the legacy
+  // draft save above: replace-not-append (every save fully replaces this
+  // draft's FindingInstance rows, so repeated saves never accumulate
+  // duplicates), and any failure here is caught and logged only — it must
+  // never turn an already-successful draft save into a failed response.
+  // report_finding_instances has no readers yet, so a swallowed failure here
+  // has no observable effect beyond a stale/missing structured snapshot.
+  //
+  // Guarded on `rest.findings != null` (not `.length > 0`): an old client
+  // that never sends the key — or sends an explicit null — must leave
+  // existing rows untouched, but a current client that sends `findings: []`
+  // (user deselected every Quick Select finding) is a real signal that the
+  // replace should still run and clear this draft's rows — treating an empty
+  // array like "no signal" would silently leave stale rows behind after a
+  // legitimate deselect-all save.
+  if (draft?.id && rest.findings != null) {
+    const draftId = draft.id;
+    const findings = rest.findings;
+    try {
+      if (await isFeatureEnabledServer("ff_radiology_structured_core")) {
+        await db.transaction(async (tx) => {
+          await tx
+            .delete(reportFindingInstancesTable)
+            .where(eq(reportFindingInstancesTable.draftId, draftId));
+          if (findings.length > 0) {
+            await tx.insert(reportFindingInstancesTable).values(
+              findings.map((f) => ({
+                draftId,
+                findingId: f.findingId,
+                structuredJson: f.params ?? {},
+                source: "quickselect",
+              })),
+            );
+          }
+        });
+      }
+    } catch (err) {
+      console.error(
+        "[radiology-report-generator] A3.2 structured findings dual-write failed (non-fatal):",
+        err,
+      );
+    }
+
+    // Ticket A4 — regenerate the structured_json cache on this draft from
+    // the report_finding_instances rows A3.2 just replaced. Its own
+    // try/catch, deliberately separate from A3.2's block above: A4 is fully
+    // removable without touching A3.2, and a regeneration failure must not
+    // affect the draft save response any more than A3.2's failure does.
+    // regenerateDraftStructuredJson re-checks the feature flag itself.
+    try {
+      await regenerateDraftStructuredJson(draftId);
+    } catch (err) {
+      console.error(
+        "[radiology-report-generator] A4 structured_json cache regeneration failed (non-fatal):",
+        err,
+      );
+    }
+
+    // Ticket D3 — persist a canonical D1 structured_json document for this
+    // draft into the SEPARATE structured_json_d1 column (NEVER the A4-owned
+    // structured_json, which A5 drift-checks). Own try/catch + own flag,
+    // exactly like A3.2/A4 above: any failure here is logged only and can never
+    // turn an already-successful draft save into a failed response. Gated on
+    // ff_radiology_structured_d1_draft AND ff_radiology_structured_core (both
+    // default OFF). The adapter skips truthfully when required D1 fields are
+    // unavailable; the D2 writer is the ONLY producer of content_sha256; draft
+    // documents never carry final signature fields.
+    try {
+      if (
+        (await isFeatureEnabledServer("ff_radiology_structured_d1_draft")) &&
+        (await isFeatureEnabledServer("ff_radiology_structured_core"))
+      ) {
+        let worklist: D3WorklistRow | null = null;
+        if (draft.worklistId != null) {
+          const [row] = await db
+            .select()
+            .from(radiologyWorklistTable)
+            .where(eq(radiologyWorklistTable.id, draft.worklistId))
+            .limit(1);
+          worklist = (row as D3WorklistRow | undefined) ?? null;
+        }
+        const source = buildD1DraftSource(draft as D3DraftRow, findings, worklist);
+        // Ticket D3.5 — when the canonical catalog is enabled (ff_radiology_catalog),
+        // materialize the Quick-Select selections into real D1 findings via the
+        // B1/B2 catalog; unresolvable ones stay in extensions for audit. When the
+        // catalog is off, D3's behavior stands (findings:[], full selection in
+        // extensions). Building the store/port/resolver issues no query by
+        // itself — the resolver only reads the catalog for selections that
+        // materialize.
+        const catalogStore = (await isFeatureEnabledServer("ff_radiology_catalog"))
+          ? new DrizzleCatalogStore()
+          : null;
+        const built = await buildAndValidateDraftD1Document(
+          source,
+          catalogStore
+            ? {
+                resolver: new CatalogStoreFindingResolver(catalogStore, async (qfId) => {
+                  const [row] = await db
+                    .select({ label: radiologyQuickFindingsTable.label })
+                    .from(radiologyQuickFindingsTable)
+                    .where(eq(radiologyQuickFindingsTable.id, qfId))
+                    .limit(1);
+                  return row?.label ? { label: row.label } : null;
+                }),
+                catalogPort: new DrizzleStructuredReportCatalogPort(catalogStore),
+              }
+            : {},
+        );
+        if (built.ok) {
+          await db
+            .update(radiologyReportDraftsTable)
+            .set({ structuredJsonD1: built.document })
+            .where(eq(radiologyReportDraftsTable.id, draftId));
+        } else {
+          console.warn(
+            "[radiology-report-generator] D3 D1 structured_json persist skipped (non-fatal):",
+            "skipReasons" in built ? built.skipReasons : built,
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        "[radiology-report-generator] D3 D1 structured_json persist failed (non-fatal):",
+        err,
+      );
+    }
+  }
+
+  // Every envelope key this request carries goes into structured_json in ONE
+  // locked read-modify-write. These used to be six separate per-key writers,
+  // each doing its own SELECT → compose → UPDATE of the same column; two
+  // overlapping saves then composed against the same stale snapshot and the
+  // second silently discarded the first's keys. See persistCareStructuredJsonPatch.
+  let structuredJsonPersistFailed = false;
+  const structuredJsonPatch = buildCareStructuredJsonPatch(rest);
+  if (draft?.id && Object.keys(structuredJsonPatch).length > 0) {
+    try {
+      await persistCareStructuredJsonPatch(draft.id, structuredJsonPatch);
+    } catch (err) {
+      structuredJsonPersistFailed = true;
+      console.error(
+        "[radiology-report-generator] structured_json persist failed:",
+        err,
+        "keys:",
+        Object.keys(structuredJsonPatch).join(","),
+      );
+    }
+  }
+
+  // success:true with this flag set means the narrative columns saved but the
+  // structured envelope did not. The client must keep its dirty flag on this
+  // response so the autosave retries — clearing it would make the loss
+  // permanent and invisible.
+  res.json({ success: true, draft, structuredJsonPersistFailed });
+});
+
+// GET /structured-json-drift — admin-only, read-only diagnostic (Ticket
+// A5). Compares radiology_report_drafts.structured_json (the cache) against
+// a fresh rebuild from report_finding_instances (the source of truth) for
+// draft rows only — never touches patient_reports. Detection only: this
+// endpoint never writes anything, and there is deliberately no auto-repair
+// wired to it. Pass ?draftId=<id> to check one draft; omit it to scan every
+// draft that could possibly be out of sync. Gated on
+// ff_radiology_structured_core — checked here (for a clear "disabled"
+// response) and again inside the drift-check functions themselves.
+radiologyReportGeneratorRouter.get(
+  "/structured-json-drift",
+  requireAdminRole,
+  async (req: Request, res: Response) => {
+    if (!(await isFeatureEnabledServer("ff_radiology_structured_core"))) {
+      res.json({ success: true, enabled: false, message: "ff_radiology_structured_core is disabled" });
+      return;
+    }
+
+    const draftIdParam = req.query.draftId ? Number(req.query.draftId) : null;
+    if (draftIdParam !== null) {
+      if (!Number.isInteger(draftIdParam) || draftIdParam <= 0) {
+        res.status(400).json({ success: false, error: "Invalid draftId" });
+        return;
+      }
+      const result = await checkDraftStructuredJsonDrift(draftIdParam);
+      res.json({ success: true, enabled: true, result });
+      return;
+    }
+
+    const summary = await scanDraftsForStructuredJsonDrift();
+    res.json({ success: true, enabled: true, summary });
+  },
+);
+
+// GET /drafts — list recent drafts (optionally filtered by studyId or patientId)
+radiologyReportGeneratorRouter.get("/drafts", async (req: Request, res: Response) => {
+  const studyId = req.query.studyId ? Number(req.query.studyId) : null;
+  const patientId = req.query.patientId ? Number(req.query.patientId) : null;
+
+  const conditions = [];
+  if (studyId) conditions.push(eq(radiologyReportDraftsTable.studyId, studyId));
+  if (patientId) conditions.push(eq(radiologyReportDraftsTable.patientId, patientId));
+
+  const rows = await db
+    .select()
+    .from(radiologyReportDraftsTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(radiologyReportDraftsTable.updatedAt), desc(radiologyReportDraftsTable.id))
+    .limit(50);
+
+  let drafts = rows;
+  if (studyId) {
+    const worklist = await resolveWorklistFromStudyRef(studyId);
+    if (worklist?.patientId) {
+      drafts = rows.filter((r) => r.patientId == null || r.patientId === worklist.patientId);
+    }
+  }
+
+  res.json({ success: true, drafts });
+});
+
+// ─── Ticket M1.4 — read-only workflow endpoints ──────────────────────────────
+
+// GET /finding-instances?draftId=N — the Quick Select selections persisted by
+// A3.2 for one draft, exactly what the canonical workspace needs to RESTORE
+// its structured click state after a reload. Read-only; only the fields the
+// UI hydrates from.
+radiologyReportGeneratorRouter.get("/finding-instances", async (req: Request, res: Response) => {
+  const draftId = Number(req.query.draftId);
+  if (!Number.isInteger(draftId) || draftId <= 0) {
+    res.status(400).json({ success: false, error: "Invalid draftId" });
+    return;
+  }
+  const rows = await db
+    .select({
+      findingId: reportFindingInstancesTable.findingId,
+      structuredJson: reportFindingInstancesTable.structuredJson,
+      source: reportFindingInstancesTable.source,
+    })
+    .from(reportFindingInstancesTable)
+    .where(eq(reportFindingInstancesTable.draftId, draftId));
+  res.json({ success: true, instances: rows });
+});
+
+// POST /validate-draft {draftId} — run the EXISTING D3/D3.5 builder + D1
+// validator over a saved draft, read-only (never persists anything), so the
+// workspace can show real blocking errors / warnings before finalize instead
+// of client-side guesses. Mirrors the save-draft D3 block's inputs exactly;
+// no validation logic is reimplemented here or in the frontend.
+radiologyReportGeneratorRouter.post("/validate-draft", async (req: Request, res: Response) => {
+  const draftId = Number((req.body as { draftId?: unknown })?.draftId);
+  if (!Number.isInteger(draftId) || draftId <= 0) {
+    res.status(400).json({ success: false, error: "Invalid draftId" });
+    return;
+  }
+  const [draft] = await db
+    .select()
+    .from(radiologyReportDraftsTable)
+    .where(eq(radiologyReportDraftsTable.id, draftId))
+    .limit(1);
+  if (!draft) {
+    res.status(404).json({ success: false, error: "Draft not found" });
+    return;
+  }
+
+  const structuredEnabled =
+    (await isFeatureEnabledServer("ff_radiology_structured_d1_draft")) &&
+    (await isFeatureEnabledServer("ff_radiology_structured_core"));
+  if (!structuredEnabled) {
+    res.json({
+      success: true,
+      structured: { enabled: false, attempted: false },
+      legacy: { rawFindings: Boolean(draft.rawFindings?.trim()), impression: Boolean(draft.impression) },
+    });
+    return;
+  }
+
+  const instanceRows = await db
+    .select({ findingId: reportFindingInstancesTable.findingId, structuredJson: reportFindingInstancesTable.structuredJson })
+    .from(reportFindingInstancesTable)
+    .where(eq(reportFindingInstancesTable.draftId, draftId));
+  const findings = instanceRows.map((r) => ({
+    findingId: r.findingId,
+    params: (r.structuredJson ?? {}) as Record<string, unknown>,
+  }));
+
+  let worklist: D3WorklistRow | null = null;
+  if (draft.worklistId != null) {
+    const [row] = await db
+      .select()
+      .from(radiologyWorklistTable)
+      .where(eq(radiologyWorklistTable.id, draft.worklistId))
+      .limit(1);
+    worklist = (row as D3WorklistRow | undefined) ?? null;
+  }
+
+  const source = buildD1DraftSource(draft as D3DraftRow, findings, worklist);
+  const catalogStore = (await isFeatureEnabledServer("ff_radiology_catalog"))
+    ? new DrizzleCatalogStore()
+    : null;
+  const built = await buildAndValidateDraftD1Document(
+    source,
+    catalogStore
+      ? {
+          resolver: new CatalogStoreFindingResolver(catalogStore, async (qfId) => {
+            const [row] = await db
+              .select({ label: radiologyQuickFindingsTable.label })
+              .from(radiologyQuickFindingsTable)
+              .where(eq(radiologyQuickFindingsTable.id, qfId))
+              .limit(1);
+            return row?.label ? { label: row.label } : null;
+          }),
+          catalogPort: new DrizzleStructuredReportCatalogPort(catalogStore),
+        }
+      : {},
+  );
+
+  res.json({
+    success: true,
+    structured: built.ok
+      ? {
+          enabled: true,
+          attempted: true,
+          built: true,
+          documentId: built.document.document_id,
+          contentSha256: built.contentSha256,
+          findingsCount: Array.isArray(built.document.findings) ? built.document.findings.length : 0,
+          errors: [],
+          warnings: built.warnings,
+        }
+      : {
+          enabled: true,
+          attempted: true,
+          built: false,
+          skipReasons: built.skipReasons,
+          errors: built.validationErrors ?? [],
+          warnings: [],
+        },
+    legacy: { rawFindings: Boolean(draft.rawFindings?.trim()), impression: Boolean(draft.impression) },
+  });
+});
+
+// GET /drafts/:id
+radiologyReportGeneratorRouter.get("/drafts/:id", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ success: false, error: "Invalid id" }); return; }
+
+  const [draft] = await db
+    .select()
+    .from(radiologyReportDraftsTable)
+    .where(eq(radiologyReportDraftsTable.id, id));
+
+  if (!draft) { res.status(404).json({ success: false, error: "Draft not found" }); return; }
+  res.json({ success: true, draft });
+});
+
+// ── R1.1 — server-rendered DRAFT preview through THE shared presentation
+// layer. The workspace's on-screen preview and its Print button both show
+// this exact document, so what the radiologist sees is what every delivery
+// surface produces (one render pipeline, no duplicated HTML). Read-only;
+// drafts render with a DRAFT watermark and can never pass as final.
+radiologyReportGeneratorRouter.get("/drafts/:id/print-preview", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ success: false, error: "Invalid id" }); return; }
+  const [draft] = await db.select().from(radiologyReportDraftsTable).where(eq(radiologyReportDraftsTable.id, id));
+  if (!draft) { res.status(404).send("Draft not found"); return; }
+
+  const [worklist] = draft.worklistId
+    ? await db.select().from(radiologyWorklistTable).where(eq(radiologyWorklistTable.id, draft.worklistId)).limit(1)
+    : [undefined];
+  const [clinic] = await db.select().from(clinicSettingsTable).limit(1);
+
+  let catalogTestName: string | null = null;
+  let patientUhid: string | null = null;
+  let patientAgeDisplay: string | null = null;
+  // The preview and the signed artifact must print the SAME age, so both resolve
+  // it through `reportAge.formatAgeAtExamination` — the age AT THE EXAMINATION,
+  // never at the render instant. Reading `new Date()` here meant a draft
+  // previewed in December and signed in January carried two different ages for
+  // one examination, and a reprint of a 2025 study silently aged the patient.
+  const examinationDateIso = normalizeStudyDate(worklist?.studyDate ?? null);
+  const formatMasterAge = (p: {
+    ageValue?: number | null;
+    ageUnit?: string | null;
+    dateOfBirth?: string | null;
+  } | null | undefined): string =>
+    p
+      ? formatAgeAtExamination({
+          dateOfBirth: p.dateOfBirth ?? null,
+          ageValue: p.ageValue ?? null,
+          ageUnit: p.ageUnit ?? null,
+          documentedAge: worklist?.age ?? null,
+          asOf: examinationDateIso || null,
+        })
+      : "";
+  if (worklist?.studyId) {
+    const [linked] = await db
+      .select({
+        testName: testsTable.name,
+        uhid: patientsTable.patientId,
+        ageValue: patientsTable.ageValue,
+        ageUnit: patientsTable.ageUnit,
+        dateOfBirth: patientsTable.dateOfBirth,
+      })
+      .from(radiologyStudiesTable)
+      .leftJoin(testsTable, eq(testsTable.id, radiologyStudiesTable.testId))
+      .leftJoin(patientsTable, eq(patientsTable.id, radiologyStudiesTable.patientId))
+      .where(eq(radiologyStudiesTable.id, worklist.studyId))
+      .limit(1);
+    catalogTestName = linked?.testName ?? null;
+    patientUhid = linked?.uhid ?? null;
+    patientAgeDisplay = formatMasterAge(linked) || null;
+  } else if (worklist?.patientId) {
+    const [pat] = await db
+      .select({
+        uhid: patientsTable.patientId,
+        ageValue: patientsTable.ageValue,
+        ageUnit: patientsTable.ageUnit,
+        dateOfBirth: patientsTable.dateOfBirth,
+      })
+      .from(patientsTable)
+      .where(eq(patientsTable.id, worklist.patientId))
+      .limit(1);
+    patientUhid = pat?.uhid ?? null;
+    patientAgeDisplay = formatMasterAge(pat) || null;
+  }
+
+  // ONE title precedence, same as the client's resolveCanonicalStudyTitle and
+  // the signed artifact's stored title: the BILLED catalogue name first (what
+  // the clinic sold — always present for a matched study), the DICOM
+  // description second, the draft's own studyName (legacy generator pages
+  // only — the workspace never sets it) last. The old order let one study
+  // print three different headings from three doors.
+  const studyTitle = (
+    catalogTestName?.trim()
+    || worklist?.studyDescription?.trim()
+    || draft.studyName?.trim()
+    || `${draft.modality ?? worklist?.modality ?? ""} Study`.trim()
+  ).toUpperCase();
+  // The heading above is the booked examination and stays it. When the
+  // radiologist recorded a region transition (ADR-004), the body of this report
+  // documents a different — usually narrower — region, and the reader of the
+  // paper needs to know that was decided, not missed. Derived only from the
+  // stored transition record; null for every report that has never been
+  // re-regioned, which is what keeps those pages byte-identical.
+  const reportingScopeNote = reportedScopeNote({
+    bookedTitle: studyTitle,
+    records: extractCareRegionTransitions(draft.structuredJson),
+  }) ?? undefined;
+  const formattedStudyDate = formatReportDate(worklist?.studyDate ?? null);
+
+  // The clinic's heading case, threaded the same way impressionStyle is: the
+  // client's live print body case-formats every heading (default all_caps), so
+  // a direct preview render no longer disagrees with the document it previews.
+  const headingCase = parseHeadingCase(req.query.headingCase);
+
+  // Body: findings sections + impression + recommendation from the draft row
+  // (presentation of existing content only — no clinical wording is altered).
+  const esc = (s: string | null | undefined) => escapeHtml(s ?? "");
+  let sectionsHtml = "";
+  let techniqueHtml = "";
+  try {
+    const sections = draft.findingsSections ? (JSON.parse(draft.findingsSections) as Record<string, unknown>) : {};
+    const sectionText = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (content && typeof content === "object" && "text" in content) {
+        return String((content as { text?: unknown }).text ?? "");
+      }
+      return "";
+    };
+    const findingsParts: string[] = [];
+    for (const [name, content] of Object.entries(sections)) {
+      const text = sectionText(content).trim();
+      if (!text) continue;
+      if (name.toLowerCase() === "technique") {
+        techniqueHtml = `<div class="section-heading">${esc(fmtServerHeading("Technique", headingCase))}</div><p>${esc(text).replaceAll("\n", "<br/>")}</p>`;
+        continue;
+      }
+      findingsParts.push(`<div class="section-heading">${esc(fmtServerHeading(name, headingCase))}</div><p>${esc(text).replaceAll("\n", "<br/>")}</p>`);
+    }
+    sectionsHtml = findingsParts.join("\n");
+  } catch { /* malformed sections JSON → fall through to raw findings */ }
+  if (!sectionsHtml && draft.rawFindings?.trim()) {
+    sectionsHtml = `<div class="section-heading">${esc(fmtServerHeading("Findings", headingCase))}</div><p>${esc(draft.rawFindings).replaceAll("\n", "<br/>")}</p>`;
+  }
+  let impressionList = "";
+  const impressionStyle = parseImpressionStyle(req.query.impressionStyle);
+  const impressionBullets = parseImpressionBullets(draft.impression);
+  if (impressionBullets.length > 0) {
+    impressionList = renderImpressionSectionHtml(impressionBullets, impressionStyle, esc, headingCase);
+  }
+
+  // Disc-level canal AP table. One builder shared with the signed report’s body
+  // (lib/spinalCanalApTable.ts), so the draft the radiologist approves and the
+  // document the patient receives cannot print different measurements. Both of the
+  // study’s ids are passed, billed first, because one examination legitimately has two.
+  //
+  // The draft's own canonical record is the authority and `spinal_measurements` is the
+  // per-level fallback: the Reporting Workspace grid writes the record, and until this
+  // call passed it, every number typed into that grid printed only as prose produced by
+  // "Generate Professional Report" — the bordered table came from the other store, which
+  // the grid never writes (audit 2026-10-17 §6).
+  const spinalTableHtml = await buildSpinalCanalApTableHtml(
+    [worklist?.studyId ?? null, draft.studyId ?? null],
+    extractCareCanalApProvenance(draft.structuredJson),
+  );
+
+  const bodyHtml = [
+    draft.clinicalHistory?.trim() ? `<div class="section-heading">Clinical History</div><p>${esc(draft.clinicalHistory)}</p>` : "",
+    techniqueHtml,
+    sectionsHtml,
+    spinalTableHtml,
+    impressionList,
+    draft.recommendation?.trim()
+      ? `<div class="section-heading">Recommendation</div><p>${esc(collapseSpacedOutLetters(draft.recommendation))}</p>`
+      : "",
+  ].filter(Boolean).join("\n");
+
+  let keyImages: ReportKeyImageModel[] = [];
+  let frozenIntegrityBanner = "";
+  try {
+    const resolved = await resolveDraftPrintKeyImagesDetailed(id);
+    keyImages = resolved.images;
+    if (resolved.source === "frozen" && !resolved.integrityOk) {
+      frozenIntegrityBanner = frozenIntegrityBannerHtml(resolved.unavailableFrozenCount);
+    }
+  } catch {
+    keyImages = [];
+  }
+
+  const likeFinal = req.query.likeFinal === "true";
+
+    const ids = reconcileAccessionVsReferringDoctor({
+      accessionNumber: worklist?.accessionNumber ?? "",
+      referringDoctor: worklist?.referringDoctor ?? "",
+    });
+
+    let doctorsMaster: Array<{ name: string; degree: string | null }> = [];
+    try {
+      doctorsMaster = await db
+        .select({ name: doctorsTable.name, degree: doctorsTable.degree })
+        .from(doctorsTable);
+    } catch { doctorsMaster = []; }
+    const referringWithDegree = enrichReferringDoctorWithDegree(ids.referringDoctor, doctorsMaster);
+
+    // A draft has not been authorized by anyone, so it prints no signer at all. This
+    // route used to look up the clinic's active signature block (matching one person's
+    // name first) and print it under the label "Signed:", complete with the uploaded
+    // hand-signature — and when no block was active it printed a hard-coded name. Either
+    // way an unsigned document implied authorization. The name, designation and
+    // signature image belong to `patient_reports.signatureId` and appear only once a
+    // radiologist has signed; the DRAFT stamp and watermark above carry the truth.
+    //
+    // This also retires #1085's preview selector: choosing WHICH configured block a
+    // draft should wear is no longer a question the page asks, so `printSigner()` had
+    // nothing left to answer and the module is removed with it.
+    const previewSignatures: ReportDocumentModel["signatures"] = [];
+
+    const model: ReportDocumentModel = {
+    reportNumber: likeFinal ? `PREVIEW-${draft.id}` : `DRAFT-${draft.id}`,
+    studyTitle,
+    typeLabel: "RADIOLOGY",
+    statusLabel: likeFinal ? "PREVIEW" : (draft.status ?? "DRAFT").toUpperCase(),
+    clinic: {
+      name: clinic?.name ?? "Care Diagnostics",
+      tagline: clinic?.tagline ?? "Diagnostic & Pathology Services",
+      address: clinic?.address ?? "",
+      phone: clinic?.phone ?? "",
+      email: clinic?.email ?? "",
+      website: clinic?.website ?? "",
+      logoDataUrl: clinic?.logoDataUrl ?? null,
+    },
+    patientRows: [
+      { key: "patientName", label: "Patient", value: worklist?.patientName ?? "" },
+      {
+        key: "ageSex",
+        label: "Age / Sex",
+        // `formatMasterAge` already ends on the worklist's own age text; the
+        // second term only covers a worklist row with no patient link at all,
+        // and routes through the same plausibility refusal so an implausible
+        // raw value cannot slip back onto the page.
+        value: [patientAgeDisplay || formatDocumentedStudyAge(worklist?.age) || "", worklist?.sex].filter(Boolean).join(" / "),
+      },
+      { key: "uhid", label: "UHID", value: patientUhid ?? "" },
+      { key: "studyDate", label: "Study Date", value: formatReportDateShort(worklist?.studyDate ?? null) || formattedStudyDate },
+      { key: "referringDoctor", label: "Referring Doctor", value: referringWithDegree },
+      { key: "accessionNumber", label: "Accession No.", value: ids.accessionNumber },
+      { key: "testName", label: "Test", value: catalogTestName ?? worklist?.studyDescription ?? draft.studyName ?? "" },
+      { key: "modality", label: "Modality", value: draft.modality ?? worklist?.modality ?? "" },
+    ],
+    bodyHtml,
+    keyImages,
+    reportingScopeNote,
+    safeguardBannerHtml: frozenIntegrityBanner || undefined,
+    stamp: likeFinal
+      ? { kind: "pending", label: "PREVIEW — NOT SIGNED" }
+      : { kind: "draft", label: "DRAFT (not signed)" },
+    signatures: previewSignatures,
+    signerUnsigned: true,
+    showQrPlaceholder: false,
+    footerNote: clinic?.footerNote ?? "",
+    generatedAtLabel: new Date().toLocaleString("en-IN"),
+    draftWatermark: !likeFinal,
+    autoPrint: req.query.autoPrint === "true",
+  };
+
+  // R1.2 — drafts follow the LATEST ACTIVE version (no freeze until signed);
+  // ?template=key[@version] previews any template against the draft.
+  const baseTemplate = await resolveTemplateForRender({
+    explicit: typeof req.query.template === "string" ? req.query.template : null,
+    copyType: "standard",
+  });
+
+  // Apply the same institutional Style settings the finalized print path uses
+  // (logo/signature/DICOM placement, fonts, heading underline, line gaps).
+  let instStyle: typeof radiologyInstitutionalStylesTable.$inferSelect | null = null;
+  try {
+    const [style] = await db.select().from(radiologyInstitutionalStylesTable).limit(1);
+    if (style) instStyle = style;
+  } catch {
+    instStyle = null;
+  }
+  const template = applyInstitutionalTemplateOverrides(baseTemplate, instStyle);
+
+  // When the radiologist has disabled the letterpad header (for printing on
+  // pre-printed letterheads), suppress the CARE logo + address chrome.
+  try {
+    const userId = (req as unknown as { staffSession?: { subjectId?: string | number } }).staffSession?.subjectId;
+    if (userId) {
+      const [prefs] = await db.select({ showLetterpadHeader: radiologyReportPreferencesTable.showLetterpadHeader })
+        .from(radiologyReportPreferencesTable)
+        .where(eq(radiologyReportPreferencesTable.userId, Number(userId)))
+        .limit(1);
+      if (prefs && !prefs.showLetterpadHeader) {
+        template.headerCfg = {
+          show: false,
+          showLogo: false,
+          showTagline: template.headerCfg?.showTagline ?? false,
+          showContact: template.headerCfg?.showContact ?? false,
+          style: template.headerCfg?.style ?? "banded",
+          logoPosition: template.headerCfg?.logoPosition,
+        };
+      }
+    }
+  } catch { /* non-fatal: header shows as normal */ }
+
+  // pacs letterhead scale + Style chrome apply to clinic-branded templates.
+  // CARE letter-pad (Classic/Premium) reads logo/address from the template.
+  let customCss = "";
+  try {
+    const scaleRows = await db.select({ key: pacsSettingsTable.key, value: pacsSettingsTable.value })
+      .from(pacsSettingsTable)
+      .where(and(
+        inArray(pacsSettingsTable.key, [REPORT_HEADER_SCALE_KEY, REPORT_LOGO_SCALE_KEY, REPORT_FOOTER_SCALE_KEY]),
+        eq(pacsSettingsTable.category, "report"),
+      ));
+    const scaleVal = (k: string) => scaleRows.find((row) => row.key === k)?.value;
+    customCss += buildReportSurfaceCss(template, instStyle, {
+      headerScale: scaleVal(REPORT_HEADER_SCALE_KEY),
+      logoScale: scaleVal(REPORT_LOGO_SCALE_KEY),
+      footerScale: scaleVal(REPORT_FOOTER_SCALE_KEY),
+    }, parseReportFormatNudge(req.query));
+  } catch {
+    customCss += buildReportSurfaceCss(template, instStyle, undefined, parseReportFormatNudge(req.query));
+  }
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(renderReportDocument(model, template, { customCss }));
+});
+
+// POST /key-images — multipart upload (VIEWPORT_CAPTURE | UPLOAD | …)
+radiologyReportGeneratorRouter.post(
+  "/key-images",
+  upload.single("image"),
+  async (req: StaffAuthRequest, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: "Image file is required" });
+      return;
+    }
+
+    let absPath = req.file.path;
+    let thumbAbs: string | null = null;
+    const cleanupOrphans = async () => {
+      await unlinkKeyImageArtifacts(absPath, thumbAbs);
+    };
+
+    const draftId = req.body.draftId ? Number(req.body.draftId) : null;
+    if (!draftId || !Number.isFinite(draftId)) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: "draftId is required" });
+      return;
+    }
+
+    if (await keyImagesLocked(draftId)) {
+      await cleanupOrphans();
+      res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+      return;
+    }
+
+    try {
+      await assertDraftWritable({
+        draftId,
+        studyId: req.body.studyId ? Number(req.body.studyId) : null,
+        patientId: req.body.patientId ? Number(req.body.patientId) : null,
+      });
+    } catch (err) {
+      await cleanupOrphans();
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+
+    if (!isSafeKeyImageFilename(req.file.filename)) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: "Invalid filename" });
+      return;
+    }
+
+    const dimCheck = await validateStoredImage(absPath);
+    if (!dimCheck.ok) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: dimCheck.error });
+      return;
+    }
+
+    const studyUid = req.body.studyInstanceUID || req.body.studyInstanceUid || null;
+    const seriesUid = req.body.seriesInstanceUID || req.body.seriesInstanceUid || null;
+    const sopUid = req.body.sopInstanceUID || req.body.sopInstanceUid || null;
+    for (const [label, uid] of [
+      ["studyInstanceUID", studyUid],
+      ["seriesInstanceUID", seriesUid],
+      ["sopInstanceUID", sopUid],
+    ] as const) {
+      if (!isReasonableDicomUid(uid)) {
+        await cleanupOrphans();
+        res.status(400).json({ success: false, error: `Invalid ${label}` });
+        return;
+      }
+    }
+
+    // D2-I1: a capture that names a study at all must name THIS study, even when it
+    // names no series and no SOP. An empty claim stays legal — the file-upload form
+    // sends no DICOM UID, and that is an image with no identity rather than a wrong
+    // one — so only a claim that disagrees is refused.
+    if (studyUid) {
+      try {
+        await assertImageUidBelongsToDraft(draftId, String(studyUid));
+      } catch (err) {
+        await cleanupOrphans();
+        if (err instanceof RadiologyIdentityError) {
+          res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+          return;
+        }
+        throw err;
+      }
+    }
+
+    // D2 — the format check above only proves the string looks like a UID. A
+    // captured image also has to be the image the viewer says it is, or it is
+    // not stored as an identity at all. See lib/imageIdentity.ts.
+    const captureClaimsImage = Boolean(seriesUid && sopUid);
+    let captureIdentity: VerifiedIdentity | null = null;
+    let captureIdentityWarning: { code: string; message: string } | null = null;
+    if (captureClaimsImage) {
+      let verdict: IdentityVerdict;
+      try {
+        verdict = await verifyImageIdentityClaim({
+          draftId,
+          claim: {
+            studyInstanceUID: studyUid,
+            seriesInstanceUID: seriesUid,
+            sopInstanceUID: sopUid,
+            frameNumber: req.body.frameNumber ? Number(req.body.frameNumber) : null,
+          },
+        });
+      } catch (err) {
+        await cleanupOrphans();
+        if (err instanceof RadiologyIdentityError) {
+          res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+          return;
+        }
+        throw err;
+      }
+      if (verdict.status === "contradicted") {
+        await cleanupOrphans();
+        res.status(409).json({ success: false, error: verdict.message, code: verdict.code });
+        return;
+      }
+      if (verdict.status === "verified") captureIdentity = verdict.identity;
+      else captureIdentityWarning = { code: verdict.code, message: verdict.message };
+    }
+
+    const snap = parseViewportSnapshotJson(req.body.viewportSnapshotJson);
+    if (!snap.ok) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: snap.error });
+      return;
+    }
+    const ann = parseAnnotationMetadataJson(req.body.annotationMetadataJson);
+    if (!ann.ok) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: ann.error });
+      return;
+    }
+    const captured = parseCapturedAt(req.body.capturedAt);
+    if (!captured.ok) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: captured.error });
+      return;
+    }
+    const viewerParsed = parseViewer(req.body.viewer);
+    if (!viewerParsed.ok) {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: viewerParsed.error });
+      return;
+    }
+
+    const observationId = typeof req.body.observationId === "string" && req.body.observationId.trim()
+      ? req.body.observationId.trim().slice(0, 120)
+      : null;
+    try {
+      await assertObservationBelongsToDraft(draftId, observationId);
+    } catch (err) {
+      await cleanupOrphans();
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+
+    // Normalize to bounded print JPEG (autorotate + max edge) before persist.
+    let normalized;
+    try {
+      normalized = await normalizeKeyImageForPrint(absPath);
+      absPath = normalized.absPath;
+    } catch {
+      await cleanupOrphans();
+      res.status(400).json({ success: false, error: "Could not normalize image for storage" });
+      return;
+    }
+
+    const sourceTypeRaw = String(req.body.sourceType || "UPLOAD").trim().toUpperCase();
+    const sourceType = ["VIEWPORT_CAPTURE", "DICOM", "UPLOAD", "PACS_SCREENSHOT"].includes(sourceTypeRaw)
+      ? sourceTypeRaw
+      : "UPLOAD";
+
+    const studyId = req.body.studyId ? Number(req.body.studyId) : null;
+    const patientId = req.body.patientId ? Number(req.body.patientId) : null;
+
+    let sortOrder = req.body.sortOrder ? Number(req.body.sortOrder) : NaN;
+    if (!Number.isFinite(sortOrder)) {
+      const existing = await db
+        .select({ sortOrder: radiologyReportKeyImagesTable.sortOrder })
+        .from(radiologyReportKeyImagesTable)
+        .where(eq(radiologyReportKeyImagesTable.draftId, draftId));
+      sortOrder = existing.reduce((m, r) => Math.max(m, r.sortOrder ?? 0), -1) + 1;
+    }
+
+    const imageUrl = `/uploads/radiology-key-images/${normalized.filename}`;
+    let thumbnailUrl = imageUrl;
+    const thumb = await makeKeyImageThumbnail(absPath);
+    if (thumb) {
+      thumbnailUrl = thumb;
+      thumbAbs = path.join(KEY_IMAGE_DIR, path.basename(thumb));
+    }
+
+    const frameNumber = req.body.frameNumber ? Number(req.body.frameNumber) : null;
+    const instanceNumber = req.body.instanceNumber ? Number(req.body.instanceNumber) : null;
+    const includeInReport = req.body.includeInReport === "false" || req.body.includeInReport === false
+      ? false
+      : true;
+    const captionManual = req.body.captionManual === "true" || req.body.captionManual === true;
+
+    try {
+      const [row] = await db
+        .insert(radiologyReportKeyImagesTable)
+        .values({
+          draftId,
+          studyId: Number.isFinite(studyId as number) ? studyId : null,
+          patientId: Number.isFinite(patientId as number) ? patientId : null,
+          accessionNumber: req.body.accessionNumber ? String(req.body.accessionNumber).slice(0, 64) : null,
+          imageUrl,
+          thumbnailUrl,
+          caption: String(req.body.caption ?? "").trim().slice(0, 500),
+          captionManual,
+          sortOrder,
+          includeInReport,
+          sourceType,
+          observationId,
+          studyInstanceUid: captureClaimsImage
+            ? captureIdentity?.studyInstanceUID ?? null
+            : (studyUid ? String(studyUid).slice(0, 128) : null),
+          seriesInstanceUid: captureClaimsImage
+            ? captureIdentity?.seriesInstanceUID ?? null
+            : (seriesUid ? String(seriesUid).slice(0, 128) : null),
+          sopInstanceUid: captureClaimsImage
+            ? captureIdentity?.sopInstanceUID ?? null
+            : (sopUid ? String(sopUid).slice(0, 128) : null),
+          frameNumber: captureClaimsImage
+            ? captureIdentity?.frameNumber ?? null
+            : (Number.isFinite(frameNumber as number) && (frameNumber as number) >= 1 ? Math.floor(frameNumber as number) : null),
+          instanceNumber: Number.isFinite(instanceNumber as number) ? Math.floor(instanceNumber as number) : null,
+          seriesDescription: req.body.seriesDescription ? String(req.body.seriesDescription).slice(0, 200) : null,
+          modality: parseModality(req.body.modality),
+          viewer: viewerParsed.viewer,
+          viewportSnapshotJson: snap.json || null,
+          annotationMetadataJson: ann.json,
+          capturedAt: captured.date,
+          createdBy: req.staffSession?.subjectName ?? null,
+        })
+        .returning();
+
+      res.status(201).json({
+        success: true,
+        item: row,
+        ...(captureIdentityWarning
+          ? { warningCode: captureIdentityWarning.code, warning: captureIdentityWarning.message }
+          : {}),
+      });
+    } catch (err) {
+      await cleanupOrphans();
+      throw err;
+    }
+  },
+);
+
+// GET /key-images?draftId=&studyId=
+radiologyReportGeneratorRouter.get("/key-images", async (req: StaffAuthRequest, res: Response) => {
+  const draftId = req.query.draftId ? Number(req.query.draftId) : null;
+  const studyId = req.query.studyId ? Number(req.query.studyId) : null;
+  if (!draftId && !studyId) {
+    res.status(400).json({ success: false, error: "draftId or studyId required" });
+    return;
+  }
+
+  if (draftId) {
+    try {
+      await assertDraftExists(draftId);
+    } catch (err) {
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  const conditions = [];
+  if (draftId) conditions.push(eq(radiologyReportKeyImagesTable.draftId, draftId));
+  if (studyId) conditions.push(eq(radiologyReportKeyImagesTable.studyId, studyId));
+
+  const rows = await db
+    .select()
+    .from(radiologyReportKeyImagesTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(asc(radiologyReportKeyImagesTable.sortOrder), asc(radiologyReportKeyImagesTable.id));
+
+  // When both filters supplied, require the row to match both (no cross-draft leak by studyId alone).
+  res.json({ success: true, items: rows });
+});
+
+/**
+ * Mint a per-file grant onto one stored key-image URL.
+ *
+ * Returns the URL untouched when it is not a file under the guarded prefix (an
+ * Orthanc/DICOMweb rendered URL, a data: URI, a legacy absolute path) or when
+ * the stored name is not a safe single file name — in those cases there is
+ * nothing to grant, and inventing a token would either 404 in the client or,
+ * worse, look like protection that does not exist.
+ */
+function signKeyImageUrl(url: string | null): { url: string | null; expiresAt: Date | null } {
+  if (!url || typeof url !== "string") return { url: url ?? null, expiresAt: null };
+  if (!url.startsWith(FROZEN_KEY_IMAGE_URL_PREFIX)) return { url, expiresAt: null };
+  const file = url.slice(FROZEN_KEY_IMAGE_URL_PREFIX.length).split("?")[0] ?? "";
+  if (!isSafeKeyImageFilename(file)) return { url, expiresAt: null };
+  const grant = mintKeyImageGrant(file);
+  return {
+    url: `${FROZEN_KEY_IMAGE_URL_PREFIX}${file}?${KEY_IMAGE_GRANT_QUERY_PARAM}=${grant.token}`,
+    expiresAt: grant.expiresAt,
+  };
+}
+
+/**
+ * POST /key-images/access-urls  { ids: number[] }
+ * → { success, expiresAt, items: [{ id, imageUrl, thumbnailUrl }] }
+ *
+ * `radiologyKeyImageStatic.ts` guards the stored pixels, and `<img>` cannot send
+ * a Bearer header, so the workspace asks for these URLs and puts them in the
+ * `src`. Each one carries a grant that is bound to a single file name and
+ * expires in minutes; the staff session itself never appears in an image URL.
+ * Authorization is this route's existing mount — `requireStaffAuth` plus
+ * `requireStaffPermission("/radiology")` — so a mint is a permitted, logged-in,
+ * per-image decision, not a capability the client can fabricate.
+ *
+ * URLs that are not stored key-image files (an Orthanc/DICOMweb rendered URL,
+ * a data: URI) are returned unchanged: this guard covers the upload directory
+ * only, and silently dropping an image the client still needs would break the
+ * rail for those studies.
+ */
+const KeyImageAccessBody = z.object({
+  ids: z.array(z.number().int().positive()).min(1).max(100),
+});
+
+radiologyReportGeneratorRouter.post(
+  "/key-images/access-urls",
+  async (req: StaffAuthRequest, res: Response) => {
+    const parsed = KeyImageAccessBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ success: false, error: "ids required (1-100 positive integers)" });
+      return;
+    }
+    const ids = [...new Set(parsed.data.ids)];
+
+    const rows = await db
+      .select({
+        id: radiologyReportKeyImagesTable.id,
+        imageUrl: radiologyReportKeyImagesTable.imageUrl,
+        thumbnailUrl: radiologyReportKeyImagesTable.thumbnailUrl,
+      })
+      .from(radiologyReportKeyImagesTable)
+      .where(inArray(radiologyReportKeyImagesTable.id, ids));
+
+    let expiresAt: Date | null = null;
+    let items: Array<{ id: number; imageUrl: string | null; thumbnailUrl: string | null }>;
+    try {
+      items = rows.map((row) => {
+        const image = signKeyImageUrl(row.imageUrl);
+        const thumb = row.thumbnailUrl ? signKeyImageUrl(row.thumbnailUrl) : null;
+        for (const grant of [image, thumb]) {
+          if (grant?.expiresAt && (!expiresAt || grant.expiresAt < expiresAt)) {
+            expiresAt = grant.expiresAt;
+          }
+        }
+        return {
+          id: row.id,
+          imageUrl: image.url,
+          thumbnailUrl: thumb?.url ?? null,
+        };
+      });
+    } catch {
+      // No signing secret configured (`SESSION_SECRET` / `JWT_SECRET` are unset).
+      // Fail closed: hand out nothing rather than a URL the guard cannot verify.
+      res.status(503).json({
+        success: false,
+        error: "key_image_grant_unavailable",
+        message:
+          "CARE could not sign an image link right now, so no image was released. The report text and the study are unaffected — please retry, and ask the admin to check the server's SESSION_SECRET if this persists.",
+      });
+      return;
+    }
+
+    if (items.length === 0) {
+      res.status(404).json({ success: false, error: "no_key_image_rows" });
+      return;
+    }
+    res.json({ success: true, expiresAt, items });
+  },
+);
+
+// PUT /key-images/:id
+const UpdateKeyImageBody = z.object({
+  caption: z.string().trim().max(500).optional(),
+  captionManual: z.boolean().optional(),
+  includeInReport: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+  observationId: z.string().max(120).nullable().optional(),
+});
+
+radiologyReportGeneratorRouter.put("/key-images/:id", async (req: StaffAuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ success: false, error: "Invalid id" }); return; }
+
+  const parsed = UpdateKeyImageBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "Invalid request" });
+    return;
+  }
+
+  const [existing] = await db
+    .select()
+    .from(radiologyReportKeyImagesTable)
+    .where(eq(radiologyReportKeyImagesTable.id, id))
+    .limit(1);
+  if (!existing) { res.status(404).json({ success: false, error: "Image not found" }); return; }
+  if (!existing.draftId) {
+    res.status(409).json({ success: false, error: "Key image has no draft ownership" });
+    return;
+  }
+  if (await keyImagesLocked(existing.draftId)) {
+    res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+    return;
+  }
+  try {
+    await assertDraftWritable({ draftId: existing.draftId });
+    if (parsed.data.observationId !== undefined) {
+      await assertObservationBelongsToDraft(existing.draftId, parsed.data.observationId);
+    }
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+
+  const patch: Record<string, unknown> = { ...parsed.data };
+  if (parsed.data.caption !== undefined && parsed.data.captionManual === undefined) {
+    patch.captionManual = true;
+  }
+
+  const [updated] = await db
+    .update(radiologyReportKeyImagesTable)
+    .set(patch)
+    .where(and(
+      eq(radiologyReportKeyImagesTable.id, id),
+      eq(radiologyReportKeyImagesTable.draftId, existing.draftId),
+    ))
+    .returning();
+
+  if (!updated) { res.status(404).json({ success: false, error: "Image not found" }); return; }
+  res.json({ success: true, item: updated });
+});
+
+// POST /key-images/reorder
+radiologyReportGeneratorRouter.post("/key-images/reorder", async (req: StaffAuthRequest, res: Response) => {
+  const schema = z.object({
+    draftId: z.number().int(),
+    orderedIds: z.array(z.number().int()).max(100),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "Invalid body" });
+    return;
+  }
+  try {
+    await assertDraftWritable({ draftId: parsed.data.draftId });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+  if (await keyImagesLocked(parsed.data.draftId)) {
+    res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+    return;
+  }
+  const draftRows = await db
+    .select({ id: radiologyReportKeyImagesTable.id })
+    .from(radiologyReportKeyImagesTable)
+    .where(eq(radiologyReportKeyImagesTable.draftId, parsed.data.draftId));
+  const owned = new Set(draftRows.map((r) => r.id));
+  const foreign = parsed.data.orderedIds.filter((oid) => !owned.has(oid));
+  if (foreign.length > 0) {
+    res.status(400).json({ success: false, error: "orderedIds must reference this draft's images only" });
+    return;
+  }
+  await db.transaction(async (tx) => {
+    for (let i = 0; i < parsed.data.orderedIds.length; i++) {
+      await tx
+        .update(radiologyReportKeyImagesTable)
+        .set({ sortOrder: i })
+        .where(
+          and(
+            eq(radiologyReportKeyImagesTable.id, parsed.data.orderedIds[i]),
+            eq(radiologyReportKeyImagesTable.draftId, parsed.data.draftId),
+          ),
+        );
+    }
+  });
+  res.json({ success: true });
+});
+
+// POST /key-images/detach-observation — observation delete: unlink, do not destroy files
+radiologyReportGeneratorRouter.post("/key-images/detach-observation", async (req: StaffAuthRequest, res: Response) => {
+  const schema = z.object({
+    draftId: z.number().int(),
+    observationId: z.string().min(1).max(120),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: "Invalid body" });
+    return;
+  }
+  try {
+    await assertDraftWritable({ draftId: parsed.data.draftId });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+  if (await keyImagesLocked(parsed.data.draftId)) {
+    res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+    return;
+  }
+  const count = await detachKeyImagesFromObservation(parsed.data);
+  res.json({ success: true, detached: count });
+});
+
+// DELETE /key-images/:id
+radiologyReportGeneratorRouter.delete("/key-images/:id", async (req: StaffAuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ success: false, error: "Invalid id" }); return; }
+
+  const [existing] = await db
+    .select()
+    .from(radiologyReportKeyImagesTable)
+    .where(eq(radiologyReportKeyImagesTable.id, id))
+    .limit(1);
+  if (!existing) { res.status(404).json({ success: false, error: "Image not found" }); return; }
+  if (!existing.draftId) {
+    res.status(409).json({ success: false, error: "Key image has no draft ownership" });
+    return;
+  }
+  if (await keyImagesLocked(existing.draftId)) {
+    res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+    return;
+  }
+  try {
+    await assertDraftWritable({ draftId: existing.draftId });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+
+  const [deleted] = await db
+    .delete(radiologyReportKeyImagesTable)
+    .where(and(
+      eq(radiologyReportKeyImagesTable.id, id),
+      eq(radiologyReportKeyImagesTable.draftId, existing.draftId),
+    ))
+    .returning();
+
+  if (!deleted) { res.status(404).json({ success: false, error: "Image not found" }); return; }
+
+  for (const url of [deleted.imageUrl, deleted.thumbnailUrl]) {
+    if (!url) continue;
+    if (url === deleted.imageUrl && deleted.thumbnailUrl === deleted.imageUrl) {
+      // same file referenced twice — delete once below
+    }
+    const filename = path.basename(url);
+    if (!isSafeKeyImageFilename(filename)) continue;
+    // Only delete files under our controlled key-image dir (never shared/legacy paths).
+    if (!url.startsWith("/uploads/radiology-key-images/")) continue;
+    void fs.unlink(path.join(KEY_IMAGE_DIR, filename)).catch(() => undefined);
+  }
+
+  res.json({ success: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// TEXT MACROS
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /macros — list macros for the authenticated user plus globals
+radiologyReportGeneratorRouter.get("/macros", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const modality = String(req.query.modality || "").trim() || undefined;
+  const query = db
+    .select()
+    .from(radiologyTextMacrosTable)
+    .where(
+      or(
+        eq(radiologyTextMacrosTable.createdBy, userName),
+        eq(radiologyTextMacrosTable.isGlobal, true),
+      ),
+    )
+    .orderBy(asc(radiologyTextMacrosTable.sortOrder), desc(radiologyTextMacrosTable.createdAt));
+  const rows = await query;
+  const filtered = modality
+    ? rows.filter((r) => !r.modality || r.modality === modality)
+    : rows;
+  res.json(filtered);
+});
+
+const CreateMacroSchema = z.object({
+  shortcut: z.string().min(1).max(50),
+  expansion: z.string().min(1).max(5000),
+  modality: z.string().max(20).optional(),
+  isGlobal: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+// POST /macros — create a new macro
+radiologyReportGeneratorRouter.post("/macros", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = CreateMacroSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const isGlobal = req.staffSession?.role === "super_admin" ? (data.isGlobal ?? false) : false;
+  const [row] = await db.insert(radiologyTextMacrosTable).values({
+    createdBy: userName,
+    shortcut: data.shortcut,
+    expansion: data.expansion,
+    modality: data.modality || null,
+    isGlobal,
+    sortOrder: data.sortOrder ?? 0,
+  }).returning();
+  res.status(201).json(row);
+});
+
+const UpdateMacroSchema = z.object({
+  shortcut: z.string().min(1).max(50).optional(),
+  expansion: z.string().min(1).max(5000).optional(),
+  modality: z.string().max(20).optional().nullable(),
+  isGlobal: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+// PUT /macros/:id — update a macro (owner or super-admin only)
+radiologyReportGeneratorRouter.put("/macros/:id", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  const role = req.staffSession?.role;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [existing] = await db.select().from(radiologyTextMacrosTable).where(eq(radiologyTextMacrosTable.id, id));
+  if (!existing) { res.status(404).json({ error: "Not found" }); return; }
+  const canEdit = existing.createdBy === userName || role === "super_admin";
+  if (!canEdit) { res.status(403).json({ error: "Forbidden" }); return; }
+  const parsed = UpdateMacroSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const update: Record<string, unknown> = {};
+  if (parsed.data.shortcut !== undefined) update.shortcut = parsed.data.shortcut;
+  if (parsed.data.expansion !== undefined) update.expansion = parsed.data.expansion;
+  if (parsed.data.modality !== undefined) update.modality = parsed.data.modality;
+  if (parsed.data.isGlobal !== undefined && role === "super_admin") update.isGlobal = parsed.data.isGlobal;
+  if (parsed.data.sortOrder !== undefined) update.sortOrder = parsed.data.sortOrder;
+  const [row] = await db.update(radiologyTextMacrosTable).set(update).where(eq(radiologyTextMacrosTable.id, id)).returning();
+  res.json(row);
+});
+
+// DELETE /macros/:id — delete a macro (owner or super-admin only)
+radiologyReportGeneratorRouter.delete("/macros/:id", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  const role = req.staffSession?.role;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [existing] = await db.select().from(radiologyTextMacrosTable).where(eq(radiologyTextMacrosTable.id, id));
+  if (!existing) { res.status(404).json({ error: "Not found" }); return; }
+  const canDelete = existing.createdBy === userName || role === "super_admin";
+  if (!canDelete) { res.status(403).json({ error: "Forbidden" }); return; }
+  await db.delete(radiologyTextMacrosTable).where(eq(radiologyTextMacrosTable.id, id));
+  res.json({ success: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// REPORT PREFERENCES
+// ════════════════════════════════════════════════════════════════════════════
+
+const PreferencesSchema = z.object({
+  headingCase: z.enum(["all_caps", "title_case"]),
+  sectionSpacing: z.enum(["spaced", "compact"]),
+  impressionStyle: z.enum(["bulleted", "numbered", "plain"]),
+  showEndOfReportFooter: z.boolean(),
+  // The workspace clears an optional line by sending null, and the handler below
+  // stores `data.footerText || null`; `optional()` alone would reject that body
+  // and the preferences would never persist.
+  footerText: z.string().max(500).nullable().optional(),
+  headerLine1: z.string().max(200).nullable().optional(),
+  headerLine2Source: z.enum(["template_name", "custom"]),
+  headerLine2Custom: z.string().max(200).nullable().optional(),
+  workspaceLayout: z.enum(["3_panel", "preview_first", "workflow"]),
+  printMode: z.enum(["letterhead", "plain_paper"]).default("letterhead"),
+  showLetterpadHeader: z.boolean().default(true),
+});
+
+// GET /preferences — fetch preferences for the authenticated user
+radiologyReportGeneratorRouter.get("/preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const rows = await db.select().from(radiologyReportPreferencesTable).where(eq(radiologyReportPreferencesTable.userId, Number(userId)));
+  if (rows.length === 0) {
+    // Return defaults without creating a row yet
+    res.json({
+      headingCase: "all_caps",
+      sectionSpacing: "spaced",
+      impressionStyle: "bulleted",
+      showEndOfReportFooter: true,
+      footerText: null,
+      headerLine1: null,
+      headerLine2Source: "template_name",
+      headerLine2Custom: null,
+      workspaceLayout: "3_panel",
+      printMode: "letterhead",
+      showLetterpadHeader: true,
+    });
+    return;
+  }
+  res.json(rows[0]);
+});
+
+// PUT /preferences — create or update preferences
+radiologyReportGeneratorRouter.put("/preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = PreferencesSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const existing = await db.select().from(radiologyReportPreferencesTable).where(eq(radiologyReportPreferencesTable.userId, Number(userId)));
+  if (existing.length === 0) {
+    const [row] = await db.insert(radiologyReportPreferencesTable).values({
+      userId: Number(userId),
+      headingCase: data.headingCase,
+      sectionSpacing: data.sectionSpacing,
+      impressionStyle: data.impressionStyle,
+      showEndOfReportFooter: data.showEndOfReportFooter,
+      footerText: data.footerText || null,
+      headerLine1: data.headerLine1 || null,
+      headerLine2Source: data.headerLine2Source,
+      headerLine2Custom: data.headerLine2Custom || null,
+      workspaceLayout: data.workspaceLayout,
+      printMode: data.printMode,
+      showLetterpadHeader: data.showLetterpadHeader,
+    }).returning();
+    res.status(201).json(row);
+    return;
+  }
+  const [row] = await db.update(radiologyReportPreferencesTable)
+    .set({
+      headingCase: data.headingCase,
+      sectionSpacing: data.sectionSpacing,
+      impressionStyle: data.impressionStyle,
+      showEndOfReportFooter: data.showEndOfReportFooter,
+      footerText: data.footerText || null,
+      headerLine1: data.headerLine1 || null,
+      headerLine2Source: data.headerLine2Source,
+      headerLine2Custom: data.headerLine2Custom || null,
+      workspaceLayout: data.workspaceLayout,
+      printMode: data.printMode,
+      showLetterpadHeader: data.showLetterpadHeader,
+    })
+    .where(eq(radiologyReportPreferencesTable.userId, Number(userId)))
+    .returning();
+  res.json(row);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// NORMAL SNIPPETS — one-click shortcuts for common normal reports
+// ════════════════════════════════════════════════════════════════════════════
+
+radiologyReportGeneratorRouter.get("/normal-snippets", async (req: StaffAuthRequest, res: Response) => {
+  const modality = String(req.query.modality || "").trim() || undefined;
+  const bodyPart = String(req.query.bodyPart || "").trim() || undefined;
+  const query = db.select().from(radiologyNormalSnippetsTable).where(eq(radiologyNormalSnippetsTable.isGlobal, true)).orderBy(asc(radiologyNormalSnippetsTable.sortOrder));
+  const rows = await query;
+  const filtered = rows.filter((r) => {
+    if (modality && r.modality && r.modality !== modality) return false;
+    if (bodyPart && r.bodyPart && r.bodyPart !== bodyPart) return false;
+    return true;
+  });
+  res.json(filtered);
+});
+
+const NormalSnippetSchema = z.object({
+  shortcut: z.string().min(1).max(50),
+  label: z.string().min(1).max(100),
+  modality: z.string().max(20).optional(),
+  bodyPart: z.string().max(30).optional(),
+  text: z.string().min(1).max(5000),
+  impression: z.string().max(2000).optional(),
+  recommendation: z.string().max(2000).optional(),
+  isGlobal: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+radiologyReportGeneratorRouter.post("/normal-snippets", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  const role = req.staffSession?.role;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = NormalSnippetSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const isGlobal = role === "super_admin" ? (data.isGlobal ?? false) : false;
+  const [row] = await db.insert(radiologyNormalSnippetsTable).values({
+    shortcut: data.shortcut,
+    label: data.label,
+    modality: data.modality || null,
+    bodyPart: data.bodyPart || null,
+    text: data.text,
+    impression: data.impression || null,
+    recommendation: data.recommendation || null,
+    isGlobal,
+    createdBy: userName,
+    sortOrder: data.sortOrder ?? 0,
+  }).returning();
+  res.status(201).json(row);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// IMAGE REFERENCES — key image pointers for reports
+// ════════════════════════════════════════════════════════════════════════════
+
+radiologyReportGeneratorRouter.get("/image-references", async (req: Request, res: Response) => {
+  const draftId = req.query.draftId ? Number(req.query.draftId) : null;
+  const studyId = req.query.studyId ? Number(req.query.studyId) : null;
+  if (!draftId && !studyId) { res.status(400).json({ error: "draftId or studyId required" }); return; }
+  const conds = [];
+  if (draftId) conds.push(eq(radiologyImageReferencesTable.draftId, draftId));
+  if (studyId) conds.push(eq(radiologyImageReferencesTable.studyId, studyId));
+  const rows = await db.select().from(radiologyImageReferencesTable).where(conds.length ? and(...conds) : undefined)
+    .orderBy(asc(radiologyImageReferencesTable.displayOrder), asc(radiologyImageReferencesTable.createdAt));
+  res.json(rows);
+});
+
+// R1.1 — image references persist the DICOM identifier triple + frame +
+// display order (StudyInstanceUID / SeriesInstanceUID / SOPInstanceUID /
+// FrameNumber / caption / order). NEVER pixel data or browser blob URLs;
+// pixels resolve server-side at render time (lib/reportImages.ts).
+const UID = /^[0-9.]{1,128}$/;
+// R1.3 — a report supports up to 100 selected images (rendering adapts).
+const MAX_REFS_PER_DRAFT = 100;
+const ImageRefSchema = z.object({
+  draftId: z.number().int(),
+  studyId: z.number().int().optional(),
+  seriesNumber: z.string().max(20).optional(),
+  imageNumber: z.string().max(20).optional(),
+  description: z.string().min(1).max(500),
+  studyInstanceUid: z.string().regex(UID).optional(),
+  seriesInstanceUid: z.string().regex(UID).optional(),
+  sopInstanceUid: z.string().regex(UID).optional(),
+  frameNumber: z.number().int().min(1).max(10_000).optional(),
+  displayOrder: z.number().int().min(0).max(1_000).optional(),
+  isKeyImage: z.boolean().optional(),
+});
+
+/** R1.3 — the partial unique index (draft, SOP, frame) raised a duplicate. */
+function isUniqueViolation(err: unknown): boolean {
+  const e = err as { code?: string; cause?: { code?: string } } | null;
+  return e?.code === "23505" || e?.cause?.code === "23505";
+}
+
+/** R1.3 — image mutations are DRAFT-time presentation edits. Once the draft
+ *  has been promoted to a final report, the delivered document's image set
+ *  is part of what was signed: reject further mutation (the workspace panel
+ *  is already read-only at that point; this closes the API path too). */
+async function imageRefsLocked(draftId: number): Promise<boolean> {
+  return draftImageRefsLocked(draftId);
+}
+const LOCKED_MSG = "Report finalized — its images can no longer be modified";
+
+radiologyReportGeneratorRouter.post("/image-references", async (req: StaffAuthRequest, res: Response) => {
+  const parsed = ImageRefSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  if (await imageRefsLocked(parsed.data.draftId)) { res.status(409).json({ error: LOCKED_MSG }); return; }
+  try {
+    await assertImageUidBelongsToDraft(parsed.data.draftId, parsed.data.studyInstanceUid);
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+
+  // D2 — a reference that claims a specific image is only as good as the PACS's
+  // answer about it. A complete claim (study + series + SOP) is verified before
+  // any of it is stored; a contradicted claim is refused; a claim CARE could not
+  // check is stored with no DICOM identity at all rather than as an unverified
+  // one. A study-level note (no series/SOP) is not an image anchor and keeps its
+  // existing meaning.
+  const claimsImage = Boolean(parsed.data.seriesInstanceUid && parsed.data.sopInstanceUid);
+  let verifiedIdentity: VerifiedIdentity | null = null;
+  let identityWarning: { code: string; message: string } | null = null;
+  if (claimsImage) {
+    const verdict = await verifyImageIdentityClaim({
+      draftId: parsed.data.draftId,
+      claim: {
+        studyInstanceUID: parsed.data.studyInstanceUid,
+        seriesInstanceUID: parsed.data.seriesInstanceUid,
+        sopInstanceUID: parsed.data.sopInstanceUid,
+        frameNumber: parsed.data.frameNumber,
+      },
+    });
+    if (verdict.status === "contradicted") {
+      res.status(409).json({ error: verdict.message, code: verdict.code });
+      return;
+    }
+    if (verdict.status === "verified") verifiedIdentity = verdict.identity;
+    else identityWarning = { code: verdict.code, message: verdict.message };
+  }
+
+  try {
+    // Cap check + duplicate pre-check + insert run atomically under the same
+    // per-draft advisory lock the reorder route takes, so concurrent POSTs
+    // can neither exceed the cap nor race past the duplicate check — even on
+    // a legacy DB where the partial unique index could not be built (pre-R1.3
+    // duplicates on finalized drafts). The index, where present, is a second
+    // backstop (unique violation → 409 below).
+    const row = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"imgreorder:" + parsed.data.draftId}))`);
+      const existing = await tx.select({
+        id: radiologyImageReferencesTable.id,
+        sopInstanceUid: radiologyImageReferencesTable.sopInstanceUid,
+        frameNumber: radiologyImageReferencesTable.frameNumber,
+      })
+        .from(radiologyImageReferencesTable)
+        .where(eq(radiologyImageReferencesTable.draftId, parsed.data.draftId));
+      if (existing.length >= MAX_REFS_PER_DRAFT) return { error: 400 as const };
+      const storedStudy = verifiedIdentity?.studyInstanceUID ?? parsed.data.studyInstanceUid ?? null;
+      const storedSeries = verifiedIdentity?.seriesInstanceUID ?? (claimsImage ? null : parsed.data.seriesInstanceUid ?? null);
+      const storedSop = verifiedIdentity?.sopInstanceUID ?? (claimsImage ? null : parsed.data.sopInstanceUid ?? null);
+      const storedFrame = verifiedIdentity
+        ? verifiedIdentity.frameNumber
+        : (claimsImage ? null : parsed.data.frameNumber ?? null);
+      const wantSop = storedSop;
+      const wantFrame = storedFrame;
+      if (wantSop && existing.some((r) => r.sopInstanceUid === wantSop && (r.frameNumber ?? null) === wantFrame)) {
+        return { error: 409 as const };
+      }
+      const [inserted] = await tx.insert(radiologyImageReferencesTable).values({
+        draftId: parsed.data.draftId,
+        studyId: parsed.data.studyId ?? null,
+        seriesNumber: parsed.data.seriesNumber ?? null,
+        imageNumber: parsed.data.imageNumber ?? null,
+        description: parsed.data.description,
+        studyInstanceUid: storedStudy,
+        seriesInstanceUid: storedSeries,
+        sopInstanceUid: storedSop,
+        frameNumber: storedFrame,
+        displayOrder: parsed.data.displayOrder ?? 0,
+        isKeyImage: parsed.data.isKeyImage ?? false,
+        createdBy: req.staffSession?.subjectName ?? null,
+      }).returning();
+      return { inserted };
+    });
+    if ("error" in row) {
+      if (row.error === 400) res.status(400).json({ error: `Maximum ${MAX_REFS_PER_DRAFT} images per report` });
+      else res.status(409).json({ error: "This image is already attached to the report" });
+      return;
+    }
+    res.status(201).json(identityWarning ? { ...row.inserted, warningCode: identityWarning.code, warning: identityWarning.message } : row.inserted);
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      res.status(409).json({ error: "This image is already attached to the report" });
+      return;
+    }
+    throw err;
+  }
+});
+
+// R1.1 — caption/order edits for a persisted reference (presentation only).
+// R1.3 adds the key-image flag. Never touches clinical text and never
+// regenerates the report — the reference row is presentation state only.
+const ImageRefPatchSchema = z.object({
+  description: z.string().min(1).max(500).optional(),
+  displayOrder: z.number().int().min(0).max(1_000).optional(),
+  isKeyImage: z.boolean().optional(),
+  framing: z.object({
+    zoom: z.number(),
+    offsetX: z.number(),
+    offsetY: z.number(),
+    fitMode: z.enum(["contain", "cover"]),
+  }).optional(),
+});
+
+radiologyReportGeneratorRouter.patch("/image-references/:id", async (req: StaffAuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const parsed = ImageRefPatchSchema.safeParse(req.body);
+  if (!parsed.success || (
+    parsed.data.description === undefined
+    && parsed.data.displayOrder === undefined
+    && parsed.data.isKeyImage === undefined
+    && parsed.data.framing === undefined
+  )) {
+    res.status(400).json({ error: "description, displayOrder, isKeyImage or framing required" });
+    return;
+  }
+  const [target] = await db.select({ draftId: radiologyImageReferencesTable.draftId })
+    .from(radiologyImageReferencesTable).where(eq(radiologyImageReferencesTable.id, id)).limit(1);
+  if (!target) { res.status(404).json({ error: "Not found" }); return; }
+  if (await imageRefsLocked(target.draftId)) { res.status(409).json({ error: LOCKED_MSG }); return; }
+  const [row] = await db.update(radiologyImageReferencesTable)
+    .set({
+      ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
+      ...(parsed.data.displayOrder !== undefined ? { displayOrder: parsed.data.displayOrder } : {}),
+      ...(parsed.data.isKeyImage !== undefined ? { isKeyImage: parsed.data.isKeyImage } : {}),
+      ...(parsed.data.framing !== undefined ? { presentationJson: serializeImageFraming(parseImageFraming(parsed.data.framing)) } : {}),
+    })
+    .where(eq(radiologyImageReferencesTable.id, id))
+    .returning();
+  if (!row) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(row);
+});
+
+// R1.3 — atomic drag-reorder: the client sends the draft's reference ids in
+// the desired order; each gets displayOrder = its index. Ids that belong to
+// the draft but are missing from the list (concurrent add) keep their
+// relative order after the reordered ones. Ids that do NOT belong to the
+// draft are rejected — a reorder can never move another report's images.
+const ImageRefReorderSchema = z.object({
+  draftId: z.number().int(),
+  orderedIds: z.array(z.number().int().positive()).min(1).max(MAX_REFS_PER_DRAFT),
+});
+
+radiologyReportGeneratorRouter.post("/image-references/reorder", async (req: StaffAuthRequest, res: Response) => {
+  const parsed = ImageRefReorderSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const { draftId, orderedIds } = parsed.data;
+  if (new Set(orderedIds).size !== orderedIds.length) {
+    res.status(400).json({ error: "orderedIds contains duplicates" });
+    return;
+  }
+  const rows = await db.select({ id: radiologyImageReferencesTable.id })
+    .from(radiologyImageReferencesTable)
+    .where(eq(radiologyImageReferencesTable.draftId, draftId))
+    .orderBy(asc(radiologyImageReferencesTable.displayOrder), asc(radiologyImageReferencesTable.createdAt));
+  const draftIdSet = new Set(rows.map((r) => r.id));
+  const foreign = orderedIds.filter((id) => !draftIdSet.has(id));
+  if (foreign.length > 0) {
+    res.status(400).json({ error: "orderedIds must reference this draft's images only" });
+    return;
+  }
+  if (await imageRefsLocked(draftId)) { res.status(409).json({ error: LOCKED_MSG }); return; }
+  const mentioned = new Set(orderedIds);
+  const finalOrder = [...orderedIds, ...rows.map((r) => r.id).filter((id) => !mentioned.has(id))];
+  await db.transaction(async (tx) => {
+    // Serialize concurrent reorders of the same draft — the per-row UPDATEs
+    // follow the client-supplied order, so without this two interleaved
+    // reorders could deadlock or produce a mixed ordering.
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"imgreorder:" + draftId}))`);
+    for (let i = 0; i < finalOrder.length; i++) {
+      await tx.update(radiologyImageReferencesTable)
+        .set({ displayOrder: i })
+        .where(and(
+          eq(radiologyImageReferencesTable.id, finalOrder[i]),
+          eq(radiologyImageReferencesTable.draftId, draftId),
+        ));
+    }
+  });
+  const fresh = await db.select().from(radiologyImageReferencesTable)
+    .where(eq(radiologyImageReferencesTable.draftId, draftId))
+    .orderBy(asc(radiologyImageReferencesTable.displayOrder), asc(radiologyImageReferencesTable.createdAt));
+  res.json(fresh);
+});
+
+radiologyReportGeneratorRouter.delete("/image-references/:id", async (req: StaffAuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [target] = await db.select({ draftId: radiologyImageReferencesTable.draftId })
+    .from(radiologyImageReferencesTable).where(eq(radiologyImageReferencesTable.id, id)).limit(1);
+  if (target && await imageRefsLocked(target.draftId)) { res.status(409).json({ error: LOCKED_MSG }); return; }
+  await db.delete(radiologyImageReferencesTable).where(eq(radiologyImageReferencesTable.id, id));
+  res.json({ success: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SELECT IMAGES FROM PACS — attach an Orthanc image to a report, no viewer
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The picker browses Orthanc's own DICOMweb (series → instances → frames) and
+// then asks CARE for the pixels. CARE fetches Orthanc's server-rendered JPEG
+// from the server, with Orthanc's own credentials, and FREEZES it into
+// radiology_report_key_images — the table print/PDF already treats as the
+// authoritative image set. So one click produces one row in the store the
+// delivered document is built from, the printed report keeps its pictures
+// even if Orthanc goes away, and no second image database exists.
+//
+// Identity is verified the same way as every other durable DICOM claim (D2,
+// lib/imageIdentity.ts) before a byte is stored, so an image of another
+// patient's study cannot be attached to this report.
+
+const PacsStillSchema = z.object({
+  draftId: z.number().int().positive(),
+  studyId: z.number().int().positive().optional(),
+  patientId: z.number().int().positive().optional(),
+  accessionNumber: z.string().max(64).optional(),
+  studyInstanceUid: z.string().regex(UID),
+  seriesInstanceUid: z.string().regex(UID),
+  sopInstanceUid: z.string().regex(UID),
+  frameNumber: z.number().int().min(1).max(10_000).optional().nullable(),
+  instanceNumber: z.number().int().min(0).max(999_999).optional().nullable(),
+  seriesDescription: z.string().max(200).optional(),
+  modality: z.string().max(16).optional(),
+  caption: z.string().trim().max(500).optional(),
+  sortOrder: z.number().int().min(0).max(10_000).optional(),
+});
+
+radiologyReportGeneratorRouter.post(
+  "/key-images/from-pacs",
+  async (req: StaffAuthRequest, res: Response) => {
+    const parsed = PacsStillSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, error: "Invalid body" });
+      return;
+    }
+    const claim = parsed.data;
+
+    if (await keyImagesLocked(claim.draftId)) {
+      res.status(409).json({ success: false, error: KEY_IMAGE_LOCKED_MSG });
+      return;
+    }
+
+    // The draft the image lands in must be writable by the study/patient the
+    // caller names — the same cross-patient guard the viewport capture uses.
+    try {
+      await assertDraftWritable({
+        draftId: claim.draftId,
+        studyId: claim.studyId ?? null,
+        patientId: claim.patientId ?? null,
+      });
+    } catch (err) {
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+
+    let identity: VerifiedIdentity | null = null;
+    let identityWarning: { code: string; message: string } | null = null;
+    try {
+      await assertImageUidBelongsToDraft(claim.draftId, claim.studyInstanceUid);
+      const verdict = await verifyImageIdentityClaim({
+        draftId: claim.draftId,
+        claim: {
+          studyInstanceUID: claim.studyInstanceUid,
+          seriesInstanceUID: claim.seriesInstanceUid,
+          sopInstanceUID: claim.sopInstanceUid,
+          frameNumber: claim.frameNumber ?? null,
+        },
+      });
+      if (verdict.status === "contradicted") {
+        res.status(409).json({ success: false, error: verdict.message, code: verdict.code });
+        return;
+      }
+      if (verdict.status === "verified") identity = verdict.identity;
+      else identityWarning = { code: verdict.code, message: verdict.message };
+    } catch (err) {
+      if (err instanceof RadiologyIdentityError) {
+        res.status(err.httpStatus).json({ success: false, error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+
+    // Pixels come from Orthanc at print quality, named by the verified identity
+    // (not by whatever the browser claimed) when verification succeeded.
+    const rendered = await fetchPrintImageBytes({
+      studyInstanceUid: identity?.studyInstanceUID ?? claim.studyInstanceUid,
+      seriesInstanceUid: identity?.seriesInstanceUID ?? claim.seriesInstanceUid,
+      sopInstanceUid: identity?.sopInstanceUID ?? claim.sopInstanceUid,
+      frameNumber: identity ? identity.frameNumber : claim.frameNumber ?? null,
+    });
+    if (!rendered) {
+      res.status(502).json({
+        success: false,
+        error: "PACS could not render this image. Confirm the study is still in Orthanc.",
+      });
+      return;
+    }
+
+    const stem = randomUUID();
+    let absPath = path.join(KEY_IMAGE_DIR, `${stem}.jpg`);
+    let thumbAbs: string | null = null;
+    const cleanupOrphans = async () => {
+      await unlinkKeyImageArtifacts(absPath, thumbAbs);
+    };
+
+    try {
+      await fs.mkdir(KEY_IMAGE_DIR, { recursive: true });
+      await fs.writeFile(absPath, rendered.bytes);
+      const normalized = await normalizeKeyImageForPrint(absPath);
+      absPath = normalized.absPath;
+
+      const existing = await db
+        .select({
+          sopInstanceUid: radiologyReportKeyImagesTable.sopInstanceUid,
+          frameNumber: radiologyReportKeyImagesTable.frameNumber,
+          sortOrder: radiologyReportKeyImagesTable.sortOrder,
+        })
+        .from(radiologyReportKeyImagesTable)
+        .where(eq(radiologyReportKeyImagesTable.draftId, claim.draftId));
+      const sameImage = existing.some(
+        (r) =>
+          r.sopInstanceUid === (identity?.sopInstanceUID ?? claim.sopInstanceUid)
+          && (r.frameNumber ?? null) === (identity ? identity.frameNumber : claim.frameNumber ?? null),
+      );
+      if (sameImage) {
+        await cleanupOrphans();
+        res.status(409).json({ success: false, error: "This image is already attached to the report" });
+        return;
+      }
+
+      const imageUrl = `${FROZEN_KEY_IMAGE_URL_PREFIX}${normalized.filename}`;
+      let thumbnailUrl = imageUrl;
+      const thumb = await makeKeyImageThumbnail(absPath);
+      if (thumb) {
+        thumbnailUrl = thumb;
+        thumbAbs = path.join(KEY_IMAGE_DIR, path.basename(thumb));
+      }
+
+      // A caption is the radiologist's words or nothing. The series description
+      // and instance number are stored in their own columns and stay available to
+      // the rail and the print layout; inventing a caption from them made every
+      // attachment print a label nobody wrote.
+      const caption = (claim.caption?.trim() ?? "").slice(0, 500);
+
+      const [row] = await db
+        .insert(radiologyReportKeyImagesTable)
+        .values({
+          draftId: claim.draftId,
+          studyId: claim.studyId ?? null,
+          patientId: claim.patientId ?? null,
+          accessionNumber: claim.accessionNumber?.slice(0, 64) ?? null,
+          imageUrl,
+          thumbnailUrl,
+          caption,
+          captionManual: caption.length > 0,
+          sortOrder: claim.sortOrder ?? existing.reduce((m, r) => Math.max(m, r.sortOrder ?? 0), -1) + 1,
+          includeInReport: true,
+          sourceType: "DICOM",
+          studyInstanceUid: identity?.studyInstanceUID ?? null,
+          seriesInstanceUid: identity?.seriesInstanceUID ?? null,
+          sopInstanceUid: identity?.sopInstanceUID ?? null,
+          frameNumber: identity ? identity.frameNumber : null,
+          instanceNumber: claim.instanceNumber ?? null,
+          seriesDescription: claim.seriesDescription?.slice(0, 200) ?? null,
+          modality: parseModality(claim.modality),
+          viewer: "ORTHANC",
+          capturedAt: new Date(),
+          createdBy: req.staffSession?.subjectName ?? null,
+        })
+        .returning();
+
+      res.status(201).json({
+        success: true,
+        item: row,
+        ...(identityWarning ? { warningCode: identityWarning.code, warning: identityWarning.message } : {}),
+      });
+    } catch (err) {
+      await cleanupOrphans();
+      throw err;
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// RADIOLOGIST STYLE PREFERENCES — AI impression style settings
+// ════════════════════════════════════════════════════════════════════════════
+const StylePreferencesSchema = z.object({
+  impressionStyle: z.enum(["concise", "detailed", "academic", "diagnostic"]),
+  terminologyLevel: z.enum(["simple", "standard", "advanced"]),
+  autoNumberImpressions: z.boolean(),
+  includeDifferential: z.boolean(),
+  includeMeasurements: z.boolean(),
+});
+
+radiologyReportGeneratorRouter.get("/style-preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const rows = await db.select().from(radiologistStylePreferencesTable).where(eq(radiologistStylePreferencesTable.userId, Number(userId)));
+  if (rows.length === 0) {
+    res.json({ impressionStyle: "concise", terminologyLevel: "standard", autoNumberImpressions: true, includeDifferential: false, includeMeasurements: false });
+    return;
+  }
+  res.json(rows[0]);
+});
+
+radiologyReportGeneratorRouter.put("/style-preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = StylePreferencesSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const existing = await db.select().from(radiologistStylePreferencesTable).where(eq(radiologistStylePreferencesTable.userId, Number(userId)));
+  if (existing.length === 0) {
+    const [row] = await db.insert(radiologistStylePreferencesTable).values({
+      userId: Number(userId),
+      ...data,
+    }).returning();
+    res.status(201).json(row);
+    return;
+  }
+  const [row] = await db.update(radiologistStylePreferencesTable).set(data).where(eq(radiologistStylePreferencesTable.userId, Number(userId))).returning();
+  res.json(row);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// RADIOLOGIST VOICE PREFERENCES — M1.6B3 per-user voice-layer overrides.
+// Self-scoped (same pattern as style-preferences above; registered in the
+// personal-endpoint cache guard + sw.js network-only list). Values may only
+// tighten clinic policy or pick personal ergonomics — the merge rules live in
+// the frontend's mergeVoiceSettings and are enforced there by construction
+// (enabled can only be turned OFF, confirmation only raised to strict).
+// ════════════════════════════════════════════════════════════════════════════
+
+const VoicePreferencesSchema = z.object({
+  enabledOverride: z.enum(["inherit", "off"]),
+  pttKey: z.enum(["inherit", "Space", "off"]),
+  defaultMode: z.enum(["inherit", "command", "dictation"]),
+  confirmationPolicy: z.enum(["inherit", "strict"]),
+  language: z.string().max(20),
+  autoPunctuation: z.enum(["inherit", "on", "off"]),
+  inputDevice: z.string().max(200),
+});
+
+const VOICE_PREF_DEFAULTS = {
+  enabledOverride: "inherit", pttKey: "inherit", defaultMode: "inherit",
+  confirmationPolicy: "inherit", language: "", autoPunctuation: "inherit", inputDevice: "",
+} as const;
+
+radiologyReportGeneratorRouter.get("/voice-preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const rows = await db.select().from(radiologistVoicePreferencesTable).where(eq(radiologistVoicePreferencesTable.userId, Number(userId)));
+  res.json(rows.length === 0 ? VOICE_PREF_DEFAULTS : rows[0]);
+});
+
+radiologyReportGeneratorRouter.put("/voice-preferences", async (req: StaffAuthRequest, res: Response) => {
+  const userId = req.staffSession?.subjectId;
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = VoicePreferencesSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const existing = await db.select().from(radiologistVoicePreferencesTable).where(eq(radiologistVoicePreferencesTable.userId, Number(userId)));
+  if (existing.length === 0) {
+    const [row] = await db.insert(radiologistVoicePreferencesTable).values({ userId: Number(userId), ...data }).returning();
+    res.status(201).json(row);
+    return;
+  }
+  const [row] = await db.update(radiologistVoicePreferencesTable).set(data).where(eq(radiologistVoicePreferencesTable.userId, Number(userId))).returning();
+  res.json(row);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// REPORT LIFECYCLE LOG — audit trail for report edits/amendments/reprints
+// ════════════════════════════════════════════════════════════════════════════
+
+radiologyReportGeneratorRouter.get("/lifecycle-log", async (req: Request, res: Response) => {
+  const studyId = req.query.studyId ? Number(req.query.studyId) : null;
+  const draftId = req.query.draftId ? Number(req.query.draftId) : null;
+  if (!studyId && !draftId) { res.status(400).json({ error: "studyId or draftId required" }); return; }
+  const conds = [];
+  if (studyId) conds.push(eq(radiologyReportLifecycleLogTable.studyId, studyId));
+  if (draftId) conds.push(eq(radiologyReportLifecycleLogTable.draftId, draftId));
+  const rows = await db.select().from(radiologyReportLifecycleLogTable).where(conds.length ? and(...conds) : undefined).orderBy(desc(radiologyReportLifecycleLogTable.createdAt));
+  res.json(rows);
+});
+
+radiologyReportGeneratorRouter.post("/log-action", async (req: StaffAuthRequest, res: Response) => {
+  const parsed = z.object({
+    studyId: z.number().int(),
+    draftId: z.number().int().optional(),
+    action: z.string().min(1),
+    oldValue: z.string().optional(),
+    newValue: z.string().optional(),
+    details: z.string().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const [row] = await db.insert(radiologyReportLifecycleLogTable).values({
+    studyId: data.studyId,
+    draftId: data.draftId ?? null,
+    action: data.action,
+    actorId: req.staffSession?.subjectId ? Number(req.staffSession.subjectId) : null,
+    actorName: req.staffSession?.subjectName || "unknown",
+    oldValue: data.oldValue ?? null,
+    newValue: data.newValue ?? null,
+    details: data.details ?? null,
+  }).returning();
+  res.status(201).json(row);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// SPINAL MEASUREMENTS — per-vertebral-level canal/cord tracking for MRI spine
+// ══════════════════════════════════════════════════════════════════════════════════
+
+radiologyReportGeneratorRouter.get("/spinal-measurements", async (req: StaffAuthRequest, res: Response) => {
+  const studyId = req.query.studyId ? Number(req.query.studyId) : null;
+  const draftId = req.query.draftId ? Number(req.query.draftId) : null;
+  if (!studyId && !draftId) { res.status(400).json({ error: "studyId or draftId required" }); return; }
+  const conds = [];
+  if (studyId) conds.push(eq(spinalMeasurementsTable.studyId, studyId));
+  if (draftId) conds.push(eq(spinalMeasurementsTable.draftId, draftId));
+  const rows = await db.select().from(spinalMeasurementsTable).where(conds.length ? and(...conds) : undefined).orderBy(asc(spinalMeasurementsTable.vertebraLevel));
+  res.json(rows);
+});
+
+const SpinalMeasurementSchema = z.object({
+  studyId: z.number().int(),
+  draftId: z.number().int().optional(),
+  patientId: z.number().int().optional(),
+  worklistId: z.number().int().optional(),
+  vertebraLevel: z.string().min(1).max(12),
+  canalAP: z.string().max(20).optional(),
+  canalTransverse: z.string().max(20).optional(),
+  canalArea: z.string().max(20).optional(),
+  cordAP: z.string().max(20).optional(),
+  cordTransverse: z.string().max(20).optional(),
+  cordArea: z.string().max(20).optional(),
+  discHeight: z.string().max(20).optional(),
+  stenosisGrade: z.enum(["none", "mild", "moderate", "severe"]).optional(),
+  stenosisNotes: z.string().max(500).optional(),
+  leftForaminal: z.enum(["normal", "mild", "moderate", "severe"]).optional(),
+  rightForaminal: z.enum(["normal", "mild", "moderate", "severe"]).optional(),
+  alignment: z.enum(["normal", "kyphosis", "lordosis", "scoliosis", "listhesis"]).optional(),
+  alignmentNotes: z.string().max(500).optional(),
+});
+
+// POST /spinal-measurements — create or replace (upsert per vertebraLevel + studyId)
+radiologyReportGeneratorRouter.post("/spinal-measurements", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = SpinalMeasurementSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body", issues: parsed.error.issues }); return; }
+  const d = parsed.data;
+
+  // Harden: refuse canal mutation when draft/worklist is finalized or locked by another.
+  if (d.worklistId != null && req.staffSession) {
+    const gate = await checkWriteLock(d.worklistId, req.staffSession.subjectId);
+    if (gate.blocked) {
+      res.status(409).json({
+        error: "LOCKED_BY_OTHER",
+        lockedBy: gate.lockedBy,
+        message: `This study is currently being reported by ${gate.lockedBy}. Canal measurements were not saved.`,
+      });
+      return;
+    }
+  }
+  try {
+    await assertDraftWritable({
+      draftId: d.draftId ?? null,
+      worklistId: d.worklistId ?? null,
+      studyId: d.studyId,
+      patientId: d.patientId ?? null,
+    });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+
+  // Check existing for this study + level
+  const existing = await db.select({ id: spinalMeasurementsTable.id }).from(spinalMeasurementsTable).where(
+    and(eq(spinalMeasurementsTable.studyId, d.studyId), eq(spinalMeasurementsTable.vertebraLevel, d.vertebraLevel))
+  );
+  if (existing.length > 0) {
+    const [row] = await db.update(spinalMeasurementsTable).set({
+      draftId: d.draftId ?? null,
+      patientId: d.patientId ?? null,
+      worklistId: d.worklistId ?? null,
+      canalAP: d.canalAP ?? null,
+      canalTransverse: d.canalTransverse ?? null,
+      canalArea: d.canalArea ?? null,
+      cordAP: d.cordAP ?? null,
+      cordTransverse: d.cordTransverse ?? null,
+      cordArea: d.cordArea ?? null,
+      discHeight: d.discHeight ?? null,
+      stenosisGrade: d.stenosisGrade ?? "none",
+      stenosisNotes: d.stenosisNotes ?? null,
+      leftForaminal: d.leftForaminal ?? "normal",
+      rightForaminal: d.rightForaminal ?? "normal",
+      alignment: d.alignment ?? "normal",
+      alignmentNotes: d.alignmentNotes ?? null,
+      measuredBy: userName,
+      measuredAt: new Date(),
+    }).where(eq(spinalMeasurementsTable.id, existing[0].id)).returning();
+    res.json(row);
+    return;
+  }
+  const [row] = await db.insert(spinalMeasurementsTable).values({
+    studyId: d.studyId,
+    draftId: d.draftId ?? null,
+    patientId: d.patientId ?? null,
+    worklistId: d.worklistId ?? null,
+    vertebraLevel: d.vertebraLevel,
+    canalAP: d.canalAP ?? null,
+    canalTransverse: d.canalTransverse ?? null,
+    canalArea: d.canalArea ?? null,
+    cordAP: d.cordAP ?? null,
+    cordTransverse: d.cordTransverse ?? null,
+    cordArea: d.cordArea ?? null,
+    discHeight: d.discHeight ?? null,
+    stenosisGrade: d.stenosisGrade ?? "none",
+    stenosisNotes: d.stenosisNotes ?? null,
+    leftForaminal: d.leftForaminal ?? "normal",
+    rightForaminal: d.rightForaminal ?? "normal",
+    alignment: d.alignment ?? "normal",
+    alignmentNotes: d.alignmentNotes ?? null,
+    measuredBy: userName,
+    measuredAt: new Date(),
+  }).returning();
+  res.status(201).json(row);
+});
+
+radiologyReportGeneratorRouter.delete("/spinal-measurements/:id", async (req: StaffAuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const [existing] = await db
+    .select({
+      id: spinalMeasurementsTable.id,
+      draftId: spinalMeasurementsTable.draftId,
+      worklistId: spinalMeasurementsTable.worklistId,
+      studyId: spinalMeasurementsTable.studyId,
+      patientId: spinalMeasurementsTable.patientId,
+    })
+    .from(spinalMeasurementsTable)
+    .where(eq(spinalMeasurementsTable.id, id))
+    .limit(1);
+  if (!existing) { res.status(404).json({ error: "Not found" }); return; }
+  if (existing.worklistId != null && req.staffSession) {
+    const gate = await checkWriteLock(existing.worklistId, req.staffSession.subjectId);
+    if (gate.blocked) {
+      res.status(409).json({ error: "LOCKED_BY_OTHER", lockedBy: gate.lockedBy });
+      return;
+    }
+  }
+  try {
+    await assertDraftWritable({
+      draftId: existing.draftId ?? null,
+      worklistId: existing.worklistId ?? null,
+      studyId: existing.studyId,
+      patientId: existing.patientId ?? null,
+    });
+  } catch (err) {
+    if (err instanceof RadiologyIdentityError) {
+      res.status(err.httpStatus).json({ error: err.message, code: err.code });
+      return;
+    }
+    throw err;
+  }
+  await db.delete(spinalMeasurementsTable).where(eq(spinalMeasurementsTable.id, id));
+  res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// SMART MACROS — measurement-aware text expansions
+// ══════════════════════════════════════════════════════════════════════════════════
+
+radiologyReportGeneratorRouter.get("/smart-macros", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const modality = String(req.query.modality || "").trim() || undefined;
+  const bodyPart = String(req.query.bodyPart || "").trim() || undefined;
+  const query = db
+    .select()
+    .from(radiologySmartMacrosTable)
+    .where(
+      or(
+        eq(radiologySmartMacrosTable.createdBy, userName),
+        eq(radiologySmartMacrosTable.isGlobal, true),
+      ),
+    )
+    .orderBy(asc(radiologySmartMacrosTable.sortOrder), desc(radiologySmartMacrosTable.createdAt));
+  const rows = await query;
+  const filtered = rows.filter((r) => {
+    if (modality && r.modality && r.modality !== modality) return false;
+    if (bodyPart && r.bodyPart && r.bodyPart !== bodyPart) return false;
+    return true;
+  });
+  res.json(filtered);
+});
+
+const SmartMacroSchema = z.object({
+  shortcut: z.string().min(1).max(50),
+  expansion: z.string().min(1).max(5000),
+  modality: z.string().max(20).optional(),
+  bodyPart: z.string().max(30).optional(),
+  isMeasurementMacro: z.boolean().optional(),
+  measurementParams: z.string().max(2000).optional(),
+  autoSuggestOn: z.boolean().optional(),
+  isGlobal: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+radiologyReportGeneratorRouter.post("/smart-macros", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const parsed = SmartMacroSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const data = parsed.data;
+  const isGlobal = req.staffSession?.role === "super_admin" ? (data.isGlobal ?? false) : false;
+  const [row] = await db.insert(radiologySmartMacrosTable).values({
+    createdBy: userName,
+    shortcut: data.shortcut,
+    expansion: data.expansion,
+    modality: data.modality || null,
+    bodyPart: data.bodyPart || null,
+    isMeasurementMacro: data.isMeasurementMacro ?? false,
+    measurementParams: data.measurementParams || null,
+    autoSuggestOn: data.autoSuggestOn ?? false,
+    isGlobal,
+    sortOrder: data.sortOrder ?? 0,
+  }).returning();
+  res.status(201).json(row);
+});
+
+const UpdateSmartMacroSchema = z.object({
+  shortcut: z.string().min(1).max(50).optional(),
+  expansion: z.string().min(1).max(5000).optional(),
+  modality: z.string().max(20).optional().nullable(),
+  bodyPart: z.string().max(30).optional().nullable(),
+  isMeasurementMacro: z.boolean().optional(),
+  measurementParams: z.string().max(2000).optional().nullable(),
+  autoSuggestOn: z.boolean().optional(),
+  isGlobal: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+radiologyReportGeneratorRouter.put("/smart-macros/:id", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  const role = req.staffSession?.role;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [existing] = await db.select().from(radiologySmartMacrosTable).where(eq(radiologySmartMacrosTable.id, id));
+  if (!existing) { res.status(404).json({ error: "Not found" }); return; }
+  const canEdit = existing.createdBy === userName || role === "super_admin";
+  if (!canEdit) { res.status(403).json({ error: "Forbidden" }); return; }
+  const parsed = UpdateSmartMacroSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid body" }); return; }
+  const update: Record<string, unknown> = {};
+  if (parsed.data.shortcut !== undefined) update.shortcut = parsed.data.shortcut;
+  if (parsed.data.expansion !== undefined) update.expansion = parsed.data.expansion;
+  if (parsed.data.modality !== undefined) update.modality = parsed.data.modality;
+  if (parsed.data.bodyPart !== undefined) update.bodyPart = parsed.data.bodyPart;
+  if (parsed.data.isMeasurementMacro !== undefined) update.isMeasurementMacro = parsed.data.isMeasurementMacro;
+  if (parsed.data.measurementParams !== undefined) update.measurementParams = parsed.data.measurementParams;
+  if (parsed.data.autoSuggestOn !== undefined) update.autoSuggestOn = parsed.data.autoSuggestOn;
+  if (parsed.data.isGlobal !== undefined && role === "super_admin") update.isGlobal = parsed.data.isGlobal;
+  if (parsed.data.sortOrder !== undefined) update.sortOrder = parsed.data.sortOrder;
+  const [row] = await db.update(radiologySmartMacrosTable).set(update).where(eq(radiologySmartMacrosTable.id, id)).returning();
+  res.json(row);
+});
+
+radiologyReportGeneratorRouter.delete("/smart-macros/:id", async (req: StaffAuthRequest, res: Response) => {
+  const userName = req.staffSession?.subjectName;
+  const role = req.staffSession?.role;
+  if (!userName) { res.status(401).json({ error: "Unauthorized" }); return; }
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [existing] = await db.select().from(radiologySmartMacrosTable).where(eq(radiologySmartMacrosTable.id, id));
+  if (!existing) { res.status(404).json({ error: "Not found" }); return; }
+  const canDelete = existing.createdBy === userName || role === "super_admin";
+  if (!canDelete) { res.status(403).json({ error: "Forbidden" }); return; }
+  await db.delete(radiologySmartMacrosTable).where(eq(radiologySmartMacrosTable.id, id));
+  res.json({ success: true });
+});

@@ -1,0 +1,181 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
+import { execSync } from "node:child_process";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+
+// Defaults below allow this app to run outside Replit (e.g. on Windows)
+// without manually setting environment variables. Replit's runtime always
+// injects PORT/BASE_PATH via the artifact.toml so those values win.
+const rawPort = process.env.PORT ?? "5173";
+
+/** The port CARE_DEV_ISOLATED mode pins the dev server to, ignoring PORT. */
+const DEV_ERP_DEFAULT_PORT = 5173;
+
+const port = Number(rawPort);
+
+if (Number.isNaN(port) || port <= 0) {
+  throw new Error(`Invalid PORT value: "${rawPort}"`);
+}
+
+const basePath = process.env.BASE_PATH ?? "/";
+
+/**
+ * CARE_DEV_ISOLATED — the same flag the API reads (authoritative implementation:
+ * artifacts/api-server/src/lib/devIsolation.ts, which this config cannot import
+ * because it belongs to another package). Two things change here:
+ *
+ *  - the proxy target becomes the isolated API on 127.0.0.1:8181, because 8080 on
+ *    this Windows machine belongs to the separate emergency ERP and must never be
+ *    proxied to by a development CARE instance;
+ *  - the dev server port stops following PORT. Both children of
+ *    `scripts/dev-erp-local.mjs` inherit the same environment, and root `.env` sets
+ *    `PORT=8080` for the API — without this, Vite would try to bind 8080, collide
+ *    with the emergency ERP, and Vite's port fallback would then silently serve the
+ *    CARE UI on some other port entirely.
+ *
+ * Hot reload is unaffected: this is still `vite dev`, no Docker image is rebuilt.
+ */
+const isolatedDev = /^(1|true|yes|on)$/i.test(String(process.env.CARE_DEV_ISOLATED ?? "").trim());
+const apiProxyTarget = isolatedDev ? "http://127.0.0.1:8181" : "http://localhost:8080";
+const devServerPort = isolatedDev
+  ? Number(process.env.CARE_DEV_ERP_PORT ?? DEV_ERP_DEFAULT_PORT)
+  : port;
+
+/**
+ * Bake a short Git SHA into the SPA. Prefer stamped env (Docker/compose
+ * GIT_COMMIT / CARE_GIT_SHA / VITE_GIT_COMMIT); fall back to local git;
+ * never fail the production build when .git is unavailable.
+ */
+function resolveViteGitCommit(): string {
+  const fromEnv = (
+    process.env.GIT_COMMIT ||
+    process.env.CARE_GIT_SHA ||
+    process.env.VITE_GIT_COMMIT ||
+    ""
+  )
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  if (fromEnv && fromEnv.toLowerCase() !== "unknown") {
+    return fromEnv.split(/\s+/)[0]!.slice(0, 12);
+  }
+  try {
+    return execSync("git rev-parse --short=12 HEAD", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+}
+
+const viteGitCommit = resolveViteGitCommit();
+
+export default defineConfig({
+  base: basePath,
+  define: {
+    // Ensures import.meta.env.VITE_GIT_COMMIT is always a string literal in the bundle.
+    "import.meta.env.VITE_GIT_COMMIT": JSON.stringify(viteGitCommit),
+  },
+  plugins: [
+    react(),
+    tailwindcss(),
+    runtimeErrorOverlay(),
+    ...(process.env.NODE_ENV !== "production" &&
+    process.env.REPL_ID !== undefined
+      ? [
+          await import("@replit/vite-plugin-cartographer").then((m) =>
+            m.cartographer({
+              root: path.resolve(import.meta.dirname, ".."),
+            }),
+          ),
+          await import("@replit/vite-plugin-dev-banner").then((m) =>
+            m.devBanner(),
+          ),
+        ]
+      : []),
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "src"),
+      "@assets": path.resolve(import.meta.dirname, "..", "..", "attached_assets"),
+    },
+    dedupe: ["react", "react-dom"],
+  },
+  root: path.resolve(import.meta.dirname),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          // Stable names for lazy export libs — anonymous index-*.js chunks
+          // break Word export when Cloudflare/tunnel serves HTML for a stale hash.
+          if (id.includes("/docx/") || id.endsWith("/docx") || id.includes("\\docx\\")) {
+            return "vendor-docx";
+          }
+          if (id.includes("file-saver")) {
+            return "vendor-filesaver";
+          }
+          if (id.includes("jspdf")) {
+            return "vendor-jspdf";
+          }
+          if (id.includes("recharts") || id.includes("d3-") || id.includes("d3/")) {
+            return "vendor-charts";
+          }
+          if (id.includes("@radix-ui")) {
+            return "vendor-radix";
+          }
+          if (id.includes("@tanstack")) {
+            return "vendor-query";
+          }
+          if (id.includes("framer-motion")) {
+            return "vendor-animation";
+          }
+        },
+      },
+    },
+  },
+  server: {
+    port: devServerPort,
+    // Isolated development binds loopback: a restored copy of production records
+    // must not be reachable from the clinic LAN just because a laptop is plugged in.
+    // Otherwise the previous behaviour (0.0.0.0) is preserved.
+    host: isolatedDev ? "127.0.0.1" : "0.0.0.0",
+    // In isolated mode a port collision is an error, not a silent move to 5174 —
+    // the browser would otherwise show a CARE UI whose proxy still points at 8080.
+    strictPort: isolatedDev,
+    allowedHosts: true,
+    fs: {
+      strict: true,
+      deny: ["**/.*"],
+    },
+    proxy: {
+      "/api": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      // Frozen key images are served by the API at bare "/uploads/*" — a sibling
+      // of /api, not under it (docker/nginx.conf routes both). Their signed
+      // grant URLs are root-relative, so without this the dev server answers
+      // them with index.html and every attached image renders broken locally
+      // while working in production.
+      "/uploads": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+    },
+  },
+  // `vite preview` serves whatever was last built, and in isolated mode what was
+  // last built talks to a restored copy of production records. The same loopback
+  // rule therefore applies here, and the port must not come from PORT either —
+  // the restored .env says 8080, which is the separate emergency ERP's port.
+  preview: {
+    port: devServerPort,
+    host: isolatedDev ? "127.0.0.1" : "0.0.0.0",
+    allowedHosts: true,
+    strictPort: isolatedDev,
+  },
+});

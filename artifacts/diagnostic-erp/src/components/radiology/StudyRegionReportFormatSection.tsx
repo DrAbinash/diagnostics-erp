@@ -1,0 +1,534 @@
+/**
+ * Section 1 — Study / Region (family → sub-region / Study Tab).
+ *
+ * Cascading picker: Region (family) → Sub-region / Study.
+ * Whole-report Format is first-class in WholeReportFormatControl (main canvas)
+ * and the right-rail picker — both reuse the same Zustand apply engine.
+ * Catalog: server radiology_study_tabs only (via availableStudyTabs).
+ * Quick: personal localStorage shortcuts by Study Tab ID (never a catalog).
+ * + Add: creates one real Study Tab, configures children, selects + pins Quick.
+ * Selection: dropdown and Quick both call onSelectRegion → selectPrimaryRegion.
+ */
+
+import { useEffect, useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { AlertTriangle, Pencil, Plus } from "lucide-react";
+import { groupStudyTabsByFamily, studyTabFamily } from "@/lib/studyRegion";
+import {
+  type StudyTabRef,
+  clearLegacyQuickRegionNames,
+  migrateLegacyQuickNamesToIds,
+  pinQuickTabId,
+  readLastStudyFamily,
+  readLegacyQuickRegionNames,
+  readStoredQuickTabIds,
+  resolveQuickStudyTabs,
+  toggleQuickTabId,
+  writeLastStudyFamily,
+  writeStoredQuickTabIds,
+} from "@/lib/workspaceRegionPrefs";
+import type { RegionTransitionPlan } from "@/lib/regionTransition";
+import { AddStudyRegionDialog } from "./AddStudyRegionDialog";
+
+export type StudyRegionReportFormatSectionProps = {
+  /** Server-backed Study Tabs (canonical catalog for this modality). */
+  availableStudyTabs: StudyTabRef[];
+  selectedRegion: string | null;
+  autoDetectedRegion: string | null;
+  regionOverridden: boolean;
+  onSelectRegion: (region: string | null) => void;
+  onResetAutoRegion: () => void;
+  modality?: string | null;
+  disabled?: boolean;
+  testName?: string | null;
+  /**
+   * How auto region was chosen at study-open (billed preferred over DICOM).
+   * null / undefined when unresolved; "override" when radiologist picked manually.
+   */
+  regionMatchSource?: "billed" | "dicom" | "override" | null;
+  /** DICOM-only match — shown when billed won with a different region. */
+  dicomMatchedRegion?: string | null;
+  billedMatchedRegion?: string | null;
+  /** Protocol still applies internally when region changes — metadata only. */
+  activeProtocolName?: string | null;
+  /**
+   * ADR-004 — a region change that would take sentences out of this report is held here
+   * until the radiologist confirms it. The plan is the policy's own object: this component
+   * only reads it, it decides nothing about what the transition costs.
+   */
+  pendingRegionTransition?: RegionTransitionPlan | null;
+  onConfirmRegionTransition?: () => void;
+  onCancelRegionTransition?: () => void;
+  onReapplyDefaults?: () => void;
+  canReapplyDefaults?: boolean;
+};
+
+export function StudyRegionReportFormatSection({
+  availableStudyTabs,
+  selectedRegion,
+  autoDetectedRegion,
+  regionOverridden,
+  onSelectRegion,
+  onResetAutoRegion,
+  modality,
+  disabled,
+  testName,
+  regionMatchSource = null,
+  dicomMatchedRegion = null,
+  billedMatchedRegion = null,
+  activeProtocolName,
+  pendingRegionTransition,
+  onConfirmRegionTransition,
+  onCancelRegionTransition,
+  onReapplyDefaults,
+  canReapplyDefaults,
+}: StudyRegionReportFormatSectionProps) {
+  const [quickIds, setQuickIds] = useState<number[]>(() => readStoredQuickTabIds());
+  const [legacyMigrated, setLegacyMigrated] = useState(false);
+  const [quickEditOpen, setQuickEditOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [selectedFamily, setSelectedFamily] = useState<string>("");
+
+  const familyGroups = useMemo(
+    () => groupStudyTabsByFamily(availableStudyTabs),
+    [availableStudyTabs],
+  );
+
+  const familyOptions = useMemo(
+    () => familyGroups.map((g) => g.family),
+    [familyGroups],
+  );
+
+  const tabsInFamily = useMemo(() => {
+    if (!selectedFamily) return [];
+    return familyGroups.find((g) => g.family === selectedFamily)?.tabs ?? [];
+  }, [familyGroups, selectedFamily]);
+
+  // Sync family from external region (auto-detect / Quick / + Add). Persist last family.
+  useEffect(() => {
+    if (selectedRegion) {
+      const fam = studyTabFamily(selectedRegion);
+      if (familyOptions.includes(fam)) {
+        setSelectedFamily(fam);
+        writeLastStudyFamily(modality, fam);
+        return;
+      }
+    }
+    // No region yet — preselect persisted family only if it still exists for this modality.
+    if (!selectedFamily) {
+      const stored = readLastStudyFamily(modality);
+      if (stored && familyOptions.includes(stored)) {
+        setSelectedFamily(stored);
+      }
+    }
+  }, [selectedRegion, availableStudyTabs, modality, familyOptions]); // eslint-disable-line react-hooks/exhaustive-deps -- selectedFamily intentional omit: do not fight manual family while region unchanged
+
+  // Single-tab family → auto-select that Study Tab.
+  useEffect(() => {
+    if (!selectedFamily) return;
+    if (tabsInFamily.length !== 1) return;
+    const only = tabsInFamily[0];
+    if (selectedRegion === only.name) return;
+    // Only auto-select when current region is empty or outside this family.
+    if (selectedRegion && studyTabFamily(selectedRegion) === selectedFamily) return;
+    if (!selectedRegion || studyTabFamily(selectedRegion) !== selectedFamily) {
+      onSelectRegion(only.name);
+    }
+  }, [selectedFamily, tabsInFamily, selectedRegion, onSelectRegion]);
+
+  // One-time: convert legacy name-based Quick prefs → Study Tab IDs.
+  useEffect(() => {
+    if (legacyMigrated) return;
+    if (availableStudyTabs.length === 0) return;
+    const existing = readStoredQuickTabIds();
+    if (existing.length > 0) {
+      setLegacyMigrated(true);
+      clearLegacyQuickRegionNames();
+      return;
+    }
+    const legacyNames = readLegacyQuickRegionNames();
+    if (legacyNames.length === 0) {
+      setLegacyMigrated(true);
+      clearLegacyQuickRegionNames();
+      return;
+    }
+    const migrated = migrateLegacyQuickNamesToIds(availableStudyTabs, legacyNames);
+    if (migrated.length > 0) setQuickIds(migrated);
+    clearLegacyQuickRegionNames();
+    setLegacyMigrated(true);
+  }, [availableStudyTabs, legacyMigrated]);
+
+  useEffect(() => {
+    writeStoredQuickTabIds(quickIds);
+  }, [quickIds]);
+
+  const quickTabs = useMemo(
+    () => resolveQuickStudyTabs(availableStudyTabs, quickIds),
+    [availableStudyTabs, quickIds],
+  );
+
+  const handleFamilyChange = (family: string) => {
+    setSelectedFamily(family);
+    if (family) writeLastStudyFamily(modality, family);
+    // Choosing a family only filters dropdown 2 — do not call onSelectRegion yet
+    // unless the family has exactly one tab (handled by effect above).
+    if (selectedRegion && family && studyTabFamily(selectedRegion) !== family) {
+      // Clear stale sub-region so the user must pick within the new family.
+      onSelectRegion(null);
+    }
+  };
+
+  const handleRegionCreated = (tab: StudyTabRef) => {
+    setQuickIds((prev) => pinQuickTabId(prev, tab.id));
+    setSelectedFamily(studyTabFamily(tab.name));
+    onSelectRegion(tab.name);
+  };
+
+  return (
+    <div className="space-y-2" data-testid="study-region-report-format-section">
+      <div
+        className="flex flex-wrap items-end gap-x-3 gap-y-2 rounded-md border border-emerald-200/60 bg-gradient-to-r from-emerald-50/40 via-card to-emerald-50/20 px-2.5 py-2 text-[10px] shadow-sm"
+        data-testid="study-setup-strip"
+      >
+        <label className="inline-flex flex-col gap-0.5 min-w-[8.5rem]">
+          <span className="font-semibold uppercase tracking-wider text-emerald-700/80">Region</span>
+          <select
+            className="h-7 min-w-[9rem] max-w-[14rem] rounded border bg-background px-1.5 text-[11px] font-medium"
+            value={selectedFamily}
+            disabled={disabled || familyOptions.length === 0}
+            onChange={(e) => handleFamilyChange(e.target.value)}
+            data-testid="study-region-family-select"
+            aria-label="Region family"
+            title="Body-part family (Brain, Spine, …) — filters Sub-region / Study"
+          >
+            <option value="">
+              {familyOptions.length === 0 ? "Add a Study Tab…" : "Select region…"}
+            </option>
+            {familyOptions.map((fam) => (
+              <option key={fam} value={fam}>{fam}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className="inline-flex flex-col gap-0.5 min-w-[10rem]">
+          <span className="font-semibold uppercase tracking-wider text-emerald-700/80">Sub-region / Study</span>
+          <select
+            className="h-7 min-w-[11rem] max-w-[16rem] rounded border bg-background px-1.5 text-[11px] font-medium"
+            value={selectedRegion ?? ""}
+            disabled={disabled || !selectedFamily}
+            onChange={(e) => onSelectRegion(e.target.value || null)}
+            data-testid="study-region-select"
+            aria-label="Sub-region / Study"
+            title="Canonical Study Tab from clinic catalog (radiology_study_tabs)"
+          >
+            <option value="">
+              {!selectedFamily
+                ? "Select a region first…"
+                : tabsInFamily.length === 0
+                  ? "No studies in this region"
+                  : "Select study / region…"}
+            </option>
+            {tabsInFamily.map((t) => (
+              <option key={t.id} value={t.name} data-study-tab-id={t.id}>{t.name}</option>
+            ))}
+          </select>
+        </label>
+
+        {testName ? (
+          <span className="text-muted-foreground pb-1" title="Detected / applied study title">
+            Test: <strong className="text-foreground">{testName}</strong>
+          </span>
+        ) : null}
+
+        {regionMatchSource === "billed" || regionMatchSource === "dicom" ? (
+          <span
+            className="pb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-800/80"
+            data-testid="region-match-source"
+            data-source={regionMatchSource}
+            title={
+              regionMatchSource === "billed"
+                ? dicomMatchedRegion && dicomMatchedRegion !== (billedMatchedRegion ?? selectedRegion)
+                  ? `Region from billed procedure (DICOM would have matched “${dicomMatchedRegion}”)`
+                  : "Region from billed procedure"
+                : "Region from DICOM / worklist StudyDescription"
+            }
+          >
+            {regionMatchSource === "billed" ? "From billed" : "From DICOM"}
+            {regionMatchSource === "billed"
+              && dicomMatchedRegion
+              && dicomMatchedRegion !== (billedMatchedRegion ?? selectedRegion)
+              ? (
+                <span className="ml-1 font-normal normal-case text-amber-800/90">
+                  · DICOM: {dicomMatchedRegion}
+                </span>
+              )
+              : null}
+          </span>
+        ) : null}
+
+        {activeProtocolName ? (
+          <span
+            className="text-muted-foreground pb-1"
+            data-testid="protocol-metadata"
+            title="Protocol still auto-applies with region; not a separate study selector"
+          >
+            Protocol: <strong className="text-foreground font-medium">{activeProtocolName}</strong>
+          </span>
+        ) : null}
+
+        {regionOverridden && (
+          <button
+            type="button"
+            className="text-amber-700 underline text-[10px] pb-1"
+            title={`Auto-detected: ${autoDetectedRegion ?? "none"}`}
+            onClick={onResetAutoRegion}
+            data-testid="region-reset-auto"
+          >
+            reset to auto
+          </button>
+        )}
+
+        {onReapplyDefaults && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 text-[10px] ml-auto"
+            disabled={disabled || !canReapplyDefaults}
+            onClick={onReapplyDefaults}
+            data-testid="reapply-defaults"
+          >
+            Re-apply defaults
+          </Button>
+        )}
+      </div>
+
+      {pendingRegionTransition ? (
+        <RegionTransitionConfirmStrip
+          plan={pendingRegionTransition}
+          disabled={disabled}
+          onConfirm={() => onConfirmRegionTransition?.()}
+          onCancel={() => onCancelRegionTransition?.()}
+        />
+      ) : null}
+
+      <div className="flex flex-wrap items-center gap-1.5 px-0.5" data-testid="study-region-quick">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mr-0.5">Quick</span>
+        {quickTabs.length === 0 ? (
+          <span className="text-[10px] text-muted-foreground" data-testid="study-region-quick-empty">
+            No quick shortcuts yet — use the pencil to pin Study Tabs (unpin never deletes the tab)
+          </span>
+        ) : (
+          quickTabs.map((t) => {
+            const selected = selectedRegion === t.name;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                disabled={disabled}
+                aria-pressed={selected}
+                data-testid={`study-region-quick-${t.id}`}
+                data-study-tab-id={t.id}
+                data-selected={selected ? "true" : "false"}
+                title={`Select ${t.name} (same as Sub-region / Study dropdown)`}
+                className={[
+                  "h-7 px-2 text-[10px] rounded-md border font-medium transition-colors",
+                  selected
+                    ? "bg-primary text-primary-foreground border-primary ring-2 ring-offset-1 ring-emerald-400"
+                    : "bg-background text-muted-foreground border-border hover:bg-muted hover:text-foreground",
+                ].join(" ")}
+                onClick={() => onSelectRegion(t.name)}
+              >
+                {t.name}
+              </button>
+            );
+          })
+        )}
+        <button
+          type="button"
+          disabled={disabled || availableStudyTabs.length === 0}
+          className="inline-flex h-7 items-center gap-0.5 rounded border border-dashed px-1.5 text-[10px] text-muted-foreground hover:border-emerald-400 hover:text-emerald-800"
+          title="Choose which Study Tabs appear as Quick shortcuts (does not delete tabs)"
+          data-testid="study-region-quick-edit"
+          onClick={() => setQuickEditOpen((v) => !v)}
+        >
+          <Pencil size={10} /> Edit Quick
+        </button>
+        <button
+          type="button"
+          disabled={disabled}
+          className="inline-flex h-7 items-center gap-0.5 rounded border border-dashed border-emerald-400/70 px-1.5 text-[10px] font-semibold text-emerald-800 hover:bg-emerald-50"
+          title="Create a Study Tab in radiology_study_tabs (children optional)"
+          data-testid="study-region-add-toggle"
+          onClick={() => setAddOpen(true)}
+        >
+          <Plus size={11} /> Add
+        </button>
+      </div>
+
+      {quickEditOpen && (
+        <div
+          className="rounded-md border border-border bg-card p-2 space-y-1.5 shadow-sm"
+          data-testid="study-region-quick-editor"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[10px] text-muted-foreground">
+              Pin Study Tabs as Quick shortcuts. Unticking only removes the shortcut — the Study Tab stays in the catalog.
+            </p>
+            <button type="button" className="p-1 text-muted-foreground hover:text-foreground" onClick={() => setQuickEditOpen(false)} aria-label="Close quick editor">
+              ×
+            </button>
+          </div>
+          {availableStudyTabs.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground">Create a Study Tab with + Add first.</p>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 max-h-40 overflow-y-auto">
+              {availableStudyTabs.map((t) => {
+                const on = quickIds.includes(t.id);
+                return (
+                  <label
+                    key={t.id}
+                    className="inline-flex items-center gap-1.5 rounded border px-1.5 py-1 text-[11px] cursor-pointer hover:bg-muted/60"
+                    data-testid={`study-region-quick-pick-${t.id}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      disabled={disabled}
+                      onChange={() => setQuickIds((prev) => toggleQuickTabId(prev, t.id))}
+                    />
+                    <span className="truncate">{t.name}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      <AddStudyRegionDialog
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        onCreated={handleRegionCreated}
+        modalityHint={modality}
+      />
+    </div>
+  );
+}
+
+/**
+ * ADR-004 — the confirmation a narrowing region change has to earn.
+ *
+ * It states the cost in the report's own sentences: the exact lines that will leave the
+ * page, the findings that stay even though they name anatomy the new examination does not
+ * acquire, the sentences that belong to no ledger row at all (never touched, and said so),
+ * and the sentences this module could not place on a spine segment (kept, because it never
+ * guesses at anatomy). Pressing Cancel writes nothing — the pending plan is the only thing
+ * this component can affect — and the region itself does not change until Confirm.
+ */
+const REGION_TRANSITION_SHOWN = 6;
+
+function RegionTransitionConfirmStrip({
+  plan,
+  disabled,
+  onConfirm,
+  onCancel,
+}: {
+  plan: RegionTransitionPlan;
+  disabled?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const shown = plan.retire.slice(0, REGION_TRANSITION_SHOWN);
+  const hidden = plan.retire.length - shown.length;
+  return (
+    <div
+      role="alert"
+      className="rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-[11px] text-amber-950 shadow-sm"
+      data-testid="region-transition-strip"
+    >
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 mt-0.5" />
+        <div className="min-w-0 space-y-1.5">
+          <div
+            className="text-[10px] font-semibold uppercase tracking-wider text-amber-800/90"
+            data-testid="region-transition-heading"
+          >
+            Region change: {plan.fromRegion ?? "not set"} → {plan.toRegion}
+          </div>
+          <div className="font-medium" data-testid="region-transition-summary">
+            {plan.summary}
+          </div>
+          {plan.retire.length > 0 ? (
+            <ul className="list-disc space-y-0.5 pl-4" data-testid="region-transition-retired-list">
+              {shown.map((row) => (
+                <li key={row.id} data-testid={`region-transition-retired-${row.id}`}>
+                  {row.text}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {hidden > 0 ? (
+            <div className="text-[10px] text-amber-800/90" data-testid="region-transition-retired-more">
+              +{hidden} more sentence{hidden === 1 ? "" : "s"}
+            </div>
+          ) : null}
+          {plan.outOfRegionAbnormalities.length > 0 ? (
+            <div data-testid="region-transition-kept-abnormalities">
+              Kept, because a finding does not disappear when the label changes:{" "}
+              {plan.outOfRegionAbnormalities
+                .slice(0, REGION_TRANSITION_SHOWN)
+                .map((row) => row.text)
+                .join(" ")}
+            </div>
+          ) : null}
+          {plan.manualLines.length > 0 ? (
+            <div data-testid="region-transition-manual-note">
+              Your own {plan.manualLines.length} line{plan.manualLines.length === 1 ? "" : "s"} are
+              untouched.
+            </div>
+          ) : null}
+          {plan.unplaced.length > 0 ? (
+            <div data-testid="region-transition-unplaced-note">
+              {plan.unplaced.length} sentence{plan.unplaced.length === 1 ? "" : "s"} this tool could not
+              place on a spine segment are kept — nothing is guessed at.
+            </div>
+          ) : null}
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 text-[11px]"
+              disabled={disabled}
+              onClick={onCancel}
+              data-testid="region-transition-cancel"
+            >
+              Cancel — report unchanged
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              className="h-7 bg-amber-600 text-[11px] hover:bg-amber-700 text-white"
+              disabled={disabled}
+              onClick={onConfirm}
+              data-testid="region-transition-confirm"
+            >
+              {plan.retire.length > 0
+                ? `Change region and remove ${plan.retire.length}`
+                : "Change region"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Pure helper used by tests: quick + dropdown must resolve to the same region setter call. */
+export function regionSelectionAction(
+  nextRegion: string | null,
+  selectPrimaryRegion: (region: string | null) => void,
+): void {
+  selectPrimaryRegion(nextRegion);
+}

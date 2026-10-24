@@ -1,0 +1,81 @@
+/**
+ * Voice Report Composer — shared types (mirrors api-server schema).
+ */
+export type VoiceObservation = {
+  id?: string;
+  concept: string;
+  level?: string | null;
+  severity?: string | null;
+  laterality?: string | null;
+  modifiers?: string[];
+  findingsText: string;
+  impressionText?: string;
+  anatomicalSection?: string;
+  conflictGroup?: string;
+  baselineReplaces?: string;
+  operation?: "add" | "update" | "remove";
+  targetObservationId?: string;
+};
+
+export type VoiceChangePlan = {
+  operation: "report_change_plan";
+  observations: VoiceObservation[];
+  removeConflictingBaselineConcepts?: string[];
+  impressionCandidates?: string[];
+  impressionUpdate?: string;
+  uncertainties: string[];
+  clarificationRequired?: string | null;
+};
+
+export type VoiceComposerDiagnostics = {
+  requestId: string;
+  provider: "ollama";
+  model: string;
+  fallbackUsed?: boolean;
+  endpointSource?: string;
+  region?: string;
+  transcriptLength: number;
+  latencyMs: number;
+  validationMs?: number;
+  validationOk: boolean;
+  schemaOk?: boolean;
+  phraseFallback?: boolean;
+  /**
+   * PHI-safe reason code for a provider/parse failure ("timeout",
+   * "network", "model_not_found", "schema_invalid", "http_500", …) —
+   * mirrored from the server diagnostics; drives the reason-code UX.
+   */
+  failureReason?: string;
+  /** True when the one-shot JSON repair prompt was sent for this request. */
+  repairUsed?: boolean;
+};
+
+/**
+ * Advisory contradiction warning (owner pick #2) — mirrors api-server
+ * contradictionCheck.ts. Rides the compose response next to the plan and
+ * lands on the accepted dictation turn for review; never blocks Apply.
+ */
+export type ComposerContradictionWarning = {
+  code: string;
+  message: string;
+  concept?: string;
+};
+
+export type VoiceComposerProvenance = {
+  source: "radiologist-voice";
+  composer: "local_ai" | "phrase_catalog";
+  model?: string;
+  fallbackUsed?: boolean;
+  requestId?: string;
+};
+
+export type ComposeApiResponse = {
+  ok: boolean;
+  plan?: VoiceChangePlan;
+  error?: string;
+  /** Advisory contradiction warnings — absent when the plan is clean. */
+  warnings?: ComposerContradictionWarning[];
+  diagnostics?: VoiceComposerDiagnostics;
+  provenance?: VoiceComposerProvenance;
+  phraseFallbackAvailable?: boolean;
+};

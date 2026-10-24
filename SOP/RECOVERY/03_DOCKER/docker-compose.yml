@@ -1,0 +1,23 @@
+# RETIRED — DO NOT RUN. Pointer only.
+#
+# The live compose file is ./docker-compose.yml at the repository root (649
+# lines, 7 services). This binder copy stopped being updated at 281 lines and
+# defines 5: db, db-patch-v2, api, web, migrate. It has NO schema-verify service
+# and NO redis service, and both SOP/RECOVERY/README.md and
+# MASTER_RECOVERY_INDEX.md labelled it "Active multi-container config".
+#
+# Why that matters, concretely: care-api starts only after care-db-patch-v2 AND
+# care-schema-verify complete, and deploy-synology.sh's own final banner lists
+# care-schema-verify among the containers it verified. A stack built from this
+# copy brings the ERP up without the schema gate ever running — which is exactly
+# the "it deployed, then the clinic found the column missing" failure the gate
+# exists to prevent. Anyone comparing the two during an incident would also
+# conclude the running stack had lost services it actually has.
+#
+# What to use instead, from the repository root:
+#   docker compose config -q        # validate the file the deploy will use
+#   docker compose config           # the resolved stack, with .env interpolated
+#   node scripts/ops-preflight.mjs  # checks the live file's services and forwarding
+#
+# scripts/ops-preflight.mjs (deploy.config_single_source) fails if a copy of a
+# deployment file comes back here un-retired.

@@ -1,0 +1,2510 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useLocation, Link } from "wouter";
+import { api, getStaffToken } from "@/lib/fetchApi";
+import { readStaffSession, ERP_SESSION_KEY, canAccess, normalizeRole } from "@/lib/staffSession";
+import { toUnifiedStatus, worklistRoleView, priorityInfo, type WorklistRoleView } from "@/lib/radiologyStatus";
+import { launchViewer, recordFailedLaunch, recordSuccessfulLaunch, resolveActiveProfile } from "@/lib/viewerService";
+import { launchRadiologyStudy } from "@/lib/studyLaunchService";
+import { normalizeModality, isUltrasoundModality } from "@/lib/usgModality";
+import { sanitizeDicomSex } from "@workspace/pathology";
+import { DATE_PRESETS, studyDateInRange } from "@/lib/dateRangePresets";
+import { buildPacsWorklistUrl, shouldIncludeOrthanc } from "@/lib/pacsWorklistQuery";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import { useToast } from "@/hooks/use-toast";
+import { reportingWorkspacePath } from "@/lib/reportingWorkspaceRoute";
+import {
+  ScanSearch, RefreshCw, ExternalLink, Sparkles, FileEdit, CheckCircle2,
+  Search, Filter, Clock, CheckCheck, AlertCircle, MonitorPlay, Tv2,
+  ClipboardList, CalendarDays, ShieldCheck, ShieldOff, Database,
+  ChevronDown, ChevronUp, Eye, MessageSquare, ThumbsUp, ThumbsDown, Trash2,
+  X, Activity, Stethoscope, Printer, Gem, FileUp, Loader2, Columns2, Maximize2, Link2,
+} from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import QueueModalityFilter from "@/components/radiology/QueueModalityFilter";
+import { aiClient } from "@/lib/aiClient";
+import {
+  OVERNIGHT_AGE_CHIPS,
+  OVERNIGHT_STATUS_CHIPS,
+  OVERNIGHT_STATUS_STYLE,
+  compareOvernightWorklistRows,
+  formatIstTime,
+  formatRelativeAgo,
+  overnightStatusMatches,
+  studyInOvernightAgeView,
+  type OvernightAgeChip,
+  type OvernightAiPayload,
+  type OvernightDisplayStatus,
+  type OvernightStatusChip,
+} from "@/lib/overnightAiDraft";
+import { AI_COMPOSE_STATUS_STYLE, AI_COMPOSE_SORT_RANK } from "@/lib/reportComposer/types";
+import {
+  normalizeWorklistAiDraftViewer,
+  type WorklistAiDraftViewerPayload,
+} from "@/lib/worklistAiDraftViewer";
+
+type WorklistEntry = {
+  id: number;
+  studyId: number | null;
+  patientId: number | null;
+  dicomPatientId: string | null;
+  patientName: string;
+  age: string | null;
+  sex: string | null;
+  modality: string;
+  studyDescription: string | null;
+  studyDate: string | null;
+  accessionNumber: string;
+  studyInstanceUID: string | null;
+  aeTitle: string | null;
+  ipAddress: string | null;
+  port: number | null;
+  referringDoctor: string | null;
+  weasisUrl: string | null;
+  sourceAeTitle: string | null;
+  status: string;
+  assignedRadiologist: string | null;
+  aiDraftStatus: string;
+  overnightAi?: OvernightAiPayload;
+  overnightEligible?: boolean;
+  /** Background text Report Composer — separate from overnight vision aiDraftStatus */
+  aiComposeStatus?: string;
+  aiComposeJobId?: number | null;
+  reportId: number | null;
+  deliveryStatus: string | null;
+  uhid?: string | null;        // Phase C: ERP UHID via patients join
+  billNumber?: string | null;  // Phase C: bill number via study→bill join
+  testName?: string | null;    // Catalog test from billing when study is linked
+  priority?: string | null;    // Phase C: reuses radiology_studies.priority
+  // R2.0 — canonical ultrasound integration: USG/Doppler measurement +
+  // key-image counts and latest report-draft status, scalar-subqueried by
+  // worklistId in GET /api/radiology/pacs-worklist. Present for every row;
+  // 0/null for non-ultrasound studies with no USG data.
+  usgMeasurementCount?: number;
+  usgKeyImageCount?: number;
+  usgReportStatus?: "draft" | "pending_review" | "verified" | "finalized" | "amended" | "archived" | null;
+  createdAt: string;
+  updatedAt: string;
+  lockUserId?: number | null;
+  lockUserName?: string | null;
+  lockTime?: string | null;
+  lockLastActivityAt?: string | null;
+  lockWorkstation?: string | null;
+};
+
+function displayTestName(entry: Pick<WorklistEntry, "testName" | "studyDescription">): string {
+  const name = entry.testName?.trim() || entry.studyDescription?.trim();
+  return name || "\u2014";
+}
+
+function formatWorklistAgeSex(entry: Pick<WorklistEntry, "age" | "sex">): string | null {
+  const sex = entry.sex ? (sanitizeDicomSex(entry.sex) ?? null) : null;
+  const parts = [entry.age, sex].filter(Boolean);
+  return parts.length > 0 ? parts.join(" \u00b7 ") : null;
+}
+
+function formatWorklistStudyDate(raw: string | null | undefined): string {
+  if (!raw) return "\u2014";
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length >= 8) {
+    const y = digits.slice(0, 4);
+    const m = digits.slice(4, 6);
+    const day = digits.slice(6, 8);
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const mi = parseInt(m, 10) - 1;
+    if (mi >= 0 && mi < 12) return `${parseInt(day, 10)} ${months[mi]} ${y}`;
+    return `${y}-${m}-${day}`;
+  }
+  return raw;
+}
+
+const WORKLIST_MODALITY_COLORS: Record<string, string> = {
+  CT: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800",
+  MR: "bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/40 dark:text-purple-300 dark:border-purple-800",
+  MRI: "bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/40 dark:text-purple-300 dark:border-purple-800",
+  CR: "bg-green-50 text-green-700 border-green-200 dark:bg-green-950/40 dark:text-green-300 dark:border-green-800",
+  DX: "bg-green-50 text-green-700 border-green-200 dark:bg-green-950/40 dark:text-green-300 dark:border-green-800",
+  US: "bg-cyan-50 text-cyan-700 border-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:border-cyan-800",
+  USG: "bg-cyan-50 text-cyan-700 border-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:border-cyan-800",
+  NM: "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800",
+  PT: "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-300 dark:border-red-800",
+  XA: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-800",
+};
+
+function worklistModalityBadgeClass(modality: string): string {
+  const key = modality?.toUpperCase() ?? "OT";
+  return WORKLIST_MODALITY_COLORS[key] ?? "bg-muted/60 text-muted-foreground border-border";
+}
+
+function canLaunchViewer(entry: Pick<WorklistEntry, "studyInstanceUID" | "accessionNumber">): boolean {
+  return Boolean(entry.studyInstanceUID?.trim() || entry.accessionNumber?.trim());
+}
+
+function formatWorklistUhid(entry: Pick<WorklistEntry, "uhid" | "dicomPatientId">): string | null {
+  return entry.uhid?.trim() || entry.dicomPatientId?.trim() || null;
+}
+
+type WorklistActionBtnProps = {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+  tone?: "weasis" | "ohif" | "report" | "ai" | "neutral" | "cc" | "warn";
+};
+
+function WorklistActionBtn({ icon: Icon, label, onClick, disabled, title, tone = "neutral" }: WorklistActionBtnProps) {
+  const tones: Record<NonNullable<WorklistActionBtnProps["tone"]>, string> = {
+    weasis: "border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:text-emerald-300 dark:border-emerald-800",
+    ohif: "border-blue-300 bg-blue-50 text-blue-800 hover:bg-blue-100 dark:bg-blue-950/30 dark:text-blue-300 dark:border-blue-800",
+    report: "border-indigo-500 bg-indigo-600 text-white hover:bg-indigo-700 dark:border-indigo-600",
+    ai: "border-violet-300 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:bg-violet-950/30 dark:text-violet-300",
+    cc: "border-teal-300 bg-teal-50 text-teal-800 hover:bg-teal-100 dark:bg-teal-950/30 dark:text-teal-300",
+    warn: "border-amber-400 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:bg-amber-950/30 dark:text-amber-300",
+    neutral: "border-border bg-background text-foreground hover:bg-muted/60",
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title ?? label}
+      className={`inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border px-0.5 py-1 w-[46px] h-[40px] text-[9px] font-semibold leading-tight transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0 ${tones[tone]}`}
+    >
+      <Icon className="h-3.5 w-3.5 shrink-0" />
+      <span className="text-center leading-none">{label}</span>
+    </button>
+  );
+}
+
+const WORKLIST_TH = "px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground whitespace-nowrap";
+const WORKLIST_TD = "px-2 py-1.5 align-top text-[12px]";
+
+const WORKLIST_COL_STORAGE_KEY = "radiologyWorklistColumnVisibility";
+
+type WorklistOptionalColumn =
+  | "measurements" | "images" | "usgReport" | "studyDescription"
+  | "refDoctor" | "accession" | "sourceAe" | "studyDate" | "createdAt"
+  | "radiologist" | "lockStatus" | "aiDraft";
+
+type WorklistColumnVisibility = Record<WorklistOptionalColumn, boolean>;
+
+const WORKLIST_COL_DEFAULTS: WorklistColumnVisibility = {
+  measurements: false,
+  images: false,
+  usgReport: false,
+  studyDescription: false,
+  refDoctor: true,
+  accession: true,
+  sourceAe: false,
+  studyDate: true,
+  createdAt: true,
+  radiologist: true,
+  lockStatus: true,
+  aiDraft: false,
+};
+
+/** When the worklist is opened for USG, surface USG-specific columns by default. */
+const WORKLIST_COL_USG_DEFAULTS: WorklistColumnVisibility = {
+  ...WORKLIST_COL_DEFAULTS,
+  measurements: true,
+  images: true,
+  usgReport: true,
+  aiDraft: true,
+  sourceAe: true,
+};
+
+const WORKLIST_COL_LABELS: Record<WorklistOptionalColumn, string> = {
+  measurements: "Measurements",
+  images: "Images",
+  usgReport: "USG Report",
+  studyDescription: "Study Description",
+  refDoctor: "Ref. Doctor",
+  accession: "Accession No",
+  sourceAe: "Source AE",
+  studyDate: "Study Date",
+  createdAt: "Created At",
+  radiologist: "Radiologist",
+  lockStatus: "Lock Status",
+  aiDraft: "AI Draft",
+};
+
+function loadWorklistColumnVisibility(modalityHint?: string): WorklistColumnVisibility {
+  const usg = modalityHint ? isUltrasoundModality(modalityHint) || normalizeModality(modalityHint) === "US" : false;
+  const base = usg ? WORKLIST_COL_USG_DEFAULTS : WORKLIST_COL_DEFAULTS;
+  try {
+    const raw = localStorage.getItem(WORKLIST_COL_STORAGE_KEY);
+    if (!raw) return { ...base };
+    return { ...base, ...(JSON.parse(raw) as Partial<WorklistColumnVisibility>) };
+  } catch {
+    return { ...base };
+  }
+}
+
+function saveWorklistColumnVisibility(cols: WorklistColumnVisibility) {
+  localStorage.setItem(WORKLIST_COL_STORAGE_KEY, JSON.stringify(cols));
+}
+
+const STATUS_CONFIG: Record<string, { label: string; color: string; icon: React.ReactNode }> = {
+  STUDY_RECEIVED: { label: "Received", color: "bg-blue-100 text-blue-800 border-blue-200", icon: <Clock className="h-3 w-3" /> },
+  AI_DRAFT_READY: { label: "AI Draft Ready", color: "bg-purple-100 text-purple-800 border-purple-200", icon: <Sparkles className="h-3 w-3" /> },
+  REPORT_IN_PROGRESS: { label: "In Progress", color: "bg-yellow-100 text-yellow-800 border-yellow-200", icon: <FileEdit className="h-3 w-3" /> },
+  REPORT_FINAL: { label: "Final", color: "bg-green-100 text-green-800 border-green-200", icon: <CheckCircle2 className="h-3 w-3" /> },
+  DELIVERED: { label: "Delivered", color: "bg-gray-100 text-gray-700 border-gray-200", icon: <CheckCheck className="h-3 w-3" /> },
+};
+
+function StatusBadge({ status, deliveryStatus }: { status: string; deliveryStatus?: string | null }) {
+  // Phase C: staff always see the unified 7-step vocabulary. The raw
+  // internal status stays visible in the tooltip for troubleshooting.
+  const u = toUnifiedStatus(status, deliveryStatus);
+  const icon = STATUS_CONFIG[status]?.icon ?? null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border ${u.color}`}
+      title={`Internal status: ${status}${deliveryStatus ? ` · delivery: ${deliveryStatus}` : ""}`}
+    >
+      {icon}
+      {u.label}
+    </span>
+  );
+}
+
+function LockBadge({ entry, currentUserId }: { entry: any; currentUserId?: number | null }) {
+  const lastAct = entry.lockLastActivityAt || entry.lockTime;
+  // M1.6A — prefer the SERVER-computed expiry (lock_last_activity_at + the
+  // configured TTL); the 30-minute window is only the pre-lock-era fallback.
+  const isLocked = entry.lockUserId && (
+    entry.lockExpiresAt
+      ? new Date(entry.lockExpiresAt).getTime() > Date.now()
+      : lastAct && (Date.now() - new Date(lastAct).getTime()) <= 30 * 60 * 1000
+  );
+  
+  if (!isLocked) {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900/50">
+        <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
+        Available
+      </span>
+    );
+  }
+
+  const isMine = entry.lockUserId === currentUserId;
+  const timeStr = entry.lockTime ? new Date(entry.lockTime).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) : "";
+
+  if (isMine) {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-900/50" title={`Locked by you at ${timeStr}`}>
+        <span className="w-1 h-1 rounded-full bg-yellow-500" />
+        Opened by You
+      </span>
+    );
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-400 border border-red-200 dark:border-red-900/50" title={`Locked by ${entry.lockUserName || "another user"} at ${timeStr}`}>
+      <span className="w-1 h-1 rounded-full bg-red-500" />
+      Locked by {entry.lockUserName || "User"}
+    </span>
+  );
+}
+
+const MODALITY_OPTIONS = ["all", "CR", "MR", "CT", "US", "MG", "BMD", "OT"];
+const STATUS_OPTIONS = ["all", "STUDY_RECEIVED", "AI_DRAFT_READY", "REPORT_IN_PROGRESS", "REPORT_FINAL", "DELIVERED"];
+
+const AI_DRAFT_STATUS_CONFIG: Record<string, { label: string; color: string }> = {
+  NONE:        { label: "None",        color: "bg-gray-100 text-gray-600 border-gray-200" },
+  PENDING:     { label: "Pending",     color: "bg-yellow-50 text-yellow-700 border-yellow-200" },
+  READY:       { label: "Ready",       color: "bg-purple-50 text-purple-700 border-purple-200" },
+  EMPTY:       { label: "Empty",       color: "bg-slate-50 text-slate-700 border-slate-300" },
+  QUARANTINED: { label: "Quarantined", color: "bg-amber-50 text-amber-900 border-amber-300" },
+  ERROR:       { label: "Error",       color: "bg-red-50 text-red-700 border-red-200" },
+};
+
+// R2.0 — USG/Doppler report-draft lifecycle status badge, styled consistently
+// with STATUS_CONFIG/AI_DRAFT_STATUS_CONFIG's Record<label,color> + rounded
+// pill convention above.
+const USG_REPORT_STATUS_CONFIG: Record<string, { label: string; color: string }> = {
+  draft:          { label: "Draft",          color: "bg-gray-100 text-gray-600 border-gray-200" },
+  pending_review: { label: "Pending Review", color: "bg-yellow-50 text-yellow-700 border-yellow-200" },
+  verified:       { label: "Verified",       color: "bg-blue-50 text-blue-700 border-blue-200" },
+  finalized:      { label: "Finalized",      color: "bg-green-100 text-green-800 border-green-200" },
+  amended:        { label: "Amended",        color: "bg-purple-50 text-purple-700 border-purple-200" },
+  archived:       { label: "Archived",       color: "bg-gray-100 text-gray-500 border-gray-200" },
+};
+
+function UsgReportStatusBadge({ status }: { status?: string | null }) {
+  if (!status) return <span className="text-xs text-muted-foreground">—</span>;
+  const cfg = USG_REPORT_STATUS_CONFIG[status] ?? { label: status, color: "bg-gray-100 text-gray-600 border-gray-200" };
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium border ${cfg.color}`}>
+      {cfg.label}
+    </span>
+  );
+}
+
+// R2.0 — small count badge for the Measurements/Images columns. Zero renders
+// as a muted em-dash (matching the file's existing empty-cell convention,
+// e.g. fmtDate/entry.studyDescription above), matching counts render as a
+// colored pill.
+function UsgCountBadge({ count, color }: { count: number; color: string }) {
+  if (!count) return <span className="text-xs text-muted-foreground">—</span>;
+  return (
+    <span className={`inline-flex items-center justify-center min-w-[22px] px-1.5 py-0.5 rounded-full text-[10px] font-semibold border ${color}`}>
+      {count}
+    </span>
+  );
+}
+
+function OvernightAiDraftCell({
+  entry,
+  overnightMode,
+  onViewDraft,
+  onHelpful,
+  onNeedsImprovement,
+  onRetry,
+}: {
+  entry: WorklistEntry;
+  overnightMode: boolean;
+  onViewDraft: () => void;
+  onHelpful: () => void;
+  onNeedsImprovement: () => void;
+  onRetry?: () => void;
+}) {
+  const display = (entry.overnightAi?.displayStatus ?? (
+    entry.aiDraftStatus === "READY" ? "READY"
+      : entry.aiDraftStatus === "EMPTY" ? "EMPTY"
+        : entry.aiDraftStatus === "QUARANTINED" ? "QUARANTINED"
+          : entry.aiDraftStatus === "ERROR" ? "ERROR"
+            : entry.aiDraftStatus === "PENDING" ? "QUEUED"
+              : "NONE"
+  )) as OvernightDisplayStatus;
+  const ai = entry.overnightAi;
+  const style = overnightMode
+    ? (OVERNIGHT_STATUS_STYLE[display] ?? OVERNIGHT_STATUS_STYLE.NONE)
+    : (AI_DRAFT_STATUS_CONFIG[entry.aiDraftStatus]?.color ?? OVERNIGHT_STATUS_STYLE.NONE);
+  const queuedAgo = formatRelativeAgo(ai?.queuedAt);
+  const startedAgo = formatRelativeAgo(ai?.startedAt);
+  const completedAt = formatIstTime(ai?.completedAt);
+  let detail: string | null = null;
+  if (display === "QUEUED" || display === "RETRYING") {
+    const pos = ai?.queuePosition != null ? `Queue #${ai.queuePosition}` : null;
+    detail = [pos, queuedAgo ? `Queued ${queuedAgo}` : null].filter(Boolean).join(" · ");
+  } else if (display === "RUNNING") {
+    detail = startedAgo ? `Started ${startedAgo}` : "Ollama processing";
+  } else if (display === "READY") {
+    detail = completedAt ? `Completed ${completedAt}` : null;
+  } else if (display === "EMPTY") {
+    detail = "No usable draft";
+  } else if (display === "QUARANTINED") {
+    detail = "Findings withheld";
+  } else if (display === "ERROR") {
+    detail = ai?.attemptCount ? `Attempt ${ai.attemptCount}` : null;
+  } else if (display === "STUCK") {
+    detail = startedAgo ? `No progress ${startedAgo}` : "Stale worker lock";
+  }
+  const label = overnightMode
+    ? (display === "NONE" ? "—" : display === "STUCK" ? "STUCK?" : display)
+    : (entry.aiDraftStatus === "NONE" ? "—" : entry.aiDraftStatus);
+
+  return (
+    <div className="flex flex-col gap-0.5 min-w-[7.5rem]">
+      <div className="flex items-center gap-1">
+        <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-medium ${style}`}>
+          {display === "RUNNING" && <RefreshCw className="h-3 w-3 animate-spin" />}
+          {display === "QUEUED" || display === "RETRYING" ? label : label}
+        </span>
+        {(display === "READY" || display === "EMPTY" || display === "QUARANTINED") && (
+          <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-xs" title={display === "READY" ? "Review AI draft in Reporting Workspace" : "View AI draft details"} onClick={onViewDraft}>
+            <Eye className="h-3 w-3" />
+          </Button>
+        )}
+        {display === "READY" && (
+          <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-xs text-green-600" title="Helpful" onClick={onHelpful}>
+            <ThumbsUp className="h-3 w-3" />
+          </Button>
+        )}
+        {display === "READY" && (
+          <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-xs text-red-500" title="Needs Improvement" onClick={onNeedsImprovement}>
+            <ThumbsDown className="h-3 w-3" />
+          </Button>
+        )}
+        {display === "ERROR" && ai?.lastError && (
+          <Button size="sm" variant="ghost" className="h-6 px-1 text-[10px]" title={ai.lastError} onClick={() => window.alert(ai.lastError)}>
+            View error
+          </Button>
+        )}
+        {(display === "ERROR" || display === "EMPTY" || display === "QUARANTINED") && onRetry && (
+          <Button size="sm" variant="ghost" className="h-6 px-1 text-[10px]" title="Retry this study (idempotent; will not start a second in-flight job)" onClick={onRetry}>
+            Retry
+          </Button>
+        )}
+      </div>
+      {overnightMode && detail && (
+        <span className="text-[10px] text-muted-foreground leading-tight">{detail}</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Usability: hours a non-final study has been waiting, computed purely from
+ * the existing createdAt timestamp already returned by the API. No new
+ * column, no DB change. Threshold is configurable (see Settings → General
+ * → Radiology → "Aging alert after (hours)"), default 4h.
+ */
+function agingHours(createdAt: string): number {
+  const created = new Date(createdAt).getTime();
+  if (Number.isNaN(created)) return 0;
+  return (Date.now() - created) / (1000 * 60 * 60);
+}
+
+function fmtDate(iso: string | null): string {
+  if (!iso) return "\u2014";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+function StudyQueuePanel() {
+  const session = readStaffSession();
+  const [, navigate] = useLocation();
+  const { data: studies = [], isLoading, refetch, isFetching } = useQuery<{
+    id: number; patientName: string; modality: string; status: string;
+    createdAt: string; assignedRadiologist: string | null;
+    lockUserId?: number | null;
+    lockUserName?: string | null;
+    lockTime?: string | null;
+    lockLastActivityAt?: string | null;
+    lockWorkstation?: string | null;
+    /** The PACS-pushed worklist row this RIS study is linked to, when there is one. */
+    worklistId?: number | null;
+  }[]>({
+    queryKey: ["study-queue-brief"],
+    queryFn: () => api.get("/api/radiology/worklist"),
+    refetchInterval: 30_000,
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-muted-foreground">{studies.length} studies in queue</p>
+        <Button variant="outline" size="sm" onClick={() => void refetch()} disabled={isFetching}>
+          <RefreshCw size={14} className={isFetching ? "animate-spin mr-1.5" : "mr-1.5"} /> Refresh
+        </Button>
+      </div>
+      {isLoading ? (
+        <div className="text-sm text-muted-foreground py-10 text-center">Loading…</div>
+      ) : studies.length === 0 ? (
+        <div className="text-sm text-muted-foreground py-10 text-center">No studies in queue</div>
+      ) : (
+        <div className="rounded-xl border overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-muted/50 text-muted-foreground text-xs uppercase tracking-wide">
+                <th className="px-3 py-2 text-left">Patient</th>
+                <th className="px-3 py-2 text-left">Modality</th>
+                <th className="px-3 py-2 text-left">Status</th>
+                <th className="px-3 py-2 text-left">Lock Status</th>
+                <th className="px-3 py-2 text-left">Radiologist</th>
+                <th className="px-3 py-2 text-left">Received</th>
+                <th className="px-3 py-2 text-right">Report</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {studies.slice(0, 100).map((s) => (
+                <tr key={s.id} className="hover:bg-muted/30 transition-colors">
+                  <td className="px-3 py-2 font-medium">{s.patientName}</td>
+                  <td className="px-3 py-2">
+                    <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 text-xs font-medium">{s.modality}</span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className="px-1.5 py-0.5 rounded bg-muted text-xs">{s.status}</span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <LockBadge entry={s} currentUserId={session?.user?.id} />
+                  </td>
+                  <td className="px-3 py-2 text-muted-foreground">{s.assignedRadiologist ?? "—"}</td>
+                  <td className="px-3 py-2 text-xs text-muted-foreground">{fmtDate(s.createdAt)}</td>
+                  <td className="px-3 py-2 text-right">
+                    {s.worklistId != null ? (
+                      <Button
+                        size="sm"
+                        className="h-7 px-2 text-[11px]"
+                        onClick={() => navigate(reportingWorkspacePath(s.worklistId!))}
+                        data-testid={`ris-study-report-${s.id}`}
+                        title="Open the reporting workspace for this study"
+                      >
+                        Report
+                      </Button>
+                    ) : (
+                      <span
+                        className="text-[10px] text-muted-foreground/70"
+                        title="This RIS study has no PACS worklist entry to report on — it appears here once the study is pushed and matched."
+                      >
+                        not in PACS queue
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Live Debug Panel ─────────────────────────────────────────────────────────
+function PacsDebugPanel({
+  entries,
+  filtered,
+  isLoading,
+  isError,
+  error,
+  lastRefresh,
+  statusFilter,
+  modalityFilter,
+  search,
+  dbTotalRows,
+  onForceRefresh,
+  onClearCache,
+  showSentinel,
+  onToggleSentinel,
+}: {
+  entries: WorklistEntry[];
+  filtered: WorklistEntry[];
+  isLoading: boolean;
+  isError: boolean;
+  error: Error | null;
+  lastRefresh: Date | null;
+  statusFilter: string;
+  modalityFilter: string;
+  search: string;
+  dbTotalRows: number | null;
+  onForceRefresh: () => void;
+  onClearCache: () => void;
+  showSentinel: boolean;
+  onToggleSentinel: () => void;
+}) {
+  const session = readStaffSession();
+  const hasToken = !!session?.token;
+  const tokenSnippet = session?.token
+    ? session.token.slice(0, 12) + "…"
+    : "none";
+
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className={expanded ? "w-full basis-full rounded border border-blue-300/80 bg-blue-50/80 dark:bg-blue-950/30 dark:border-blue-700 overflow-hidden" : "inline-flex shrink-0"}>
+      <button
+        className={expanded
+          ? "w-full flex items-center justify-between gap-2 px-2 py-0.5 bg-blue-100/90 dark:bg-blue-900/40 hover:bg-blue-200/80 dark:hover:bg-blue-900/60 transition-colors"
+          : "inline-flex items-center gap-1 h-7 px-1.5 rounded-md border border-blue-300/60 bg-blue-50/80 text-[10px] font-mono font-semibold text-blue-900 dark:text-blue-200 hover:bg-blue-100/90"}
+        onClick={() => setExpanded((v) => !v)}
+        type="button"
+        title="PACS worklist diagnostics"
+      >
+        <Database className="h-3 w-3 shrink-0" />
+        <span className="truncate max-w-[72px]">Debug</span>
+        {isLoading && <span className="text-blue-500 animate-pulse shrink-0">●</span>}
+        {isError && <span className="text-red-600 shrink-0">⚠</span>}
+        {expanded ? <ChevronUp className="h-3 w-3 text-blue-600 shrink-0" /> : <ChevronDown className="h-3 w-3 text-blue-600 shrink-0" />}
+      </button>
+
+      {expanded && (
+        <div className="p-3 font-mono text-xs grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
+          {/* Auth */}
+          <div className="col-span-full flex items-center gap-2 mb-1">
+            {hasToken
+              ? <><ShieldCheck className="h-3.5 w-3.5 text-green-600" /><span className="text-green-700 dark:text-green-400 font-semibold">AUTH: ACTIVE</span></>
+              : <><ShieldOff className="h-3.5 w-3.5 text-red-600" /><span className="text-red-700 font-semibold">AUTH: NO TOKEN — will get 401</span></>
+            }
+          </div>
+
+          <div><span className="text-blue-500 select-none">Username      : </span>{session?.user?.name ?? "—"}</div>
+          <div><span className="text-blue-500 select-none">Email         : </span>{session?.user?.email ?? "—"}</div>
+          <div><span className="text-blue-500 select-none">Role          : </span><span className="font-bold">{session?.user?.role ?? "—"}</span></div>
+          <div><span className="text-blue-500 select-none">Token prefix  : </span>{tokenSnippet}</div>
+          <div><span className="text-blue-500 select-none">Permissions   : </span>{session?.user?.permissions?.join(", ") || "none"}</div>
+
+          <div className="col-span-full border-t border-blue-200 dark:border-blue-700 my-1" />
+
+          <div><span className="text-blue-500 select-none">API endpoint  : </span>GET /api/radiology/pacs-worklist</div>
+          <div><span className="text-blue-500 select-none">Active status : </span>{statusFilter === "all" ? "ALL (no filter)" : statusFilter}</div>
+          <div><span className="text-blue-500 select-none">Active modality: </span>{modalityFilter === "all" ? "ALL (no filter)" : modalityFilter}</div>
+          <div><span className="text-blue-500 select-none">Search text   : </span>{search || "(empty)"}</div>
+
+          <div className="col-span-full border-t border-blue-200 dark:border-blue-700 my-1" />
+
+          <div>
+            <span className="text-blue-500 select-none">DB total rows : </span>
+            {dbTotalRows === null
+              ? <span className="text-blue-400">loading…</span>
+              : <span className={dbTotalRows === 0 ? "text-red-600 font-bold" : "text-green-700 dark:text-green-400 font-bold"}>{dbTotalRows} rows in radiology_worklist</span>
+            }
+          </div>
+          <div>
+            <span className="text-blue-500 select-none">API returned  : </span>
+            <span className={entries.length === 0 && !isLoading ? "text-orange-600 font-bold" : "font-bold"}>{isLoading ? "…" : `${entries.length} rows`}</span>
+          </div>
+          <div><span className="text-blue-500 select-none">After filter  : </span>{isLoading ? "…" : `${filtered.length} rows visible`}</div>
+          <div><span className="text-blue-500 select-none">Last refresh  : </span>{lastRefresh ? lastRefresh.toLocaleTimeString() : "pending…"}</div>
+
+          {isError && (
+            <div className="col-span-full text-red-700 font-semibold">
+              Error: {error?.message ?? "unknown"}
+            </div>
+          )}
+
+          <div className="col-span-full border-t border-blue-200 dark:border-blue-700 my-1" />
+
+          <div className="col-span-full flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" className="h-7 text-xs border-blue-400 text-blue-700 hover:bg-blue-100" onClick={onForceRefresh}>
+              <RefreshCw className="h-3 w-3 mr-1" /> Force Refetch
+            </Button>
+            <Button size="sm" variant="outline" className="h-7 text-xs border-blue-400 text-blue-700 hover:bg-blue-100" onClick={onClearCache}>
+              Clear RQ Cache + Refetch
+            </Button>
+            <Button
+              size="sm"
+              variant={showSentinel ? "default" : "outline"}
+              className="h-7 text-xs"
+              onClick={onToggleSentinel}
+              title="Inject a fake hardcoded row to confirm the table renders correctly"
+            >
+              {showSentinel ? "Hide" : "Show"} Sentinel Row
+            </Button>
+          </div>
+          <div className="col-span-full text-blue-400 mt-1">
+            Check browser Console → filter "[PACS" for request/response logs.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Hardcoded sentinel row — proves the table renders when shown
+const SENTINEL_ROW: WorklistEntry = {
+  id: -1,
+  studyId: null,
+  patientId: null,
+  dicomPatientId: "TEST-001",
+  patientName: "SENTINEL TEST PATIENT",
+  age: "40Y",
+  sex: "M",
+  modality: "CT",
+  studyDescription: "HARDCODED SENTINEL — table render test",
+  studyDate: new Date().toISOString().slice(0, 10),
+  accessionNumber: "ACC-SENTINEL-001",
+  studyInstanceUID: null,
+  aeTitle: "SENTINEL_AE",
+  ipAddress: null,
+  port: null,
+  referringDoctor: "Debug Doctor",
+  weasisUrl: null,
+  sourceAeTitle: "SENTINEL_AE",
+  status: "STUDY_RECEIVED",
+  assignedRadiologist: null,
+  aiDraftStatus: "NONE",
+  reportId: null,
+  deliveryStatus: null,
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
+
+// Single open-report path lives in lib/reportingWorkspaceRoute — the Command
+// Center hands off through the same builder, so no screen invents its own route
+// into the authoritative workspace.
+
+export default function RadiologyWorklist() {
+  const [, navigate] = useLocation();
+  const { toast } = useToast();
+  const qc = useQueryClient();
+
+  const session = readStaffSession();
+  // Hope / partner deep-links may pass ?q=Patient+Name alongside ?modality=MR.
+  const [search, setSearch] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get("q") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const [statusFilter, setStatusFilter] = useState("all");
+
+  // ── Phase C: role-based view. Page ACCESS is still governed solely by the
+  // existing permission system; this only decides which action buttons render.
+  const viewRole: WorklistRoleView = worklistRoleView(normalizeRole(session?.user?.role || ""));
+  const isOwnerView = viewRole === "owner";
+  const isRadView = viewRole === "radiologist" || isOwnerView;
+  const isTechView = viewRole === "technician";
+  const isReceptionView = viewRole === "reception";
+  const may = (path: string) => canAccess(session, path);
+  // PR B — USG Platform Consolidation: the "USG Worklist" sidebar entry links
+  // here with `?modality=USG` so it reuses this SAME worklist pre-filtered,
+  // instead of a second worklist component. Any ultrasound spelling
+  // ("USG", "Ultrasound", "Doppler", ...) normalizes to the existing "US"
+  // filter bucket via the same normalizer the modality Select already uses.
+  const [modalityFilter, setModalityFilter] = useState(() => {
+    const param = new URLSearchParams(window.location.search).get("modality");
+    if (!param) return "all";
+    const normalized = normalizeModality(param);
+    return MODALITY_OPTIONS.includes(normalized) ? normalized : "all";
+  });
+  const [lockFilter, setLockFilter] = useState("all");
+  const [aiDraftFilter, setAiDraftFilter] = useState<"all" | "overnight">("all");
+  const [aiComposeFilter, setAiComposeFilter] = useState<"all" | "ready" | "processing" | "failed" | "none">("all");
+  const [sortAiCompose, setSortAiCompose] = useState(false);
+  const [overnightAgeChip, setOvernightAgeChip] = useState<OvernightAgeChip>("last_24h");
+  const [overnightStatusChip, setOvernightStatusChip] = useState<OvernightStatusChip>("all");
+  const [selectedOvernightIds, setSelectedOvernightIds] = useState<Set<number>>(new Set());
+  const [autoLinking, setAutoLinking] = useState(false);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [searchOrthanc, setSearchOrthanc] = useState(true);
+  function setDatePreset(from: string, to: string) {
+    setDateFrom(from);
+    setDateTo(to);
+  }
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [showSentinel, setShowSentinel] = useState(false);
+  const [showRawJson, setShowRawJson] = useState(false);
+  // Reports are composed in Word, not this app's structured builder — this
+  // tracks which row's file input is mid-upload, matching OutsourceWorklist's
+  // "Attach Report" pattern exactly.
+  const [attachingStudyId, setAttachingStudyId] = useState<number | null>(null);
+  const [draftViewer, setDraftViewer] = useState<{
+    id: number;
+    draft: WorklistAiDraftViewerPayload | Record<string, unknown> | null;
+  } | null>(null);
+  // M1.6B1 — assignment management + live workload
+  const [showWorkload, setShowWorkload] = useState(false);
+  const [feedbackEntry, setFeedbackEntry] = useState<number | null>(null);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [columnVisibility, setColumnVisibility] = useState<WorklistColumnVisibility>(() =>
+    loadWorklistColumnVisibility(new URLSearchParams(window.location.search).get("modality") ?? undefined),
+  );
+
+  // When filtering to USG, ensure USG ops columns are visible (without wiping user prefs permanently).
+  useEffect(() => {
+    if (modalityFilter === "US" || isUltrasoundModality(modalityFilter)) {
+      setColumnVisibility((prev) => ({
+        ...prev,
+        measurements: true,
+        images: true,
+        usgReport: true,
+        aiDraft: true,
+        sourceAe: true,
+      }));
+    }
+  }, [modalityFilter]);
+  const prevEntriesLen = useRef(-1);
+
+  function toggleColumn(col: WorklistOptionalColumn) {
+    setColumnVisibility((prev) => {
+      const next = { ...prev, [col]: !prev[col] };
+      saveWorklistColumnVisibility(next);
+      return next;
+    });
+  }
+
+  const col = columnVisibility;
+
+  const overnightMode = aiDraftFilter === "overnight";
+  const includeOrthanc = shouldIncludeOrthanc({
+    enabled: searchOrthanc,
+    dateFrom,
+    dateTo,
+    search,
+  });
+
+  const worklistFetchParams = {
+    overnightDrafts: overnightMode,
+    modality: modalityFilter,
+    status: statusFilter,
+    search: search.trim(),
+    dateFrom,
+    dateTo,
+    orthanc: includeOrthanc,
+  };
+
+  const { data: entries = [], isLoading, isError, error, refetch } = useQuery<WorklistEntry[]>({
+    queryKey: ["radiology-pacs-worklist", worklistFetchParams],
+    queryFn: async () => {
+      const url = buildPacsWorklistUrl({
+        overnightDrafts: overnightMode,
+        modality: modalityFilter !== "all" ? modalityFilter : undefined,
+        status: statusFilter !== "all" ? statusFilter : undefined,
+        search: search.trim() || undefined,
+        dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+        orthanc: includeOrthanc,
+      });
+      console.log("[PACS-WORKLIST] Fetching:", url);
+      const session = readStaffSession();
+      console.log("[PACS-WORKLIST] Auth token present:", !!session?.token, "| role:", session?.user?.role);
+      try {
+        const result = await api.get<WorklistEntry[]>(url);
+        console.log("PACS API RESPONSE", result);
+        console.log("[PACS-WORKLIST] Rows returned:", result.length);
+        if (result.length > 0) {
+          console.log("[PACS-WORKLIST] First row:", JSON.stringify(result[0]).slice(0, 400));
+        } else {
+          console.warn("[PACS-WORKLIST] API returned 0 rows. Check radiology_worklist table in DB.");
+        }
+        return result;
+      } catch (err) {
+        console.error("[PACS-WORKLIST] Fetch/auth error:", err);
+        throw err;
+      }
+    },
+    staleTime: 0,
+    gcTime: 0,
+    refetchInterval: 30_000,
+  });
+
+  // Live refresh when Orthanc pushes a study (SSE; falls back to 30s poll above).
+  useEffect(() => {
+    const token = getStaffToken();
+    if (!token) return;
+    const base = (import.meta as { env: { BASE_URL?: string } }).env.BASE_URL || "/";
+    const url = `${base}api/radiology/pacs-worklist-stream?staffToken=${encodeURIComponent(token)}`.replace(/\/+/g, "/").replace(":/", "://");
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(url);
+      es.onmessage = () => {
+        void refetch();
+        void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist-count"] });
+      };
+    } catch {
+      /* SSE unavailable — 30s poll remains */
+    }
+    return () => { es?.close(); };
+  }, [refetch, qc]);
+
+  // DB total count — separate query, no filters, for debug panel
+  const { data: countData } = useQuery<{ totalRows: number }>({
+    queryKey: ["radiology-pacs-worklist-count"],
+    queryFn: async () => {
+      const result = await api.get<{ totalRows: number }>("/api/radiology/pacs-worklist/count");
+      console.log("[PACS-WORKLIST] DB total rows:", result.totalRows);
+      return result;
+    },
+    staleTime: 0,
+    refetchInterval: 60_000,
+  });
+
+  // M1.6B1 — assignable radiologists + assignment writes + live workload.
+  const { data: radiologistsData } = useQuery<{ success: boolean; radiologists: Array<{ id: number; name: string; role: string }> }>({
+    queryKey: ["radiology-radiologists"],
+    queryFn: () => api.get("/api/radiology/radiologists"),
+    staleTime: 5 * 60_000,
+  });
+  const radiologists = radiologistsData?.radiologists ?? [];
+
+  const assignMutation = useMutation({
+    mutationFn: async ({ worklistId, radiologistId }: { worklistId: number; radiologistId: number | null }) => {
+      const path = radiologistId === null
+        ? `/api/radiology/worklist-assignment/${worklistId}/unassign`
+        : `/api/radiology/worklist-assignment/${worklistId}/assign`;
+      return api.post<{ success: boolean; outcome: string; assignment?: { assignedRadiologistName?: string | null } }>(
+        path, radiologistId === null ? {} : { radiologistId },
+      );
+    },
+    onSuccess: (res) => {
+      if (!res.success) {
+        toast({ title: "Assignment not changed", description: res.outcome.replaceAll("_", " ").toLowerCase(), variant: "destructive" });
+      }
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+      void qc.invalidateQueries({ queryKey: ["radiology-workload"] });
+    },
+    onError: (err) => {
+      toast({ title: "Assignment failed", description: err instanceof Error ? err.message : "Error", variant: "destructive" });
+    },
+  });
+
+  const { data: workload } = useQuery<{
+    success: boolean;
+    radiologists: Array<{ radiologistId: number; radiologistName: string; assignedPending: number; lockedNow: number; completedToday: number; avgPendingAgeHours: number | null }>;
+    unassignedPending: number;
+  }>({
+    queryKey: ["radiology-workload"],
+    queryFn: () => api.get("/api/radiology/workload"),
+    enabled: showWorkload,
+    refetchInterval: showWorkload ? 60_000 : false,
+  });
+
+  const { data: pacsViewerSettings = {} as Record<string, string> } = useQuery<Record<string, string>>({
+    queryKey: ["pacs-viewer-settings"],
+    queryFn: async () => {
+      const rows = await api.get<{ key: string; value: string; category: string }[]>("/api/radiology/pacs-settings");
+      const map: Record<string, string> = {};
+      for (const r of rows) if (r.category === "viewer" || r.category === "radiology") map[r.key] = r.value;
+      return map;
+    },
+    staleTime: 120_000,
+  });
+
+  // Phase E "Highlight Urgent / VIP studies" toggle (default ON when unset)
+  const urgentHighlightOn = (pacsViewerSettings["urgent_highlight_enabled"] ?? "true") !== "false";
+
+  const [activeNetworkProfile, setActiveNetworkProfile] = useState<"LAN" | "TAILSCALE" | "PUBLIC" | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void resolveActiveProfile(pacsViewerSettings).then(({ profile }) => {
+      if (!cancelled) setActiveNetworkProfile(profile);
+    });
+    return () => { cancelled = true; };
+  }, [pacsViewerSettings]);
+
+  const preferWeasis =
+    pacsViewerSettings["default_viewer"] === "WEASIS" || activeNetworkProfile === "LAN";
+
+  async function launchWorklistWeasis(entry: WorklistEntry) {
+    if (!canLaunchViewer(entry)) {
+      toast({
+        title: "Cannot open Weasis",
+        description: "This study has no DICOM Study UID or accession number yet.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const openTarget = window.open("about:blank", "_blank");
+    try {
+      const res = await launchRadiologyStudy(
+        {
+          studyInstanceUID: entry.studyInstanceUID,
+          accessionNumber: entry.accessionNumber,
+          worklistId: entry.id,
+          viewer: "WEASIS",
+          requestedMode: "AUTO",
+        },
+        pacsViewerSettings,
+        {
+          openTarget,
+          pageIsHttps: window.location.protocol === "https:",
+          recordSuccess: recordSuccessfulLaunch,
+          recordFailure: recordFailedLaunch,
+        },
+      );
+      if (!res.success) {
+        openTarget?.close();
+        // Fallback: server-built weasis:// URL (still needs StudyInstanceUID)
+        if (entry.studyInstanceUID?.trim()) {
+          const { openWeasisLaunchRedirect } = await import("@/lib/viewerService");
+          await openWeasisLaunchRedirect(entry.studyInstanceUID, toast);
+          return;
+        }
+        toast({
+          title: "Failed to open Weasis",
+          description: res.diagnostics.slice(-2).join(" · ") || res.errorCode || "Check Radiology Settings → Viewers.",
+          variant: "destructive",
+        });
+      }
+    } catch (err) {
+      openTarget?.close();
+      toast({
+        title: "Failed to open Weasis",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    }
+  }
+
+  useEffect(() => {
+    if (!isLoading && prevEntriesLen.current !== entries.length) {
+      setLastRefresh(new Date());
+      prevEntriesLen.current = entries.length;
+      // Auto-show raw JSON if API returned rows but table is likely empty (first load)
+      if (entries.length > 0) setShowRawJson(false);
+    }
+  }, [entries, isLoading]);
+
+  const aiDraftMutation = useMutation({
+    mutationFn: (entry: WorklistEntry) =>
+      api.post("/api/internal/radiology/ai-draft", {
+        studyId: entry.id,
+        modality: entry.modality,
+        studyDescription: entry.studyDescription ?? entry.modality,
+        patientName: entry.patientName,
+        age: entry.age ?? "",
+        sex: entry.sex ?? "",
+        accessionNumber: entry.accessionNumber,
+        studyDate: entry.studyDate ?? "",
+      }),
+    onSuccess: (_data, entry) => {
+      toast({ title: "AI Draft Ready", description: `Draft generated for ${entry.patientName}` });
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+    },
+    onError: (err) => {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Failed to generate draft", variant: "destructive" });
+    },
+  });
+
+  const markFinalMutation = useMutation({
+    mutationFn: ({ entry, reason }: { entry: WorklistEntry; reason: string }) =>
+      api.post("/api/internal/radiology/report-status", {
+        accessionNumber: entry.accessionNumber,
+        studyInstanceUID: entry.studyInstanceUID,
+        status: "REPORT_FINAL",
+        actor: "staff",
+        softFinalOverride: true,
+        softFinalReason: reason,
+      }),
+    onSuccess: (_data, { entry }) => {
+      toast({ title: "Admin mark final", description: `Study ${entry.accessionNumber} marked as final (override)` });
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+    },
+    onError: (err) => {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Update failed", variant: "destructive" });
+    },
+  });
+
+  // Attach an externally-produced (Word → PDF/DOCX) final report to a study.
+  // Same two-step shape as OutsourceWorklist's "Attach Report": upload via
+  // the existing generic /api/uploads (module "reports"), then link the
+  // returned storagePath to the study.
+  const attachReportMutation = useMutation({
+    mutationFn: ({ studyId, filePath, fileName }: { studyId: number; filePath: string; fileName: string }) =>
+      api.post("/api/radiology/report-attachments", { studyId, filePath, fileName }),
+    onSuccess: () => {
+      toast({
+        title: "Report attached",
+        description: "Stored on the study. Open Report Delivery to print/share — attach is not yet mirrored into the patient portal.",
+      });
+      setAttachingStudyId(null);
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+    },
+    onError: (e: Error) => {
+      toast({ title: "Failed to attach report", description: e.message, variant: "destructive" });
+      setAttachingStudyId(null);
+    },
+  });
+
+  const handleAttachReport = (studyId: number, e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file after a failed attempt
+    if (!file) return;
+
+    setAttachingStudyId(studyId);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64Data = (reader.result as string).split(",")[1];
+      try {
+        const uploadRes = await api.post<{ storagePath: string }>("/api/uploads", {
+          module: "reports",
+          fileName: file.name,
+          mimeType: file.type,
+          base64Data,
+        });
+        attachReportMutation.mutate({ studyId, filePath: uploadRes.storagePath, fileName: file.name });
+      } catch (err) {
+        toast({ title: "Upload failed", description: (err as Error).message, variant: "destructive" });
+        setAttachingStudyId(null);
+      }
+    };
+    reader.onerror = () => {
+      toast({ title: "File read failed", variant: "destructive" });
+      setAttachingStudyId(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const filtered = entries.filter((e) => {
+    // Client-side status filter
+    if (statusFilter !== "all" && e.status !== statusFilter) return false;
+    // Client-side modality filter — normalize both sides so raw PACS
+    // spellings ("USG", "Doppler", "OB US", ...) fold into the one "US"
+    // filter chip instead of silently failing exact-string equality (R2.0).
+    if (modalityFilter !== "all" && normalizeModality(e.modality) !== normalizeModality(modalityFilter)) return false;
+
+    // Client-side lock filter — server-computed expiry first (M1.6A)
+    const lastAct = e.lockLastActivityAt || e.lockTime;
+    const isLocked = e.lockUserId && (
+      (e as { lockExpiresAt?: string | null }).lockExpiresAt
+        ? new Date((e as { lockExpiresAt?: string | null }).lockExpiresAt as string).getTime() > Date.now()
+        : lastAct && (Date.now() - new Date(lastAct).getTime()) <= 30 * 60 * 1000
+    );
+    const isMine = isLocked && e.lockUserId === session?.user?.id;
+
+    if (lockFilter === "available" && isLocked) return false;
+    if (lockFilter === "mine" && !isMine) return false;
+    if (lockFilter === "locked" && (!isLocked || isMine)) return false;
+
+    if (aiDraftFilter === "overnight") {
+      const display = (e.overnightAi?.displayStatus ?? (
+        e.aiDraftStatus === "READY" ? "READY" : e.aiDraftStatus === "ERROR" ? "ERROR" : e.aiDraftStatus === "PENDING" ? "QUEUED" : "NONE"
+      )) as OvernightDisplayStatus;
+      const inOvernightSet = display !== "NONE" || Boolean(e.overnightEligible);
+      if (!inOvernightSet) return false;
+      if (!overnightStatusMatches(display, overnightStatusChip)) return false;
+      if (!studyInOvernightAgeView({
+        chip: overnightAgeChip,
+        studyDate: e.studyDate,
+        createdAt: e.createdAt,
+        customFrom: dateFrom || undefined,
+        customTo: dateTo || undefined,
+      })) return false;
+    }
+
+    if (aiComposeFilter !== "all") {
+      const st = (e.aiComposeStatus ?? "NONE").toUpperCase();
+      if (aiComposeFilter === "ready" && st !== "READY" && st !== "STALE_READY") return false;
+      if (aiComposeFilter === "processing" && st !== "QUEUED" && st !== "COMPOSING") return false;
+      if (aiComposeFilter === "failed" && st !== "FAILED") return false;
+      if (aiComposeFilter === "none" && st !== "NONE") return false;
+    }
+
+    // Date filter uses DICOM study scan date (studyDate), not ERP received time.
+    if (!overnightMode || overnightAgeChip === "custom") {
+      if (dateFrom || dateTo) {
+        if (!studyDateInRange(e.studyDate, e.createdAt, dateFrom, dateTo)) return false;
+      }
+    }
+
+    if (!search) return true;
+    const s = search.toLowerCase();
+    return (
+      (e.patientName ?? "").toLowerCase().includes(s) ||
+      (e.accessionNumber ?? "").toLowerCase().includes(s) ||
+      (e.studyDescription ?? "").toLowerCase().includes(s) ||
+      (e.referringDoctor ?? "").toLowerCase().includes(s)
+    );
+  });
+
+  const overnightFiltered = overnightMode
+    ? [...filtered].sort(compareOvernightWorklistRows)
+    : filtered;
+
+  const composeSorted = sortAiCompose
+    ? [...overnightFiltered].sort((a, b) => {
+        const ra = AI_COMPOSE_SORT_RANK[(a.aiComposeStatus ?? "NONE").toUpperCase()] ?? 99;
+        const rb = AI_COMPOSE_SORT_RANK[(b.aiComposeStatus ?? "NONE").toUpperCase()] ?? 99;
+        return ra - rb;
+      })
+    : overnightFiltered;
+
+  const aiDraftCounts = useMemo(() => {
+    let ready = 0, empty = 0, quarantined = 0, error = 0, processing = 0, queued = 0, running = 0;
+    for (const e of entries) {
+      const display = (e.overnightAi?.displayStatus ?? (
+        e.aiDraftStatus === "READY" ? "READY"
+          : e.aiDraftStatus === "EMPTY" ? "EMPTY"
+            : e.aiDraftStatus === "QUARANTINED" ? "QUARANTINED"
+              : e.aiDraftStatus === "ERROR" ? "ERROR"
+                : e.aiDraftStatus === "PENDING" ? "QUEUED"
+                  : "NONE"
+      )) as OvernightDisplayStatus;
+      const inSet = display !== "NONE" || Boolean(e.overnightEligible);
+      if (overnightMode) {
+        if (!inSet) continue;
+        if (!studyInOvernightAgeView({
+          chip: overnightAgeChip,
+          studyDate: e.studyDate,
+          createdAt: e.createdAt,
+          customFrom: dateFrom || undefined,
+          customTo: dateTo || undefined,
+        })) continue;
+      }
+      if (display === "READY") ready++;
+      else if (display === "EMPTY") empty++;
+      else if (display === "QUARANTINED") quarantined++;
+      else if (display === "ERROR" || display === "STUCK") error++;
+      else if (display === "RUNNING") running++;
+      else if (display === "QUEUED" || display === "RETRYING") queued++;
+      else if (e.aiDraftStatus === "PENDING") processing++;
+    }
+    return { ready, empty, quarantined, error, processing, queued, running };
+  }, [entries, overnightMode, overnightAgeChip, dateFrom, dateTo]);
+
+  // Rows to render in table — real rows + optional sentinel
+  const tableRows = [
+    ...(showSentinel ? [SENTINEL_ROW] : []),
+    ...composeSorted,
+  ];
+
+  // /api/patient-reports/:id/print is staff-authed (Authorization: Bearer
+  // <token>, checked only on the request header — this app has no cookie
+  // fallback), so a plain window.open(url) navigation can never carry it and
+  // always 401'd here (opened a blank tab showing the JSON error body
+  // instead of the report). Same fix ReportHub.tsx's openPrint() already
+  // uses: open a blank tab synchronously (popup-blocker safe), fetch the
+  // HTML via the authenticated client, then write it into that tab.
+  async function openPrintReport(reportId: number) {
+    const w = window.open("", "_blank", "noopener,noreferrer");
+    if (!w) {
+      toast({ title: "Popup blocked", description: "Allow popups for this site to print.", variant: "destructive" });
+      return;
+    }
+    try {
+      const html = await api.get<string>(`/api/patient-reports/${reportId}/print`);
+      w.document.write(html);
+      w.document.close();
+      w.focus();
+    } catch (err) {
+      w.close();
+      toast({ title: "Could not open print view", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    }
+  }
+
+  function handleClearCache() {
+    void qc.resetQueries({ queryKey: ["radiology-pacs-worklist"] });
+    void qc.resetQueries({ queryKey: ["radiology-pacs-worklist-count"] });
+    window.localStorage.removeItem("pacs_worklist_cache");
+    console.log("[PACS-WORKLIST] React Query cache cleared, re-fetching…");
+    setTimeout(() => void refetch(), 100);
+  }
+
+  // READY drafts with usable content open Reporting Workspace. EMPTY /
+  // QUARANTINED open the detail dialog (no Accept — nothing usable).
+  async function viewAiDraft(id: number) {
+    try {
+      const result = await api.get<{
+        draft: WorklistAiDraftViewerPayload | Record<string, unknown> | null;
+        safetyNote: string;
+      }>(`/api/radiology/pacs-worklist/${id}/ai-draft`);
+      const viewed = normalizeWorklistAiDraftViewer(result.draft);
+      if (viewed.usable) {
+        navigate(reportingWorkspacePath(id, { ai: true }));
+        return;
+      }
+      setDraftViewer({ id, draft: result.draft });
+    } catch (err) {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Failed to load draft", variant: "destructive" });
+    }
+  }
+
+  // Phase 11: Submit feedback (thumbs up/down) with optional text
+  async function submitFeedback(id: number, verdict: "helpful" | "needs_improvement" | "inaccurate") {
+    if (verdict === "needs_improvement" || verdict === "inaccurate") {
+      setFeedbackEntry(id);
+      return; // wait for text dialog
+    }
+    try {
+      await api.post(`/api/radiology/pacs-worklist/${id}/ai-feedback`, { verdict, notes: "" });
+      toast({ title: "Feedback saved" });
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+    } catch (err) {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Failed to save feedback", variant: "destructive" });
+    }
+  }
+
+  async function submitFeedbackWithNotes() {
+    if (!feedbackEntry) return;
+    try {
+      await api.post(`/api/radiology/pacs-worklist/${feedbackEntry}/ai-feedback`, { verdict: "needs_improvement", notes: feedbackText });
+      toast({ title: "Feedback saved" });
+      setFeedbackEntry(null);
+      setFeedbackText("");
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+    } catch (err) {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Failed to save feedback", variant: "destructive" });
+    }
+  }
+
+  const trulyEmpty = entries.length === 0 && !isLoading;
+  const filteredEmpty = entries.length > 0 && tableRows.length === 0;
+  const unlinkedPacsCount = entries.filter((e) => e.studyId == null).length;
+
+  async function autoLinkUnlinkedBills() {
+    const ids = entries.filter((e) => e.studyId == null && e.id > 0).map((e) => e.id).slice(0, 80);
+    if (ids.length === 0) return;
+    setAutoLinking(true);
+    try {
+      let linked = 0;
+      // Small batches so the API stays responsive during desk hours.
+      for (let i = 0; i < ids.length; i += 8) {
+        const chunk = ids.slice(i, i + 8);
+        const results = await Promise.allSettled(
+          chunk.map((id) =>
+            api.post<{ linked?: boolean; studyId?: number }>(
+              `/api/radiology/pacs-worklist/${id}/auto-link-billed-study`,
+              {},
+            ),
+          ),
+        );
+        for (const r of results) {
+          if (r.status === "fulfilled" && (r.value as { linked?: boolean; success?: boolean })?.linked) linked++;
+        }
+      }
+      toast({
+        title: linked > 0 ? `Linked ${linked} billed stud${linked === 1 ? "y" : "ies"}` : "No auto-links found",
+        description:
+          linked > 0
+            ? "Bill numbers should appear after refresh. Remaining rows still need DICOM Match."
+            : "PACS rows still have no matching radiology_studies for that patient — check DICOM Match Center.",
+      });
+      void qc.invalidateQueries({ queryKey: ["radiology-pacs-worklist"] });
+      void refetch();
+    } catch (err) {
+      toast({
+        title: "Auto-link failed",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setAutoLinking(false);
+    }
+  }
+
+  function toggleOvernightAiDrafts() {
+    setAiDraftFilter((v) => {
+      const next = v === "overnight" ? "all" : "overnight";
+      if (next === "overnight") {
+        setColumnVisibility((prev) => {
+          const nextCols = { ...prev, aiDraft: true };
+          saveWorklistColumnVisibility(nextCols);
+          return nextCols;
+        });
+      } else {
+        setSelectedOvernightIds(new Set());
+      }
+      return next;
+    });
+  }
+
+  function toggleOvernightSelect(id: number) {
+    setSelectedOvernightIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const selectedOvernightRows = overnightFiltered.filter((e) => selectedOvernightIds.has(e.id) && e.id > 0);
+
+  async function queueSelectedOvernight() {
+    const uids = selectedOvernightRows.map((e) => e.studyInstanceUID).filter((u): u is string => !!u);
+    const modalities: Record<string, string | null> = {};
+    for (const e of selectedOvernightRows) {
+      if (e.studyInstanceUID) modalities[e.studyInstanceUID] = e.modality ?? null;
+    }
+    if (uids.length === 0) return;
+    try {
+      const res = await aiClient.queueSelected(uids, modalities, false);
+      toast({ title: `Queued ${res.queued}`, description: res.skipped.length ? `${res.skipped.length} skipped (READY or already in queue)` : "Added to overnight AI queue" });
+      setSelectedOvernightIds(new Set());
+      void refetch();
+    } catch (err) {
+      toast({ title: "Queue failed", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    }
+  }
+
+  async function retrySelectedOvernight() {
+    const jobIds = selectedOvernightRows
+      .filter((e) => e.overnightAi?.canRetry && e.overnightAi.jobId)
+      .map((e) => e.overnightAi!.jobId as number);
+    if (jobIds.length === 0) {
+      toast({ title: "Nothing to retry", description: "Retry is only for ERROR jobs that are not already running." });
+      return;
+    }
+    try {
+      const res = await aiClient.retryOvernightJobs(jobIds);
+      toast({ title: `Retried ${res.retried}`, description: res.skippedInFlight ? `${res.skippedInFlight} skipped (already in flight)` : undefined });
+      setSelectedOvernightIds(new Set());
+      void refetch();
+    } catch (err) {
+      toast({ title: "Retry failed", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    }
+  }
+
+  async function cancelSelectedOvernight() {
+    const jobIds = selectedOvernightRows
+      .filter((e) => e.overnightAi?.canCancel && e.overnightAi.jobId)
+      .map((e) => e.overnightAi!.jobId as number);
+    const blocked = selectedOvernightRows.filter((e) => e.overnightAi?.displayStatus === "RUNNING").length;
+    if (jobIds.length === 0) {
+      toast({
+        title: "Cancel not available",
+        description: blocked ? "RUNNING jobs cannot be cancelled (Ollama request is in flight)." : "Select queued studies only.",
+      });
+      return;
+    }
+    try {
+      const res = await aiClient.cancelQueuedOvernight(jobIds);
+      toast({
+        title: `Cancelled ${res.cancelled}`,
+        description: res.skippedRunning ? `${res.skippedRunning} running jobs left untouched` : undefined,
+      });
+      setSelectedOvernightIds(new Set());
+      void refetch();
+    } catch (err) {
+      toast({ title: "Cancel failed", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    }
+  }
+
+  return (
+    <div className="h-full min-h-0 flex flex-col overflow-hidden">
+      <div className="shrink-0 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 px-2 sm:px-3 py-1 border-b border-border/60 bg-muted/15">
+        <div className="flex items-center gap-2 min-w-0">
+          <h1 className="text-sm font-bold tracking-tight text-foreground">Worklist Hub</h1>
+          <span className="text-[10px] text-muted-foreground hidden sm:inline truncate">RIS queue · PACS intake</span>
+        </div>
+      </div>
+
+      <Tabs defaultValue="pacs-worklist" className="flex-1 min-h-0 flex flex-col px-2 sm:px-3 pb-2 pt-1.5 gap-1.5 overflow-hidden">
+        <TabsList className="shrink-0 inline-flex h-8 w-full sm:w-auto p-0.5 gap-0.5 bg-muted/40 rounded-md border border-border/50">
+          <TabsTrigger
+            value="study-queue"
+            className="h-7 flex-1 sm:flex-none rounded px-2.5 text-xs font-medium gap-1.5 data-[state=active]:bg-background data-[state=active]:shadow-sm"
+          >
+            <ClipboardList size={13} />
+            <span>RIS Study Queue</span>
+          </TabsTrigger>
+          <TabsTrigger
+            value="pacs-worklist"
+            className="h-7 flex-1 sm:flex-none rounded px-2.5 text-xs font-medium gap-1.5 data-[state=active]:bg-background data-[state=active]:shadow-sm"
+          >
+            <ScanSearch size={13} />
+            <span>PACS Worklist</span>
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="study-queue" className="flex-1 min-h-0 overflow-y-auto mt-0 data-[state=inactive]:hidden">
+          <StudyQueuePanel />
+        </TabsContent>
+
+        <TabsContent value="pacs-worklist" className="flex-1 min-h-0 overflow-hidden mt-0 data-[state=inactive]:hidden">
+          <div className="h-full min-h-0 flex flex-col gap-1 overflow-hidden">
+
+            <div className="shrink-0 space-y-0.5 border-b border-border/40 pb-0.5" data-testid="pacs-worklist-toolbar">
+            <div className="flex flex-nowrap items-center gap-1 overflow-x-auto pb-0.5">
+              <PacsDebugPanel
+                entries={entries}
+                filtered={filtered}
+                isLoading={isLoading}
+                isError={isError}
+                error={error as Error | null}
+                lastRefresh={lastRefresh}
+                statusFilter={statusFilter}
+                modalityFilter={modalityFilter}
+                search={search}
+                dbTotalRows={countData?.totalRows ?? null}
+                onForceRefresh={() => void refetch()}
+                onClearCache={handleClearCache}
+                showSentinel={showSentinel}
+                onToggleSentinel={() => setShowSentinel((v) => !v)}
+              />
+              <span className="text-[11px] font-semibold text-muted-foreground whitespace-nowrap shrink-0">
+                PACS <span className="text-foreground tabular-nums">{entries.length}</span>
+                <span className="font-normal text-muted-foreground/80">
+                  {isLoading ? " · …" : filtered.length === entries.length ? "" : ` · ${filtered.length} shown`}
+                </span>
+              </span>
+              <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => void refetch()}>
+                <RefreshCw className="h-3 w-3 mr-1" /> Refresh
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => setShowWorkload((v) => !v)} data-testid="btn-workload">
+                {showWorkload ? "Hide workload" : "Workload"}
+              </Button>
+
+              <div className="relative w-[min(220px,28vw)] shrink-0">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                <Input
+                  className="h-7 pl-7 text-xs"
+                  placeholder="Search patient, accession..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+              <Select value={statusFilter} onValueChange={setStatusFilter}>
+                <SelectTrigger className="h-7 w-[118px] text-xs">
+                  <Filter className="h-3 w-3 mr-1 text-muted-foreground" />
+                  <SelectValue placeholder="Status" />
+                </SelectTrigger>
+                <SelectContent>
+                  {STATUS_OPTIONS.map((s) => (
+                    <SelectItem key={s} value={s}>{s === "all" ? "All Statuses" : toUnifiedStatus(s).label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <QueueModalityFilter
+                value={modalityFilter}
+                onChange={setModalityFilter}
+                size="sm"
+              />
+              <button
+                type="button"
+                data-testid="overnight-ai-drafts-filter"
+                onClick={() => toggleOvernightAiDrafts()}
+                className={`inline-flex items-center gap-1 h-7 px-2 rounded-md border text-[11px] font-medium transition shrink-0 ${
+                  aiDraftFilter === "overnight"
+                    ? "border-indigo-500 bg-indigo-600 text-white"
+                    : "border-border bg-background text-muted-foreground hover:bg-muted"
+                }`}
+                title="Overnight AI Drafts: QUEUED vs RUNNING from dicom_retry_queue. READY = draft available. Does not change ordinary worklist sorting."
+              >
+                <Sparkles className="h-3 w-3" />
+                Overnight AI
+              </button>
+              <Select value={aiComposeFilter} onValueChange={(v) => setAiComposeFilter(v as typeof aiComposeFilter)}>
+                <SelectTrigger className="h-7 w-[130px] text-xs" data-testid="ai-compose-filter">
+                  <SelectValue placeholder="AI Report" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">AI Report: All</SelectItem>
+                  <SelectItem value="ready">AI Ready</SelectItem>
+                  <SelectItem value="processing">AI Processing</SelectItem>
+                  <SelectItem value="failed">AI Failed</SelectItem>
+                  <SelectItem value="none">Not requested</SelectItem>
+                </SelectContent>
+              </Select>
+              <button
+                type="button"
+                data-testid="sort-ai-compose"
+                onClick={() => setSortAiCompose((v) => !v)}
+                className={`inline-flex items-center gap-1 h-7 px-2 rounded-md border text-[11px] font-medium transition shrink-0 ${
+                  sortAiCompose
+                    ? "border-emerald-500 bg-emerald-600 text-white"
+                    : "border-border bg-background text-muted-foreground hover:bg-muted"
+                }`}
+                title="Explicit Sort AI status: READY → COMPOSING → QUEUED → FAILED/STALE. Does not change global clinical ordering when off."
+              >
+                Sort AI status
+              </button>
+              <span
+                className="text-[10px] text-muted-foreground whitespace-nowrap hidden lg:inline"
+                data-testid="ai-draft-summary"
+              >
+                {overnightMode
+                  ? `Q ${aiDraftCounts.queued} · R ${aiDraftCounts.running} · ✓ ${aiDraftCounts.ready} · ∅ ${aiDraftCounts.empty} · Qz ${aiDraftCounts.quarantined} · ! ${aiDraftCounts.error}`
+                  : `AI ${aiDraftCounts.ready} ready · ${aiDraftCounts.empty} empty · ${aiDraftCounts.quarantined} qz · ${aiDraftCounts.error} err · ${aiDraftCounts.queued + aiDraftCounts.processing} proc`}
+              </span>
+              <Select value={lockFilter} onValueChange={setLockFilter}>
+                <SelectTrigger className="h-7 w-[108px] text-xs">
+                  <SelectValue placeholder="Lock" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Locks</SelectItem>
+                  <SelectItem value="available">🟢 Available</SelectItem>
+                  <SelectItem value="mine">🟡 Opened by You</SelectItem>
+                  <SelectItem value="locked">🔴 Locked by Others</SelectItem>
+                </SelectContent>
+              </Select>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-7 px-2 text-[11px] gap-1">
+                    <Columns2 className="h-3 w-3" />
+                    Cols
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-56 p-2">
+                  <p className="text-xs font-semibold text-muted-foreground px-2 py-1">Show columns</p>
+                  <div className="max-h-64 overflow-y-auto space-y-0.5">
+                    {(Object.keys(WORKLIST_COL_LABELS) as WorklistOptionalColumn[]).map((key) => (
+                      <label key={key} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted/50 cursor-pointer text-sm">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5"
+                          checked={col[key]}
+                          onChange={() => toggleColumn(key)}
+                        />
+                        {WORKLIST_COL_LABELS[key]}
+                      </label>
+                    ))}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="w-full mt-1 h-7 text-xs"
+                    onClick={() => {
+                      setColumnVisibility({ ...WORKLIST_COL_DEFAULTS });
+                      saveWorklistColumnVisibility({ ...WORKLIST_COL_DEFAULTS });
+                    }}
+                  >
+                    Reset to defaults
+                  </Button>
+                </PopoverContent>
+              </Popover>
+              {(statusFilter !== "all" || modalityFilter !== "all" || lockFilter !== "all" || aiDraftFilter !== "all" || search || dateFrom || dateTo) && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => { setSearch(""); setStatusFilter("all"); setModalityFilter("all"); setLockFilter("all"); setAiDraftFilter("all"); setDateFrom(""); setDateTo(""); }}
+                >
+                  Clear
+                </Button>
+              )}
+
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-7 px-2 text-[11px] gap-1 ml-auto shrink-0">
+                    <CalendarDays className="h-3 w-3" />
+                    {dateFrom || dateTo
+                      ? `${dateFrom ? dateFrom.slice(5) : "…"}→${dateTo ? dateTo.slice(5) : "…"}`
+                      : "Dates"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="end" className="w-auto p-2">
+                  <div className="flex items-center gap-1.5">
+                    <Input
+                      type="date"
+                      value={dateFrom}
+                      onChange={(e) => setDateFrom(e.target.value)}
+                      className="h-7 w-[118px] text-xs"
+                    />
+                    <span className="text-muted-foreground text-[10px]">→</span>
+                    <Input
+                      type="date"
+                      value={dateTo}
+                      onChange={(e) => setDateTo(e.target.value)}
+                      className="h-7 w-[118px] text-xs"
+                    />
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {DATE_PRESETS.map((p) => (
+                      <Button
+                        key={p.label}
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-[10px] px-1.5"
+                        onClick={() => setDatePreset(p.from(), p.to())}
+                      >
+                        {p.label}
+                      </Button>
+                    ))}
+                  </div>
+                  <label className="mt-2 flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={searchOrthanc}
+                      onChange={(e) => setSearchOrthanc(e.target.checked)}
+                      className="h-3 w-3"
+                      data-testid="search-orthanc-archive"
+                    />
+                    Search Orthanc archive (back dates)
+                  </label>
+                </PopoverContent>
+              </Popover>
+
+              {Object.entries(STATUS_CONFIG).map(([key, cfg]) => {
+                const count = entries.filter((e) => e.status === key).length;
+                if (count === 0) return null;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => setStatusFilter(statusFilter === key ? "all" : key)}
+                    className={`inline-flex items-center gap-0.5 px-1.5 h-6 rounded-full text-[10px] font-medium border cursor-pointer transition-opacity shrink-0 ${cfg.color} ${statusFilter === key ? "opacity-100 ring-1 ring-offset-0 ring-current" : "opacity-80 hover:opacity-100"}`}
+                  >
+                    {cfg.icon} {cfg.label} ({count})
+                  </button>
+                );
+              })}
+              {entries.filter((e) => e.status === "STUDY_RECEIVED").length > 0 && (
+                <button
+                  type="button"
+                  data-testid="dicom-intake-filter"
+                  onClick={() => setStatusFilter(statusFilter === "STUDY_RECEIVED" ? "all" : "STUDY_RECEIVED")}
+                  className="inline-flex items-center gap-0.5 px-1.5 h-6 rounded-full text-[10px] font-semibold border border-sky-300 bg-sky-50 text-sky-900 shrink-0"
+                  title="DICOM intake — studies just received from PACS/modality"
+                >
+                  <Database className="h-3 w-3" />
+                  Intake ({entries.filter((e) => e.status === "STUDY_RECEIVED").length})
+                </button>
+              )}
+            </div>
+
+            {unlinkedPacsCount > 0 && (
+              <div className="flex flex-wrap items-center gap-2 px-2 py-1 rounded-md bg-orange-50 border border-orange-200 dark:bg-orange-950/30 dark:border-orange-800 text-[11px] text-orange-900 dark:text-orange-200">
+                <AlertCircle className="h-3.5 w-3.5 shrink-0 text-orange-600" />
+                <span className="font-semibold shrink-0">{unlinkedPacsCount} unlinked</span>
+                <span className="text-orange-800/90 dark:text-orange-300/90 truncate min-w-0 hidden md:inline" title="Images can exist in Orthanc while Bill column stays —. Auto-link matches by accession (MWL work id); if the modality did not use MWL, open DICOM Match Center and link manually.">
+                  Bill column — until linked · auto-link by accession or use DICOM Match
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-6 px-2 text-[10px] shrink-0 border-orange-300 text-orange-900 hover:bg-orange-100 dark:border-orange-700 dark:text-orange-200"
+                  disabled={autoLinking}
+                  onClick={() => void autoLinkUnlinkedBills()}
+                  data-testid="pacs-auto-link-bills"
+                >
+                  {autoLinking ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
+                  Auto-link
+                </Button>
+                <Link
+                  href="/radiology/my-collection?filter=unbilled"
+                  className="text-[10px] font-semibold text-orange-800 dark:text-orange-300 underline shrink-0 hover:text-orange-900"
+                >
+                  DICOM Match →
+                </Link>
+              </div>
+            )}
+
+            {overnightMode && (
+              <div className="flex flex-wrap items-center gap-1.5" data-testid="overnight-ai-drafts-filters">
+                <span className="text-[9px] uppercase tracking-wide text-muted-foreground">Age</span>
+                {OVERNIGHT_AGE_CHIPS.map((chip) => (
+                  <button
+                    key={chip.id}
+                    type="button"
+                    onClick={() => setOvernightAgeChip(chip.id)}
+                    className={`h-6 px-1.5 rounded border text-[10px] ${
+                      overnightAgeChip === chip.id
+                        ? "border-indigo-500 bg-indigo-600 text-white"
+                        : "border-border bg-background text-muted-foreground"
+                    }`}
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+                <span className="text-[9px] uppercase tracking-wide text-muted-foreground ml-1">AI</span>
+                {OVERNIGHT_STATUS_CHIPS.map((chip) => (
+                  <button
+                    key={chip.id}
+                    type="button"
+                    onClick={() => setOvernightStatusChip(chip.id)}
+                    className={`h-6 px-1.5 rounded border text-[10px] ${
+                      overnightStatusChip === chip.id
+                        ? "border-indigo-500 bg-indigo-600 text-white"
+                        : "border-border bg-background text-muted-foreground"
+                    }`}
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+                {selectedOvernightIds.size > 0 && (
+                  <span className="flex flex-wrap items-center gap-1 ml-auto">
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => void queueSelectedOvernight()}>
+                      Queue selected
+                    </Button>
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => void retrySelectedOvernight()}>
+                      Retry errors
+                    </Button>
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => void cancelSelectedOvernight()}>
+                      Cancel queued
+                    </Button>
+                  </span>
+                )}
+              </div>
+            )}
+
+            {showWorkload && (
+              <div className="rounded-md border p-2 bg-muted/10 text-xs" data-testid="workload-panel">
+                <div className="text-xs font-semibold mb-2">
+                  Radiologist workload
+                  <span className="text-muted-foreground font-normal ml-2">
+                    {workload ? `${workload.unassignedPending} unassigned pending` : "loading…"}
+                  </span>
+                </div>
+                {workload && (
+                  <table className="text-xs w-full max-w-2xl">
+                    <thead>
+                      <tr className="text-left text-muted-foreground">
+                        <th className="pr-4 py-0.5 font-medium">Radiologist</th>
+                        <th className="pr-4 py-0.5 font-medium">Assigned</th>
+                        <th className="pr-4 py-0.5 font-medium">Locked now</th>
+                        <th className="pr-4 py-0.5 font-medium">Done today</th>
+                        <th className="pr-4 py-0.5 font-medium">Avg pending age</th>
+                        <th className="pr-4 py-0.5 font-medium">Parked</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {workload.radiologists.map((r) => (
+                        <tr key={r.radiologistId}>
+                          <td className="pr-4 py-0.5">{r.radiologistName}</td>
+                          <td className="pr-4 py-0.5">{r.assignedPending}</td>
+                          <td className="pr-4 py-0.5">{r.lockedNow}</td>
+                          <td className="pr-4 py-0.5">{r.completedToday}</td>
+                          <td className="pr-4 py-0.5">{r.avgPendingAgeHours != null ? `${r.avgPendingAgeHours} h` : "—"}</td>
+                          <td className="pr-4 py-0.5 text-muted-foreground">
+                            {/* Parked state is browser-local (M1.5) — only this
+                                workstation's own count is truthfully knowable. */}
+                            {r.radiologistId === session?.user?.id
+                              ? (() => { try { return (JSON.parse(localStorage.getItem("radiology_parked_studies_v1") ?? "[]") as unknown[]).length; } catch { return 0; } })()
+                              : "n/a"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+
+            </div>
+
+            {/* Table */}
+            {isLoading ? (
+              <div className="flex items-center justify-center flex-1 py-16">
+                <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground" />
+              </div>
+            ) : trulyEmpty && !showSentinel ? (
+              <div className="flex flex-col items-center justify-center flex-1 py-16 gap-3 text-muted-foreground">
+                <ScanSearch className="h-12 w-12" />
+                <p className="text-base font-semibold">No PACS studies found</p>
+                <p className="text-sm max-w-md text-center">
+                  {(countData?.totalRows ?? 0) === 0
+                    ? "The radiology_worklist table is empty. Push a study via your DICOM agent / Conquest PACS to see entries here."
+                    : `DB has ${countData?.totalRows} rows but API returned 0. Check auth token / filters above.`
+                  }
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowSentinel(true)}
+                  className="mt-1"
+                >
+                  Show sentinel row (render test)
+                </Button>
+              </div>
+            ) : filteredEmpty ? (
+              <div className="flex flex-col items-center justify-center flex-1 py-16 gap-2 text-muted-foreground">
+                <ScanSearch className="h-10 w-10" />
+                <p className="text-sm font-semibold">No studies match your filters</p>
+                <p className="text-xs">
+                  {entries.length} loaded
+                  {countData?.totalRows != null ? ` · ${countData.totalRows} total in database` : ""}.
+                  {includeOrthanc ? " Orthanc archive included." : ""}
+                  {" "}Try clearing search, widening dates, or enabling Orthanc archive.
+                </p>
+                <Button variant="outline" size="sm" className="mt-2" onClick={() => { setSearch(""); setStatusFilter("all"); setModalityFilter("all"); }}>
+                  Clear All Filters
+                </Button>
+              </div>
+            ) : (
+              <div className="overflow-x-auto overflow-y-auto flex-1 min-h-0 rounded-lg border shadow-sm">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-muted/40 text-left border-b">
+                      {showSentinel && <th className={`${WORKLIST_TH} text-orange-600`}>⚠ Debug</th>}
+                      {overnightMode && <th className={`${WORKLIST_TH} w-8`}></th>}
+                      <th className={`${WORKLIST_TH} min-w-[160px] sticky left-0 z-30 bg-muted/40 border-r border-border/50`}>Patient</th>
+                      <th className={WORKLIST_TH}>Bill</th>
+                      <th className={`${WORKLIST_TH} min-w-[180px]`}>Study</th>
+                      {col.studyDate && <th className={`${WORKLIST_TH} tabular-nums`}>Study Date</th>}
+                      <th className={WORKLIST_TH}>Priority</th>
+                      <th className={WORKLIST_TH}>Status</th>
+                      {col.measurements && <th className={`${WORKLIST_TH} text-center`}>Meas.</th>}
+                      {col.images && <th className={`${WORKLIST_TH} text-center`}>Img</th>}
+                      {col.usgReport && <th className={WORKLIST_TH}>USG Rpt</th>}
+                      {col.studyDescription && <th className={`${WORKLIST_TH} max-w-[160px]`}>Study Desc</th>}
+                      {col.refDoctor && <th className={WORKLIST_TH}>Ref. Dr</th>}
+                      {col.accession && <th className={WORKLIST_TH}>Accession</th>}
+                      {col.sourceAe && <th className={WORKLIST_TH}>Source AE</th>}
+                      {col.radiologist && <th className={WORKLIST_TH}>Radiologist</th>}
+                      {col.lockStatus && <th className={WORKLIST_TH}>Lock</th>}
+                      {col.aiDraft && <th className={WORKLIST_TH}>AI</th>}
+                      {col.createdAt && <th className={`${WORKLIST_TH} text-right`}>Received</th>}
+                      <th className={`${WORKLIST_TH} text-right sticky right-0 z-30 bg-muted/40 border-l border-border/50`}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border/60">
+                    {tableRows.map((entry) => (
+                      <tr
+                        key={entry.id}
+                        className={`group hover:bg-muted/25 transition-colors ${entry.id === -1 ? "bg-orange-50 dark:bg-orange-950/20" : (urgentHighlightOn && priorityInfo(entry.priority).highlight) ? "bg-red-50/50 dark:bg-red-950/10" : ""}`}
+                      >
+                        {showSentinel && (
+                          <td className={`${WORKLIST_TD} text-xs text-orange-600 font-mono`}>
+                            {entry.id === -1 ? "SENTINEL" : "real"}
+                          </td>
+                        )}
+                        {overnightMode && (
+                          <td className={`${WORKLIST_TD} w-8`}>
+                            {entry.id === -1 ? null : (
+                              <input
+                                type="checkbox"
+                                className="h-3.5 w-3.5"
+                                checked={selectedOvernightIds.has(entry.id)}
+                                onChange={() => toggleOvernightSelect(entry.id)}
+                                aria-label={`Select ${entry.patientName} for overnight AI`}
+                              />
+                            )}
+                          </td>
+                        )}
+                        <td className={`${WORKLIST_TD} min-w-[160px] sticky left-0 z-10 bg-background group-hover:bg-muted/25 border-r border-border/40`}>
+                          {(() => {
+                            const ageSex = formatWorklistAgeSex(entry);
+                            const uhid = formatWorklistUhid(entry);
+                            return (
+                              <div className="flex flex-col gap-0.5">
+                                <span className="font-semibold text-sm leading-snug text-foreground">{entry.patientName}</span>
+                                {ageSex && (
+                                  <span className="text-[11px] text-muted-foreground leading-tight">{ageSex}</span>
+                                )}
+                                {uhid && (
+                                  <span className="font-mono text-[10px] text-muted-foreground/90 leading-tight" title={entry.dicomPatientId ?? undefined}>
+                                    UHID {uhid}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
+                        </td>
+                        <td className={`${WORKLIST_TD} font-mono text-xs whitespace-nowrap`}>
+                          {entry.billNumber ? (
+                            <span className="inline-flex items-center rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300">
+                              {entry.billNumber}
+                            </span>
+                          ) : entry.studyId == null ? (
+                            <span
+                              className="text-[10px] font-medium text-orange-700 dark:text-orange-300"
+                              title="PACS row not linked to a billed radiology study — bill may still exist in Billing Desk"
+                            >
+                              Unlinked
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">{"\u2014"}</span>
+                          )}
+                        </td>
+                        <td className={`${WORKLIST_TD} min-w-[180px] max-w-[280px]`}>
+                          <div className="flex flex-col gap-1.5">
+                            <span className="text-sm font-medium leading-snug line-clamp-2" title={displayTestName(entry)}>
+                              {displayTestName(entry)}
+                            </span>
+                            <Badge variant="outline" className={`w-fit font-mono text-[10px] px-1.5 py-0 ${worklistModalityBadgeClass(entry.modality)}`}>
+                              {entry.modality}
+                            </Badge>
+                          </div>
+                        </td>
+                        {col.studyDate && (
+                        <td className={`${WORKLIST_TD} text-muted-foreground text-xs whitespace-nowrap tabular-nums`}>
+                          {formatWorklistStudyDate(entry.studyDate)}
+                        </td>
+                        )}
+                        <td className={`${WORKLIST_TD} whitespace-nowrap`}>
+                          {(() => { const pr = priorityInfo(entry.priority); return (
+                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded border text-[10px] font-semibold ${pr.color}`}>
+                              {pr.label}
+                            </span>
+                          ); })()}
+                        </td>
+                        <td className={`${WORKLIST_TD} whitespace-nowrap`}>
+                          <StatusBadge status={entry.status} deliveryStatus={entry.deliveryStatus} />
+                          {entry.status !== "REPORT_FINAL" && entry.status !== "DELIVERED" && (() => {
+                            const threshold = Number(pacsViewerSettings["radiology_aging_alert_hours"] ?? "4") || 4;
+                            const hrs = agingHours(entry.createdAt);
+                            if (hrs < threshold) return null;
+                            return (
+                              <span
+                                title={`Waiting ${hrs.toFixed(1)}h since received — configurable in Radiology Settings`}
+                                className="ml-1 inline-flex items-center px-1.5 py-0.5 rounded border text-[10px] font-semibold bg-red-50 text-red-700 border-red-200 dark:bg-red-950/30 dark:text-red-400 dark:border-red-900"
+                              >
+                                {hrs >= 24 ? `${Math.floor(hrs / 24)}d` : `${Math.floor(hrs)}h`}
+                              </span>
+                            );
+                          })()}
+                        </td>
+                        {col.measurements && (
+                        <td className="px-2 py-2 whitespace-nowrap text-center">
+                          {entry.id !== -1 && isUltrasoundModality(entry.modality) ? (() => {
+                            const count = entry.usgMeasurementCount ?? 0;
+                            const target = entry.id != null
+                              ? `/radiology/report/${entry.id}`
+                              : entry.studyInstanceUID
+                                ? `/radiology/usg-measurements/${entry.studyInstanceUID}`
+                                : null;
+                            const badge = (
+                              <UsgCountBadge
+                                count={count}
+                                color="bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/30 dark:text-teal-400 dark:border-teal-900"
+                              />
+                            );
+                            if (!target) return badge;
+                            return (
+                              <button
+                                type="button"
+                                className="inline-flex hover:opacity-80 transition-opacity"
+                                onClick={() => navigate(target)}
+                                title="Open USG measurements"
+                              >
+                                {badge}
+                              </button>
+                            );
+                          })() : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        )}
+                        {col.images && (
+                        <td className="px-2 py-2 whitespace-nowrap text-center">
+                          {entry.id !== -1 && isUltrasoundModality(entry.modality) ? (
+                            <UsgCountBadge
+                              count={entry.usgKeyImageCount ?? 0}
+                              color="bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-900/40 dark:text-slate-300 dark:border-slate-700"
+                            />
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        )}
+                        {col.usgReport && (
+                        <td className="px-2 py-2 whitespace-nowrap">
+                          {entry.id !== -1 && isUltrasoundModality(entry.modality) ? (
+                            <UsgReportStatusBadge status={entry.usgReportStatus} />
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        )}
+                        {col.studyDescription && (
+                        <td className="px-3 py-2 max-w-[160px] truncate text-xs" title={entry.studyDescription ?? ""}>
+                          {entry.studyDescription || "\u2014"}
+                        </td>
+                        )}
+                        {col.refDoctor && (
+                        <td className="px-3 py-2 text-xs whitespace-nowrap max-w-[120px] truncate" title={entry.referringDoctor ?? ""}>
+                          {entry.referringDoctor ?? "\u2014"}
+                        </td>
+                        )}
+                        {col.accession && (
+                        <td className="px-3 py-2 font-mono text-xs whitespace-nowrap">{entry.accessionNumber}</td>
+                        )}
+                        {col.sourceAe && (
+                        <td className="px-3 py-2 text-muted-foreground text-xs whitespace-nowrap">
+                          {entry.sourceAeTitle ?? entry.aeTitle ?? "\u2014"}
+                        </td>
+                        )}
+                        {col.radiologist && (
+                        <td className="px-3 py-2 text-xs whitespace-nowrap max-w-[100px] truncate" title={entry.assignedRadiologist ?? ""}>
+                          {entry.assignedRadiologist ?? "\u2014"}
+                        </td>
+                        )}
+                        {col.lockStatus && (
+                        <td className="px-3 py-2 whitespace-nowrap">
+                          <div className="flex flex-col gap-1">
+                            <LockBadge entry={entry} currentUserId={session?.user?.id} />
+                            {entry.id !== -1 && (
+                              <select
+                                className="h-6 max-w-[130px] text-[10px] border rounded px-1 bg-background text-muted-foreground"
+                                value={(entry as { assignedRadiologistId?: number | null }).assignedRadiologistId ?? ""}
+                                disabled={assignMutation.isPending || entry.status === "REPORT_FINAL" || entry.status === "DELIVERED"}
+                                title={(() => {
+                                  const e = entry as { assignedAt?: string | null; assignedByName?: string | null };
+                                  return e.assignedAt
+                                    ? `Assigned ${new Date(e.assignedAt).toLocaleString()}${e.assignedByName ? ` by ${e.assignedByName}` : ""}`
+                                    : entry.assignedRadiologist
+                                      ? `Assigned to ${entry.assignedRadiologist} (legacy, no timestamp)`
+                                      : "Unassigned — pick a radiologist to assign";
+                                })()}
+                                onChange={(ev) => {
+                                  const v = ev.target.value;
+                                  assignMutation.mutate({ worklistId: entry.id, radiologistId: v === "" ? null : Number(v) });
+                                }}
+                                data-testid={`assign-select-${entry.id}`}
+                              >
+                                <option value="">
+                                  {(entry as { assignedRadiologistId?: number | null }).assignedRadiologistId == null && entry.assignedRadiologist
+                                    ? `Unassigned (was: ${entry.assignedRadiologist})`
+                                    : "Unassigned"}
+                                </option>
+                                {radiologists.map((r) => (
+                                  <option key={r.id} value={r.id}>{r.name}</option>
+                                ))}
+                              </select>
+                            )}
+                          </div>
+                        </td>
+                        )}
+                        {col.aiDraft && (
+                        <td className="px-3 py-2 whitespace-nowrap">
+                          {entry.id === -1 ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            <div className="flex flex-col gap-1 items-start">
+                              <OvernightAiDraftCell
+                                entry={entry}
+                                overnightMode={overnightMode}
+                                onViewDraft={() => viewAiDraft(entry.id)}
+                                onHelpful={() => submitFeedback(entry.id, "helpful")}
+                                onNeedsImprovement={() => submitFeedback(entry.id, "needs_improvement")}
+                                onRetry={entry.overnightAi?.canRetry && entry.overnightAi.jobId
+                                  ? () => { void aiClient.retryOvernightJobs([entry.overnightAi!.jobId as number]).then(() => refetch()); }
+                                  : undefined}
+                              />
+                              {entry.aiComposeStatus && entry.aiComposeStatus !== "NONE" && (
+                                <span
+                                  className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold ${AI_COMPOSE_STATUS_STYLE[entry.aiComposeStatus]?.color ?? AI_COMPOSE_STATUS_STYLE.NONE.color}`}
+                                  title="Background AI Report Composer (text)"
+                                  data-testid="ai-compose-badge"
+                                >
+                                  {AI_COMPOSE_STATUS_STYLE[entry.aiComposeStatus]?.label ?? entry.aiComposeStatus}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        )}
+                        {col.createdAt && (
+                        <td className="px-3 py-2 text-muted-foreground text-xs whitespace-nowrap text-right tabular-nums">
+                          {fmtDate(entry.createdAt)}
+                        </td>
+                        )}
+                        <td className={`${WORKLIST_TD} sticky right-0 z-10 bg-background group-hover:bg-muted/25 border-l border-border/50 shadow-[-4px_0_8px_-4px_rgba(0,0,0,0.08)] min-w-[260px]`}>
+                          <div className="flex flex-nowrap items-stretch justify-end gap-0.5 ml-auto" data-testid="worklist-actions-row">
+                            {entry.id !== -1 && !isReceptionView && (
+                              <>
+                                <WorklistActionBtn
+                                  icon={Tv2}
+                                  label="Weasis"
+                                  tone={preferWeasis ? "weasis" : "neutral"}
+                                  disabled={!canLaunchViewer(entry)}
+                                  title={canLaunchViewer(entry) ? "Open in Weasis" : "Study UID missing — cannot launch Weasis"}
+                                  onClick={() => void launchWorklistWeasis(entry)}
+                                />
+                                {isRadView && may("/radiology/report") && (
+                                  <WorklistActionBtn
+                                    icon={Maximize2}
+                                    label="Focus"
+                                    tone="report"
+                                    title="Open Reporting Workspace in focus mode (maximized editor)"
+                                    onClick={() => navigate(reportingWorkspacePath(entry.id, { focus: true }))}
+                                  />
+                                )}
+                                <WorklistActionBtn
+                                  icon={MonitorPlay}
+                                  label="OHIF"
+                                  tone={!preferWeasis ? "ohif" : "neutral"}
+                                  disabled={!canLaunchViewer(entry)}
+                                  title={canLaunchViewer(entry) ? "Open in OHIF" : "Study UID missing — cannot launch OHIF"}
+                                  onClick={() => void launchViewer(entry.studyInstanceUID, "OHIF", pacsViewerSettings, toast)}
+                                />
+                              </>
+                            )}
+
+                            {entry.status !== "REPORT_FINAL" && entry.status !== "DELIVERED" && entry.id !== -1 && isRadView && (
+                              <WorklistActionBtn
+                                icon={Sparkles}
+                                label="AI"
+                                tone="ai"
+                                disabled={aiDraftMutation.isPending}
+                                title="Generate AI Draft"
+                                onClick={() => aiDraftMutation.mutate(entry)}
+                              />
+                            )}
+
+                            {entry.id !== -1 && isOwnerView && (
+                              <WorklistActionBtn
+                                icon={Activity}
+                                label="Command"
+                                tone="cc"
+                                title="Open in Command Center"
+                                onClick={() => navigate(`/radiology/command-center/${entry.id}`)}
+                              />
+                            )}
+
+                            {entry.id !== -1 && isRadView && may("/radiology/report") && (
+                              <WorklistActionBtn
+                                icon={Stethoscope}
+                                label="Report"
+                                tone="report"
+                                title="Open in the Reporting Workspace"
+                                onClick={() => navigate(reportingWorkspacePath(entry.id))}
+                              />
+                            )}
+
+                            {(entry.status === "REPORT_IN_PROGRESS" || entry.status === "AI_DRAFT_READY") && entry.id !== -1 && isOwnerView && (
+                              <WorklistActionBtn
+                                icon={CheckCircle2}
+                                label="Final"
+                                tone="warn"
+                                disabled={markFinalMutation.isPending}
+                                title="Admin only — mark FINAL without signed report (audited)"
+                                onClick={() => {
+                                  const reason = window.prompt(
+                                    `Admin override: mark ${entry.accessionNumber} FINAL without workspace Finalize & Sign?\n\nEnter reason (external report attached / emergency):`,
+                                  );
+                                  if (reason && reason.trim().length >= 3) {
+                                    markFinalMutation.mutate({ entry, reason: reason.trim() });
+                                  }
+                                }}
+                              />
+                            )}
+
+                            {entry.status === "REPORT_FINAL" && (
+                              <span className="inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border border-green-300 bg-green-50 text-green-800 w-[46px] h-[40px] text-[9px] font-semibold shrink-0 dark:bg-green-950/30 dark:text-green-300 dark:border-green-800">
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                Final
+                              </span>
+                            )}
+
+                            {entry.id !== -1 && isRadView &&
+                              (entry.reportId != null || entry.status === "REPORT_IN_PROGRESS" || entry.status === "REPORT_FINAL") && (
+                              <WorklistActionBtn
+                                icon={Gem}
+                                label="Print UI"
+                                tone="warn"
+                                title="Open Reporting Workspace print / layout tab"
+                                onClick={() => navigate(`/radiology/report/${entry.id}?tab=print`)}
+                              />
+                            )}
+
+                            {entry.id !== -1 && entry.reportId != null && (
+                              <WorklistActionBtn
+                                icon={Printer}
+                                label="Print"
+                                tone="neutral"
+                                title="Print / Share report"
+                                onClick={() => void openPrintReport(entry.reportId!)}
+                              />
+                            )}
+
+                            {entry.id !== -1 && entry.studyId != null && (
+                              attachingStudyId === entry.studyId ? (
+                                <div className="inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border border-border bg-muted/30 w-[46px] h-[40px] text-[9px] text-muted-foreground shrink-0">
+                                  <Loader2 size={14} className="animate-spin text-primary" />
+                                  Wait
+                                </div>
+                              ) : (
+                                <>
+                                  <input
+                                    type="file"
+                                    accept=".pdf,.doc,.docx"
+                                    id={`attach-report-${entry.studyId}`}
+                                    className="hidden"
+                                    onChange={(e) => handleAttachReport(entry.studyId as number, e)}
+                                  />
+                                  <WorklistActionBtn
+                                    icon={FileUp}
+                                    label="Attach"
+                                    tone="neutral"
+                                    title="Attach the final report (Word/PDF) produced outside this app"
+                                    onClick={() => document.getElementById(`attach-report-${entry.studyId}`)?.click()}
+                                  />
+                                </>
+                              )
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="shrink-0 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 border-t border-border/60 px-1 py-0.5 text-[10px] text-muted-foreground">
+              <button
+                type="button"
+                className="text-[10px] text-primary underline-offset-2 hover:underline"
+                onClick={() => setShowRawJson((v) => !v)}
+              >
+                {showRawJson ? "Hide raw API" : "Raw API"}
+              </button>
+              <span className="tabular-nums">
+                {filtered.length}/{entries.length} shown
+                {entries.length > 0 && <span className="hidden sm:inline"> · 30s refresh</span>}
+              </span>
+              <span className="text-amber-800 truncate min-w-0" title="AI drafts require radiologist review before delivery">
+                Safety: AI drafts need review — finalize in Reporting Workspace
+              </span>
+            </div>
+            {showRawJson && (
+              <pre className="shrink-0 max-h-40 overflow-auto border-t border-border bg-muted/30 p-2 text-[10px] text-foreground">
+                {JSON.stringify(entries, null, 2)}
+              </pre>
+            )}
+          </div>
+        </TabsContent>
+      </Tabs>
+
+      {/* Phase 8: AI Draft Viewer Dialog */}
+      <Dialog open={!!draftViewer} onOpenChange={() => setDraftViewer(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="text-sm flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-purple-500" /> AI Draft Viewer
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              AI Draft — Requires Radiologist Review
+            </DialogDescription>
+          </DialogHeader>
+          {(() => {
+            const viewed = normalizeWorklistAiDraftViewer(draftViewer?.draft);
+            const techJson = viewed.technical
+              ? JSON.stringify(viewed.technical, null, 2)
+              : null;
+            return (
+              <div className="space-y-3 text-sm">
+                {!draftViewer?.draft ? (
+                  <p className="text-muted-foreground">No draft stored for this study.</p>
+                ) : viewed.clinicalStatus === "QUARANTINED" ? (
+                  <div className="rounded border border-amber-300 bg-amber-50/80 p-3 text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100 space-y-2">
+                    <p className="font-medium text-xs">
+                      AI produced {viewed.candidateCount || viewed.quarantinedCount} candidate finding(s).
+                      {" "}0 accepted. {viewed.quarantinedCount || viewed.candidateCount} withheld by grounding/safety checks.
+                    </p>
+                    <p className="text-xs">
+                      {viewed.emptyReasonLabel ?? "No usable impression remained after trust validation."}
+                    </p>
+                    {viewed.quarantineReasonClasses.length > 0 && (
+                      <div className="text-[11px] space-y-1">
+                        <div className="font-semibold uppercase tracking-wide text-amber-800/80">Withheld reasons</div>
+                        <ul className="list-disc pl-4">
+                          {viewed.quarantineReasonClasses.map((r) => (
+                            <li key={r.reason}>{r.reason}{r.count > 1 ? ` ×${r.count}` : ""}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <p className="text-[11px] text-muted-foreground">Accept is unavailable — nothing usable to insert.</p>
+                    {draftViewer?.id != null && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setDraftViewer(null);
+                          navigate(reportingWorkspacePath(draftViewer.id));
+                        }}
+                      >
+                        Open Reporting Workspace (manual draft)
+                      </Button>
+                    )}
+                    {techJson && (
+                      <details className="text-[10px] text-muted-foreground">
+                        <summary className="cursor-pointer">Technical details</summary>
+                        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2">{techJson}</pre>
+                      </details>
+                    )}
+                  </div>
+                ) : !viewed.usable ? (
+                  <div className="rounded border border-slate-300 bg-slate-50/90 p-3 text-slate-900 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 space-y-2">
+                    <p className="font-medium text-xs">AI processing completed, but no usable draft was produced.</p>
+                    <p className="text-xs">
+                      Reason: {viewed.emptyReasonLabel
+                        ?? (viewed.imageCount === 0
+                          ? "No images were available for vision inference."
+                          : "No candidate findings / model returned empty.")}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Status is EMPTY (not READY). Accept is unavailable.
+                    </p>
+                    {draftViewer?.id != null && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setDraftViewer(null);
+                          navigate(reportingWorkspacePath(draftViewer.id));
+                        }}
+                      >
+                        Open Reporting Workspace (manual draft)
+                      </Button>
+                    )}
+                    {techJson && (
+                      <details className="text-[10px] text-muted-foreground">
+                        <summary className="cursor-pointer">Technical details</summary>
+                        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2">{techJson}</pre>
+                      </details>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded border bg-muted/40 p-3 max-h-96 overflow-y-auto space-y-3">
+                    {viewed.degraded && (
+                      <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                        Degraded draft (deterministic / limited inference).
+                      </p>
+                    )}
+                    <div>
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        Findings{viewed.findingCount > 0 ? ` (${viewed.findingCount})` : ""}
+                      </div>
+                      {viewed.findings.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No grounded findings — impression only.</p>
+                      ) : (
+                        <ul className="space-y-2">
+                          {viewed.findings.map((f, i) => (
+                            <li key={f.key ?? i} className="text-sm whitespace-pre-wrap leading-relaxed">
+                              {f.text}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                    {viewed.impression.length > 0 && (
+                      <div>
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                          Impression
+                        </div>
+                        <ul className="list-disc pl-4 space-y-1">
+                          {viewed.impression.map((line, i) => (
+                            <li key={i} className="text-sm leading-relaxed">{line}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {(viewed.provenanceLine || viewed.draftId != null) && (
+                      <div className="border-t pt-2 text-[10px] text-muted-foreground">
+                        {[
+                          viewed.draftId != null ? `draft #${viewed.draftId}` : null,
+                          viewed.version != null ? `v${viewed.version}` : null,
+                          viewed.provenanceLine,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </div>
+                    )}
+                    {draftViewer?.id != null && (
+                      <Button
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setDraftViewer(null);
+                          navigate(reportingWorkspacePath(draftViewer.id, { ai: true }));
+                        }}
+                      >
+                        Accept into Reporting Workspace
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </DialogContent>
+      </Dialog>
+
+      {/* Phase 11: Feedback Text Dialog */}
+      <Dialog open={!!feedbackEntry} onOpenChange={() => { setFeedbackEntry(null); setFeedbackText(""); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm">AI Draft Feedback</DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              Describe what was wrong or what needs improvement.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Textarea
+              placeholder="e.g. Findings were inaccurate, impression was too vague, missed a lesion...
+              "
+              value={feedbackText}
+              onChange={(e) => setFeedbackText(e.target.value)}
+              rows={4}
+            />
+            <div className="flex gap-2 justify-end">
+              <Button variant="outline" size="sm" onClick={() => { setFeedbackEntry(null); setFeedbackText(""); }}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={submitFeedbackWithNotes} disabled={!feedbackText.trim()}>
+                Submit Feedback
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

@@ -1,0 +1,198 @@
+# CARE ERP — Environment Variable Master Matrix
+
+_The single authoritative reference for every environment variable the CARE ERP reads._
+_Generated from a full `process.env` / `import.meta.env` sweep of the codebase during final stabilization (2026-07). Keep this in sync with `.env.example` and `docker-compose.yml`._
+
+**Legend** — Req: ✅ required / ⬜ optional · Secret: 🔑 secret (never log/commit/return) / — non-secret · RR: restart required after change (compose env) / runtime = also editable in Admin.
+
+> **Golden rule:** never hard-code hosts, ports, models, or keys in code. Runtime PACS/AI settings in the Admin UI (`pacs_settings`, AI provider settings) override env at runtime; env values are the boot defaults. Health-check impact is what `pnpm operations:verify-deployment` reports.
+
+---
+
+## Core / Database / Auth
+
+| Variable | Service | Req | Secret | Format / Example | Default | Verifier check |
+|---|---|---|---|---|---|---|
+| `DATABASE_URL` | api, schema-verify, migrate | ✅ | 🔑 | `postgres://erp:pw@db:5432/diagnostic_erp` | built from `DB_*` | Database/connectivity |
+| `DB_USER` / `DB_PASSWORD` / `DB_NAME` | db, api | ✅ | 🔑 (pw) | `erp` / strong / `diagnostic_erp` | `erp` / `changeme` / `diagnostic_erp` | — |
+| `DB_HOST` / `DB_HOST_PORT` | db-patch, db | ⬜ | — | `db` / `5400` | `db` / `5400` | — |
+| `HOST_PORT` | web | ⬜ | — | `8888` | `8888` | Frontend/web root |
+| `PORT` | api | ⬜ | — | `8080` | `8080` | API liveness |
+| `NODE_ENV` | api | ✅ | — | `production` | `development` | — |
+| `LOG_LEVEL` | api | ⬜ | — | `info`/`debug` | `info` | — |
+| `APP_NAME` | api, db-patch, schema-verify | ✅ | — | `care-erp` (DB-identity stamp) | `care-erp` | — |
+| `APP_ENVIRONMENT` | db-patch | ⬜ | — | `production` | `production` | — |
+| `JWT_SECRET` | api | ✅ | 🔑 | 64-char random | — (compose fails if unset) | — |
+| `SESSION_SECRET` | api | ✅ | 🔑 | 64-char random | — (compose fails if unset) | — |
+| `INTERNAL_API_KEY` | api | ⬜ | 🔑 | random (PACS intake agent) | empty | — |
+| `ALLOWED_ORIGINS` | api | ⬜ | — | CSV of origins | same-origin | — |
+| `PUBLIC_BASE_URL` / `APP_PUBLIC_URL` | api | ⬜ | — | `https://caredeoghar.com` | `https://caredeoghar.com` | — |
+| `OBJECT_STORAGE_DIR` | api | ⬜ | — | `/app/data/object-storage` | same | Operational/disk |
+| `BOOTSTRAP_ADMIN_FORCE` | api | ⬜ | — | `false` (⚠️ never `true` in steady state) | `false` | — |
+| `BOOTSTRAP_ADMIN_EMAIL/NAME/PIN/ROLE` | api | ⬜ | 🔑 (pin) | first-run seed only | see `.env.example` | — |
+| `SUPER_ADMIN_USB_KEY` | api | ⬜ | 🔑 | hardware bypass id | unset | — |
+| `ENABLE_SCHEDULERS` | api | ⬜ | — | `true`/`false` (cron jobs) | enabled | — |
+| `TZ` | api | ⬜ | — | `Asia/Kolkata` | system | — |
+
+## Local development isolation (`CARE_DEV_ISOLATED`)
+
+For a development checkout running against a database **restored from the production
+snapshot**. Nothing here is set on the Synology: with the flag absent, every function
+returns "not isolated" and the production boot path is unchanged.
+
+| Variable | Service | Req | Secret | Format / Example | Default | Notes |
+|---|---|---|---|---|---|---|
+| `CARE_DEV_ISOLATED` | api, worker, vite dev | ⬜ (dev only) | — | `1` | unset (off) | Suppresses background consumers, refuses outbound production integrations, pins ports, and verifies the database. Started with `pnpm dev:isolated`. |
+| `CARE_DEV_DATABASE_URL` | api | ⬜ | 🔑 | `postgresql://erp@127.0.0.1:5411/care_dev` | the approved development DB | Overrides which loopback database isolation mode will attach to. A non-loopback value here is rejected. |
+| `CARE_DEV_EGRESS_ALLOW` | api | ⬜ | — | `192.168.1.50, orthanc.dev:8042` | empty (loopback only) | Extra destinations a local development service may reach. Private/LAN ranges are NOT implied by "local" — the clinic's production NAS is a LAN address. |
+| `CARE_DEV_API_PORT` | api | ⬜ | — | `8181` | `8181` | Moves the isolated API off 8181. It never binds 8080, which belongs to the Windows emergency ERP. |
+| `CARE_DEV_ERP_PORT` | vite dev | ⬜ | — | `5173` | `5173` | Vite ignores `PORT` in isolated mode: both dev children inherit `PORT=8080` from `.env`. |
+
+Behaviour when the flag is on (`artifacts/api-server/src/lib/devIsolation.ts` is the
+authority; the registry `BLOCKED_STARTUP_STEPS` lists what is suppressed and why):
+
+- **Refuses to start** unless `DATABASE_URL` is the approved development database — a
+  restored `.env` still pointing at the clinic exits with the reason instead of
+  running "isolated" against production.
+- **No background work**: cron and integration schedulers, the overnight AI and report
+  compose consumers (which start outside `ENABLE_SCHEDULERS`), the Orthanc changes
+  poller, the MRI study warmer, missing-study reconciliation, the DIMSE pull agent,
+  startup schema patches, HOPE bootstrap, `pacs_settings` seeding and the USB
+  plugin-loader drive scan. `worker.ts` is gated too — it never read
+  `ENABLE_SCHEDULERS`, so the flag was not a way to stop it.
+- **No outbound production side effects**: `globalThis.fetch` and the `http`/`https`
+  agent seams refuse non-loopback destinations; SMTP (`nodemailer` opens its own
+  socket), DICOM DIMSE (raw TCP), the HOPE outbox dispatch and the WhatsApp outbox
+  dispatch each refuse by name. A denied destination is rewritten to `127.0.0.1:1`, so
+  no packet leaves the machine and callers still get an ordinary connection error.
+- **Loopback is always permitted**: development Postgres, a local Ollama, a local
+  MailHog, the Vite dev server.
+- API binds `127.0.0.1:8181`, Vite dev binds `127.0.0.1:5173` with `/api` and `/uploads`
+  proxied to 8181, and `vite preview` follows the same rule — it serves the last-built
+  bundle, which on an isolated machine reads the restored copy of production records. Its
+  port comes from `CARE_DEV_ERP_PORT` too, so neither server can inherit `PORT=8080`. The
+  ERP's `serve` script no longer passes `--host 0.0.0.0`, because a CLI host flag outranks
+  the config and would leave the guard decorative. Frontend hot reload is unaffected — no
+  Docker image is built.
+
+`pnpm dev:isolated` (i.e. `node scripts/dev-erp-local.mjs --isolated`) starts both
+children with these settings and prints what is suppressed. On Windows it invokes the
+package runner through `cmd.exe`: pnpm there is an extensionless shim plus `pnpm.CMD` and
+`pnpm.ps1`, whose target `pnpm.exe` sits in a version-hashed directory, and Node will not
+exec a `.CMD` without a shell (`spawn("pnpm")` fails with ENOENT and the launcher would
+print nothing). Stopping on Windows uses `taskkill /T`, because the launcher's direct child
+is `cmd.exe` — killing only it would leave the node processes holding 8181/5173.
+
+## Versioning / build (set by `deploy-synology.sh` / `bump-build.cjs`)
+`ERP_VERSION`, `BUILD_NUMBER`, `RELEASE_NAME`, `GIT_COMMIT`, `GIT_BRANCH`, `GIT_TAG`, `BUILD_DATE` — all optional, non-secret, surfaced by `/api/system/version` and the verifier's "deployed version" check.
+
+## Schema verification
+| Variable | Req | Format | Default | Notes |
+|---|---|---|---|---|
+| `SCHEMA_REPAIR` | ⬜ | `true`/`false` | `false` | `true` = allow ADD COLUMN/CREATE IF NOT EXISTS auto-repair |
+| `SCHEMA_VERIFY_STRICT` | ⬜ | `true`/`false` | `false` | `true` = any drift blocks `care-api` start |
+
+---
+
+## PACS / DICOM (Orthanc / OHIF / Conquest)
+
+| Variable | Req | Secret | Example | Default | Feature |
+|---|---|---|---|---|---|
+| `PACS_PROVIDER` | ⬜ | — | `orthanc` / `conquest` | `orthanc` | selects backend |
+| `PACS_VIEWER_TYPE` | ⬜ | — | `ohif` / `weasis` | `ohif` | viewer |
+| `ORTHANC_URL` | ⬜ | — | `http://172.16.1.139:8042` | empty | Orthanc (browser/Weasis reachable) |
+| `ORTHANC_INTERNAL_URL` | ⬜ | — | `http://care-orthanc:8042` | `http://care-orthanc:8042` | container→container health probe |
+| `ORTHANC_USERNAME` / `ORTHANC_PASSWORD` | ⬜ | 🔑 | `admin` / … | empty | Orthanc auth |
+| `ALLOW_PRIVATE_IPS` | ⬜ | — | `true` | `true` | allow API to call LAN IPs (SSRF guard relaxed for PACS) |
+| `OHIF_URL` / `OHIF_INTERNAL_URL` | ⬜ | — | `http://172.16.1.139:3010` | empty | OHIF viewer |
+| `WADO_URL` / `WEASIS_WADO_PUBLIC_URL` | ⬜ | — | `http://172.16.1.139:8042/wado` | empty | WADO for viewers |
+| `ORTHANC_AE_TITLE` / `ORTHANC_IP` / `ORTHANC_WORKLIST_DIR` | ⬜ | — | — | — | DICOM worklist / C-STORE |
+| `ORTHANC_CHANGES_POLLER` / `ORTHANC_POLL_INTERVAL_MS` | ⬜ | — | `true` / `5000` | — | change-feed poller |
+| `CONQUEST_URL` / `CONQUEST_HOST` / `CONQUEST_PORT` / `CONQUEST_AE_TITLE` | ⬜ | — | LAN | — | alt PACS |
+| `PACS_AE_TITLE` | ⬜ | — | `CARE` | — | our AE title |
+| `DICOM_UPLOAD_MAX_BYTES` | ⬜ | — | `524288000` | 512 MB | upload cap |
+
+## Network defaults (Phase B — override only if the clinic network changes)
+Backend: `NETWORK_LAN_HOST`, `NETWORK_TAILSCALE_HOST`, `NETWORK_PUBLIC_DOMAIN`, `ORTHANC_HTTP_PORT`, `ORTHANC_DICOM_PORT`, `OHIF_HTTP_PORT`, `ERP_HTTP_PORT`, `CONQUEST_DICOM_PORT`.
+Frontend (Vite, baked at build): `VITE_NETWORK_LAN_HOST`, `VITE_NETWORK_TAILSCALE_HOST`, `VITE_NETWORK_PUBLIC_DOMAIN`, `VITE_ORTHANC_HTTP_PORT`, `VITE_OHIF_HTTP_PORT`, `VITE_ERP_HTTP_PORT`, `VITE_API_BASE_URL`, `VITE_ASSET_BASE_URL`, `VITE_SCAN_BRIDGE_URL`.
+All optional; defaults live in `artifacts/api-server/src/lib/networkDefaults.ts` and `artifacts/diagnostic-erp/src/lib/networkProfiles.ts`.
+
+---
+
+## AI — Ollama (LLM) + CARE AI Gateway + cloud providers
+
+| Variable | Req | Secret | Example | Default | Notes |
+|---|---|---|---|---|---|
+| `OLLAMA_URL` / `OLLAMA_PRIMARY_URL` / `OLLAMA_FALLBACK_URL` | ⬜ | — | `http://172.16.1.140:11434` | empty | on-prem LLM endpoint (LAN-only, never public) |
+| `OLLAMA_DEFAULT_MODEL` | ⬜ | — | `qwen3:14b` | `qwen3:14b` | **default reporting model.** Approved: `qwen3:14b`, `gpt-oss:20b`, `gemma3:12b`. Stored provider default wins at runtime. |
+| `AI_GATEWAY_URL` / `USG_AI_GATEWAY_URL` | ⬜ | — | custom | empty | CARE AI Gateway health endpoint |
+| `AI_EGRESS_ALLOWLIST` | ⬜ | — | CSV hosts | empty | restricts AI outbound egress |
+| `AI_INTEGRATIONS_GEMINI_API_KEY` / `_BASE_URL` | ⬜ | 🔑 | key / URL | unset | Gemini provider |
+| `RAG_EMBED_MODEL` | ⬜ | — | model id | — | embeddings |
+
+> Cloud provider keys (OpenAI / Anthropic / Gemini) are stored **encrypted in the DB** via AI Provider Settings, not in env — the env keys above are optional bootstrap fallbacks. Keys are never returned by the API or logged. Test Connection uses the **selected** model (verified by `providerModel.test.ts`).
+
+---
+
+## Payments (ICICI primary + alternates)
+
+| Variable | Req | Secret | Notes |
+|---|---|---|---|
+| `ICICI_SECRET_KEY` | ✅ (payments) | 🔑 | compose fails if unset; verifier: Payments/ICICI config |
+| `ICICI_MERCHANT_ID` / `ICICI_AGGREGATOR_ID` | ⬜ | — | `100000000455452` / `…451` defaults |
+| `ICICI_BASE_URL` / `ICICI_URL_PREFIX` | ⬜ | — | `https://pgpay.icicibank.com` / `/pg/api/v2` |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | ⬜ | 🔑 | alternate gateway |
+| `CASHFREE_APP_ID` / `CASHFREE_CLIENT_SECRET` | ⬜ | 🔑 | alternate |
+| `PHONEPE_MERCHANT_ID` / `PHONEPE_API_SECRET` / `PHONEPE_SALT_INDEX` | ⬜ | 🔑 | alternate |
+| `PAYU_MERCHANT_KEY` / `PAYU_MERCHANT_SALT` | ⬜ | 🔑 | alternate |
+| `HDFC_MERCHANT_ID` / `HDFC_SECRET_KEY` / `HDFC_ACCESS_CODE` / `HDFC_BASE_URL` | ⬜ | 🔑 | alternate |
+| `BHARATPE_MERCHANT_ID` / `BHARATPE_API_KEY` / `BHARATPE_API_SECRET` | ⬜ | 🔑 | alternate |
+
+Gateway callbacks arrive at `/api/gateway-webhooks` and are signature-verified.
+
+---
+
+## Messaging — WhatsApp (Meta Cloud API) / n8n
+
+The **only supported production WhatsApp provider is the official Meta
+WhatsApp Business Cloud API** (`WHATSAPP_PROVIDER=meta`), configured through
+the unified Admin → Integrations → WhatsApp settings page (DB-backed,
+encrypted credentials) rather than environment variables where possible —
+env vars below are fallbacks/legacy only. `evolution` is **not** a valid
+`WHATSAPP_PROVIDER` value and was never implemented as a provider adapter
+(see `WhatsAppProviderFactory.ts`'s registry: `mock | meta | twilio |
+gupshup | wati | interakt`). The Evolution API health-probe that used to
+exist here (`EVOLUTION_API_URL`) has been removed outright — it never
+verified anything about CARE's actual WhatsApp send/receive path, only
+the reachability of an unrelated, optional self-hosted Evolution instance.
+
+| Variable | Req | Secret | Notes |
+|---|---|---|---|
+| `WHATSAPP_PROVIDER` | ⬜ | — | `meta` (only supported production value) |
+| `WHATSAPP_AUTOMATION_SECRET` | ⬜ | 🔑 | bearer token for n8n's `/api/internal/automations/whatsapp/*` triggers (separate from `CRON_SECRET`) |
+| `WHATSAPP_BASE_URL` / `_API_KEY` / `_API_SECRET` / `_APP_SECRET` | ⬜ | 🔑 | env-var fallback only — prefer the unified settings page |
+| `WHATSAPP_ACCESS_TOKEN` / `_PHONE_NUMBER_ID` / `_BUSINESS_ACCOUNT_ID` | ⬜ | 🔑 | Cloud API — env-var fallback only |
+| `WHATSAPP_VERIFY_TOKEN` / `_WEBHOOK_SECRET` | ⬜ | 🔑 | webhook verification — env-var fallback only |
+| `WHATSAPP_DEFAULT_COUNTRY_CODE` | ⬜ | — | `91` |
+| `N8N_URL` | ⬜ | — | automations (verifier: Messaging/n8n) |
+
+---
+
+## Storage / Backups / Bridges / Displays
+
+| Variable | Req | Secret | Notes |
+|---|---|---|---|
+| `BACKUP_PASSPHRASE` | ⬜ | 🔑 | encrypts backups |
+| `BACKUP_TEMP_DIR` | ⬜ | — | scratch dir for backup jobs |
+| `PRIVATE_OBJECT_DIR` / `PUBLIC_OBJECT_SEARCH_PATHS` | ⬜ | — | object storage layout |
+| `FINGERPRINT_BRIDGE_SECRET` | ⬜ | 🔑 | fingerprint scanner bridge |
+| `DISPLAY_ACCESS_TOKEN` | ⬜ | 🔑 | queue/payment display auth |
+| `BOUNDARY_API_KEY` | ⬜ | 🔑 | optional — federated Radiology Service only (not Orthanc/PACS/OHIF) |
+
+## Verifier-only (diagnostics)
+`VERIFY_API_URL`, `VERIFY_WEB_URL`, `VERIFY_SKIP_API`, `MIGRATION_SMOKE_ADMIN_URL`, `SMOKE_BASE_URL` — used only by `scripts/verify-deployment.mjs` / `migration-bootstrap-smoke.mjs`, never by the running app.
+
+---
+
+## Undocumented-in-`.env.example` (flagged during audit — see OPEN_ISSUES)
+The following are read by code but were **absent** from `.env.example` before this pass and are now catalogued here: `AI_GATEWAY_URL`, `USG_AI_GATEWAY_URL`, `AI_EGRESS_ALLOWLIST`, `BACKUP_PASSPHRASE`, `BACKUP_TEMP_DIR`, `DISPLAY_ACCESS_TOKEN`, `BOUNDARY_API_KEY`, `ENABLE_SCHEDULERS`, all alternate payment providers (`RAZORPAY_*`, `CASHFREE_*`, `PHONEPE_*`, `PAYU_*`, `HDFC_*`, `BHARATPE_*`), most `WHATSAPP_*`, `WHATSAPP_AUTOMATION_SECRET`, `N8N_URL`, `CONQUEST_*`, `ORTHANC_AE_TITLE/IP/WORKLIST_DIR/CHANGES_POLLER/POLL_INTERVAL_MS`. None are required for a core deploy; add them only when enabling that integration.

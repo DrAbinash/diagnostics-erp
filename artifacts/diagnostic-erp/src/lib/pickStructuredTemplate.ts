@@ -1,0 +1,236 @@
+/**
+ * Match structured report templates to DICOM modality + study description.
+ * Shared by Radiology Reporting Workspace (auto-select on open) and any
+ * future callers. Replaces the broken `description.includes(template.bodyPart)`
+ * check where bodyPart is an internal code (SPINE_LS) not natural language.
+ */
+
+import { templateCatalogModality } from "./radiologyTemplateModality";
+// What one template row is allowed to document is the same question the normal-format
+// resolver asks, so it is answered by the same function rather than a second spelling.
+import {
+  coverageExceeds,
+  formatDocumentedCoverage,
+  type SpineCoverageSegment,
+} from "@workspace/report-quality";
+
+export type StructuredTemplateMatch = {
+  bodyPart: string;
+  studyType?: string | null;
+};
+
+export type StructuredTemplateRow = {
+  id: number;
+  templateName: string;
+  modality: string;
+  bodyPart: string;
+  studyType: string | null;
+  isDefault?: boolean;
+  schemaVersion?: number;
+};
+
+/**
+ * Infer internal bodyPart (+ optional studyType) from modality + description.
+ *
+ * Returns null when nothing in the description matched. It used to fall through
+ * to a per-modality default — Brain for MRI and CT, Abdomen for USG, Chest for
+ * X-ray — so an MRI knee, a CT liver, an abdominal-wall USG or a hand X-ray each
+ * received a confidently-named template for a body part the study was not of.
+ * That is the same guessing `pickStructuredTemplateForRegion` already refuses,
+ * and documents refusing, for a resolved region ("return null rather than
+ * guessing (the old MRI default was Brain)"). With report formats actually seeded
+ * into `structured_report_templates` a guess stops being inert: it pre-fills
+ * sections the radiologist then has to notice are wrong.
+ *
+ * A null here means "no format chosen", which every caller already handles.
+ */
+export function inferStructuredTemplateMatch(
+  modality: string | null | undefined,
+  studyDescription: string | null | undefined,
+): StructuredTemplateMatch | null {
+  const mod = templateCatalogModality(modality);
+  const desc = `${modality ?? ""} ${studyDescription ?? ""}`.toUpperCase();
+
+  if (mod === "MRI") {
+    const wholeSpine = desc.includes("WHOLE SPINE") || desc.includes("SCREENING");
+    if (wholeSpine) {
+      if (desc.includes("CERVICAL") || desc.includes("C-SPINE") || desc.includes("C SPINE")) {
+        return { bodyPart: "SPINE_CERVICAL", studyType: "SCREENING_WHOLE_SPINE" };
+      }
+      return { bodyPart: "SPINE_LS", studyType: "SCREENING_WHOLE_SPINE" };
+    }
+    if (
+      desc.includes("LUMBO") || desc.includes("LS SPINE") || desc.includes("L-S SPINE")
+      || desc.includes("LUMBAR") || desc.includes("LUMBOSACRAL") || desc.includes("LUMBOSACRAL")
+      || /\bLS\b/.test(desc) && desc.includes("SPINE")
+    ) {
+      return { bodyPart: "SPINE_LS", studyType: "PLAIN" };
+    }
+    if (desc.includes("CERVICAL") || desc.includes("C-SPINE") || desc.includes("C SPINE")) {
+      return { bodyPart: "SPINE_CERVICAL", studyType: "PLAIN" };
+    }
+    if (desc.includes("DORSAL") || desc.includes("THORACIC") || desc.includes("D-SPINE")) {
+      return { bodyPart: "SPINE_DORSAL", studyType: "PLAIN" };
+    }
+    if (desc.includes("STROKE")) return { bodyPart: "BRAIN", studyType: "STROKE_PROTOCOL" };
+    if (desc.includes("CONTRAST") && (desc.includes("BRAIN") || desc.includes("HEAD"))) {
+      return { bodyPart: "BRAIN", studyType: "CONTRAST" };
+    }
+    if (desc.includes("BRAIN") || desc.includes("HEAD") || desc.includes("SKULL")) {
+      return { bodyPart: "BRAIN", studyType: "PLAIN" };
+    }
+    if (desc.includes("SPINE")) return { bodyPart: "SPINE_LS", studyType: "PLAIN" };
+    return null;
+  }
+
+  if (mod === "CT") {
+    if (desc.includes("HRCT") || desc.includes("HIGH RESOLUTION")) return { bodyPart: "CHEST", studyType: "HRCT" };
+    if (desc.includes("CHEST")) return { bodyPart: "CHEST", studyType: "PLAIN" };
+    if (desc.includes("ABDOMEN") || desc.includes("PELVIS")) return { bodyPart: "ABDOMEN", studyType: "PLAIN" };
+    if (desc.includes("TRAUMA")) return { bodyPart: "BRAIN", studyType: "TRAUMA" };
+    return null;
+  }
+
+  if (mod === "USG") {
+    if (desc.includes("PELVIS")) return { bodyPart: "PELVIS" };
+    if (desc.includes("OBSTETRIC") || desc.includes(" OB ") || desc.includes("FETAL")) return { bodyPart: "OBSTETRIC" };
+    if (desc.includes("THYROID") || desc.includes("NECK")) return { bodyPart: "NECK" };
+    if (desc.includes("DOPPLER")) return { bodyPart: "DOPPLER" };
+    // Abdomen was the fallback rather than a keyword, so "USG ABDOMEN" reached its
+    // body part by never having matched anything. Naming it explicitly is what
+    // lets the fallback below become a refusal instead of a guess.
+    if (desc.includes("ABDOMEN") || desc.includes("ABD") || desc.includes("KUB") || desc.includes("RENAL")) {
+      return { bodyPart: "ABDOMEN" };
+    }
+    return null;
+  }
+
+  if (mod === "X-RAY") {
+    if (desc.includes("CERVICAL")) return { bodyPart: "SPINE_CERVICAL" };
+    if (desc.includes("LS") || desc.includes("LUMBO")) return { bodyPart: "SPINE_LS" };
+    if (desc.includes("CHEST")) return { bodyPart: "CHEST" };
+    return null;
+  }
+
+  return null;
+}
+
+/** Map study-region tab name (e.g. "LS Spine") to template bodyPart code. */
+export function studyRegionToBodyPart(region: string | null | undefined): string | null {
+  if (!region) return null;
+  const r = region.toLowerCase();
+  if (r.includes("whole spine")) return "SPINE_WHOLE";
+  if (r.includes("ls spine") || r.includes("lumbar") || r.includes("lumbo")) return "SPINE_LS";
+  if (r.includes("cervical")) return "SPINE_CERVICAL";
+  if (r.includes("dorsal") || r.includes("thoracic")) return "SPINE_DORSAL";
+  if (r.includes("brain")) return "BRAIN";
+  if (r.includes("chest")) return "CHEST";
+  if (r.includes("abdomen")) return "ABDOMEN";
+  return null;
+}
+
+function nameHintMatch(templateName: string, inferred: StructuredTemplateMatch): boolean {
+  const n = templateName.toLowerCase();
+  switch (inferred.bodyPart) {
+    case "SPINE_LS": return n.includes("ls spine") || n.includes("lumbo");
+    case "SPINE_CERVICAL": return n.includes("cervical");
+    case "SPINE_DORSAL": return n.includes("dorsal") || n.includes("thoracic");
+    case "SPINE_WHOLE": return n.includes("whole spine");
+    case "BRAIN":
+      if (inferred.studyType === "STROKE_PROTOCOL") return n.includes("stroke");
+      if (inferred.studyType === "CONTRAST") return n.includes("contrast");
+      return n.includes("brain");
+    default: return false;
+  }
+}
+
+function preferRegionDefault<T extends StructuredTemplateRow>(rows: T[]): T | undefined {
+  if (rows.length === 0) return undefined;
+  const defaults = rows.filter((t) => t.isDefault);
+  if (defaults.length > 1 && process.env.NODE_ENV !== "production") {
+    console.warn(`[pickStructuredTemplate] ${defaults.length} templates have isDefault=true for the same region; using the first.`);
+  }
+  return defaults[0] ?? rows.find((t) => (t.schemaVersion ?? 1) >= 2) ?? rows[0];
+}
+
+/**
+ * Pick the best structured template row from a DICOM description when no
+ * study-region has been resolved. Prefer pickStructuredTemplateForRegion once
+ * a radiology_study_tabs name is available — do not use this as a second
+ * independent study guess in the reporting workspace.
+ */
+export function pickStructuredTemplate<T extends StructuredTemplateRow>(
+  templates: T[],
+  modality: string | null | undefined,
+  studyDescription: string | null | undefined,
+): T | null {
+  const mod = templateCatalogModality(modality);
+  const inferred = inferStructuredTemplateMatch(modality, studyDescription);
+  if (!inferred) return null;
+
+  const pool = templates.filter((t) => templateCatalogModality(t.modality) === mod);
+  if (pool.length === 0) return null;
+
+  if (inferred.studyType) {
+    const exact = pool.filter(
+      (t) => t.bodyPart === inferred.bodyPart
+        && (t.studyType || "PLAIN").toUpperCase() === inferred.studyType!.toUpperCase(),
+    );
+    const picked = preferRegionDefault(exact);
+    if (picked) return picked;
+  }
+
+  const byBody = preferRegionDefault(pool.filter((t) => t.bodyPart === inferred.bodyPart));
+  if (byBody) return byBody;
+
+  const byName = pool.find((t) => nameHintMatch(t.templateName, inferred));
+  if (byName) return byName;
+
+  return null;
+}
+
+/**
+ * Prefer the already-resolved study-region chip over re-parsing StudyDescription.
+ * When a region is present but does not map to a template bodyPart, return null
+ * rather than guessing (the old MRI default was Brain).
+ *
+ * `ceiling` is what the report is still allowed to document — see
+ * `documentedCoverageCeiling`. A Templates-screen row declares its own reach in
+ * `study_type` / its name ("… with Whole Spine Screening" documents the dorsal and
+ * lumbosacral spine from a Cervical row), and a row that declares more than the
+ * ceiling is not the row for this report. Null caps nothing, which is what a study
+ * with no recorded region decision needs: its own booking stays in charge.
+ */
+export function pickStructuredTemplateForRegion<T extends StructuredTemplateRow>(
+  templates: T[],
+  modality: string | null | undefined,
+  region: string | null | undefined,
+  ceiling?: Set<SpineCoverageSegment> | null,
+): T | null {
+  const mod = templateCatalogModality(modality);
+  const bodyPart = studyRegionToBodyPart(region);
+  if (!bodyPart) return null;
+  const pool = templates.filter((t) => templateCatalogModality(t.modality) === mod);
+  const byBody = pool.filter((t) => t.bodyPart === bodyPart);
+  // The row is matched by body part, so its own base coverage is this region; only its
+  // declaration can widen it. `formatDocumentedCoverage` is the same reading the normal
+  // format resolver uses, which is the point: one rule, two ways a report gets its prose.
+  const withinScope = ceiling
+    ? byBody.filter((t) => !coverageExceeds(formatDocumentedCoverage({
+      bodyPart: region,
+      protocolScope: t.studyType,
+      diagnosisTags: [t.templateName],
+    }), ceiling))
+    : byBody;
+  return preferRegionDefault(withinScope) ?? null;
+}
+
+/** True when loaded template anatomy disagrees with resolved study region. */
+export function templateRegionMismatch(
+  studyRegion: string | null | undefined,
+  templateBodyPart: string | null | undefined,
+): boolean {
+  const expected = studyRegionToBodyPart(studyRegion);
+  if (!expected || !templateBodyPart) return false;
+  return expected !== templateBodyPart;
+}

@@ -1,0 +1,40 @@
+{
+  "name": "@workspace/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./src/schema/index.ts"
+  },
+  "scripts": {
+    "push": "drizzle-kit push --config ./drizzle.config.ts",
+    "push-force": "drizzle-kit push --force --config ./drizzle.config.ts",
+    "generate": "drizzle-kit generate --config ./drizzle.config.ts",
+    "push-ci": "tsx scripts/db-deploy.ts",
+    "deploy": "tsx scripts/db-deploy.ts",
+    "manage": "tsx scripts/db-manage.ts",
+    "db:manage": "tsx scripts/db-manage.ts",
+    "phase-f:assess": "tsx scripts/phase-f-template-consolidation.ts assess",
+    "phase-f:execute": "tsx scripts/phase-f-template-consolidation.ts execute",
+    "phase-f:rollback": "tsx scripts/phase-f-template-consolidation.ts rollback",
+    "stamp-accession:dry-run": "tsx scripts/stamp-blank-accession-usg.ts",
+    "stamp-accession:execute": "tsx scripts/stamp-blank-accession-usg.ts --execute",
+    "usg-link:preview": "tsx scripts/backfill-usg-bill-link.ts --preview",
+    "usg-link:dry-run": "tsx scripts/backfill-usg-bill-link.ts",
+    "usg-link:execute": "tsx scripts/backfill-usg-bill-link.ts --execute"
+  },
+  "dependencies": {
+    "drizzle-orm": "catalog:",
+    "drizzle-zod": "^0.8.3",
+    "pg": "^8.20.0",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/pg": "^8.18.0",
+    "dotenv": "^16.4.7",
+    "drizzle-kit": "^0.31.9",
+    "tsx": "catalog:"
+  }
+}

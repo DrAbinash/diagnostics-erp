@@ -1,0 +1,220 @@
+/**
+ * Request-level smoke for report composer routes (DB optional — skips if unset).
+ */
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import request from "supertest";
+import type { Express } from "express";
+import { createTestApp, hasDatabaseUrl } from "../testSupport/apiTestApp";
+import { db } from "@workspace/db";
+import {
+  aiReportComposeJobsTable,
+  portalSessionsTable,
+  radiologyWorklistTable,
+  usersTable,
+} from "@workspace/db/schema";
+import { eq, inArray } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+
+describe.skipIf(!hasDatabaseUrl())("report composer routes", () => {
+  let app: Express;
+  let token = "";
+  let userId = 0;
+  let worklistId = 0;
+  const jobIds: number[] = [];
+  const marker = `vitest-compose-${randomUUID().slice(0, 8)}`;
+
+  beforeAll(async () => {
+    app = await createTestApp();
+    token = `vitest-token-${randomUUID()}`;
+    const [user] = await db
+      .insert(usersTable)
+      .values({
+        name: `Vitest Composer ${marker}`,
+        email: `${marker}@vitest.invalid`,
+        username: marker,
+        role: "admin",
+        permissions: JSON.stringify(["ai_reporting.use", "ai_reporting.configure"]),
+        pin: "0000",
+        isActive: true,
+      })
+      .returning();
+    userId = user.id;
+    await db.insert(portalSessionsTable).values({
+      token,
+      scope: "staff",
+      subjectId: user.id,
+      subjectName: user.name,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    // A compose job now has to name a study the server can resolve, so the
+    // smoke cases need a real worklist row rather than a null reference.
+    const [wl] = await db
+      .insert(radiologyWorklistTable)
+      .values({
+        patientName: `Vitest Composer ${marker}`,
+        modality: "MR",
+        studyDescription: "MRI LS Spine",
+        studyInstanceUID: `1.2.826.vitest.${marker}.route`,
+        accessionNumber: `ACC-ROUTE-${marker}`,
+        status: "STUDY_RECEIVED",
+      })
+      .returning();
+    worklistId = wl.id;
+  });
+
+  afterAll(async () => {
+    if (jobIds.length) await db.delete(aiReportComposeJobsTable).where(inArray(aiReportComposeJobsTable.id, jobIds));
+    if (worklistId) await db.delete(radiologyWorklistTable).where(eq(radiologyWorklistTable.id, worklistId));
+    if (token) await db.delete(portalSessionsTable).where(eq(portalSessionsTable.token, token));
+    if (userId) await db.delete(usersTable).where(eq(usersTable.id, userId));
+  });
+
+  it("POST /jobs returns 202 with jobId without waiting for model", async () => {
+    const snapshot = {
+      worklistId,
+      studyId: null,
+      findings: "No significant disc bulge.",
+      impression: "",
+      recommendation: "",
+      clinicalHistory: "",
+      technique: "MRI LS Spine",
+      modality: "MR",
+      region: "LS_SPINE",
+      observations: [
+        {
+          concept: "bulge",
+          source: "quick-select",
+          level: "L4-L5",
+          findingsText: "L4-5 diffuse disc bulge",
+          conflictGroup: "disc_L4_L5",
+          baselineReplaces: "No significant disc bulge.",
+        },
+      ],
+    };
+    const res = await request(app)
+      .post("/api/radiology/report-composer/jobs")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ snapshot, jobKind: "FULL_REPORT" });
+    // Exact status: this suite used to accept 202/400/403/500, so it stayed
+    // green while every request was being refused.
+    expect(res.status).toBe(202);
+    expect(res.body.jobId).toBeTypeOf("number");
+    expect(res.body.status).toBe("QUEUED");
+    jobIds.push(res.body.jobId as number);
+  });
+
+  it(
+    "POST /test is PHI-safe synthetic",
+    async () => {
+      const res = await request(app)
+        .post("/api/radiology/report-composer/test")
+        .set("Authorization", `Bearer ${token}`)
+        .send({});
+      expect([200, 403, 500]).toContain(res.status);
+      if (res.status === 200) {
+        const body = JSON.stringify(res.body);
+        expect(body).not.toMatch(/patientName|Abinash|phone/i);
+        expect(res.body.compose).toBeTruthy();
+        expect(res.body.writesClinicalReport).toBe(false);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "POST /test returns displayStatus and never writes clinical report",
+    async () => {
+      const res = await request(app)
+        .post("/api/radiology/report-composer/test")
+        .set("Authorization", `Bearer ${token}`)
+        .send({
+          studyType: "MRI LS Spine",
+          region: "LS_SPINE",
+          modality: "MR",
+          observationsText: "Loss of lumbar lordosis.\nDisc desiccation at L4-5.",
+        });
+      expect([200, 403, 500]).toContain(res.status);
+      if (res.status !== 200) return;
+      expect(res.body.writesClinicalReport).toBe(false);
+      expect(["LOCAL_AI_SUCCESS", "CLOUD_AI_SUCCESS", "FALLBACK_DRAFT", "FAILED", "OTHER"]).toContain(
+        res.body.compose?.displayStatus,
+      );
+      if (res.body.compose?.displayStatus === "FALLBACK_DRAFT") {
+        expect(res.body.compose.fallbackUsed === true || res.body.compose.model === "deterministic").toBe(
+          true,
+        );
+        expect(res.body.compose.userMessage).toMatch(/Local AI was not used/i);
+        expect(res.body.compose.personaLoaded).toBe(false);
+      }
+      if (res.body.compose?.displayStatus === "LOCAL_AI_SUCCESS") {
+        expect(res.body.compose.fallbackUsed).toBe(false);
+        expect(res.body.compose.model).not.toBe("deterministic");
+        expect(res.body.compose.ollamaCalled).toBe(true);
+        expect(res.body.compose.personaLoaded).toBe(true);
+      }
+    },
+    60_000,
+  );
+
+  it("GET /diagnostics exposes DeepSeek official-API status and defaultProvider=ollama", async () => {
+    const res = await request(app)
+      .get("/api/radiology/report-composer/diagnostics")
+      .set("Authorization", `Bearer ${token}`);
+    expect([200, 403, 500]).toContain(res.status);
+    if (res.status !== 200) return;
+    expect(res.body.composer?.transport).toBe("ollama");
+    expect(res.body.composer?.defaultProvider).toBe("ollama");
+    expect(typeof res.body.composer?.deepSeekConfigured).toBe("boolean");
+    expect(typeof res.body.composer?.qwenConfigured).toBe("boolean");
+    expect(typeof res.body.composer?.openaiConfigured).toBe("boolean");
+    expect(String(res.body.composer?.deepSeekNote ?? "")).toMatch(/DeepSeek|Ollama|DEEPSEEK_API_KEY/i);
+    expect(res.body.composer?.deepSeekTextModel).toBeTruthy();
+    expect(Array.isArray(res.body.aiProviders)).toBe(true);
+    expect(Array.isArray(res.body.models)).toBe(true);
+    // Secrets must never appear
+    expect(JSON.stringify(res.body)).not.toMatch(/sk-[a-zA-Z0-9]{8,}/);
+  });
+
+  it("process-now completes without mutating patient reports", async () => {
+    const snapshot = {
+      findings: "No significant disc bulge.\nFacet joints preserved.",
+      impression: "",
+      recommendation: "",
+      observations: [
+        {
+          concept: "bulge",
+          source: "quick-select",
+          level: "L4-L5",
+          findingsText: "L4-5 diffuse disc bulge with bilateral lateral recess narrowing",
+          baselineReplaces: "No significant disc bulge.",
+        },
+        {
+          concept: "facet",
+          source: "voice",
+          level: "L4-L5",
+          findingsText: "mild bilateral facet hypertrophy at L4-5",
+        },
+      ],
+      worklistId,
+      modality: "MR",
+      region: "LS_SPINE",
+    };
+    const enq = await request(app)
+      .post("/api/radiology/report-composer/jobs")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ snapshot, jobKind: "FULL_REPORT" });
+    // An early `return` on a non-202 here once let the whole case run zero
+    // assertions; the enqueue is now pinned, so the checks below are reached.
+    expect(enq.status).toBe(202);
+    const jobId = enq.body.jobId as number;
+    jobIds.push(jobId);
+    const proc = await request(app)
+      .post(`/api/radiology/report-composer/jobs/${jobId}/process-now`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({});
+    expect(proc.status).toBe(200);
+    expect(proc.body.job?.status).toMatch(/READY|FAILED/);
+    // Never applied automatically
+    expect(proc.body.job?.status).not.toBe("APPLIED");
+  });
+});
