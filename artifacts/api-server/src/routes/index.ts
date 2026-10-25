@@ -760,12 +760,6 @@ router.use(
 // Attach an externally-produced (Word/PDF) final report to a radiology
 // study — the clinic composes reports in Word, not this app's structured
 // builder; see radiology-report-attachments.ts for the full rationale.
-router.use(
-
-router.use("/electronic-film/public", electronicFilmPublicRouter);
-
-router.use(
-  "/electronic-film",
   requireStaffAuth,
 
 // Editable findings library (Report Builder) — add/modify/delete abnormal
