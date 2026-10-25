@@ -85,7 +85,7 @@ import { websiteRouter } from "./website";
 import { verifyRouter } from "./verify";
 import internalCronRouter from "./internal-cron";
 import internalAutomationsWhatsappRouter from "./internal-automations-whatsapp";
-import internalReportingStudioRouter from "./internal-reporting-studio";
+// Internal reporting studio removed for billing-only version
 import { publicBookingRouter } from "./public-booking";
 import { mobileConfigRouter } from "./mobileConfig";
 import { mobileBillDeskRouter } from "./mobileBillDesk";
@@ -120,18 +120,16 @@ import userPreferencesRouter from "./userPreferences";
 import barcodeResolverRouter from "./barcode-resolver";
 import { uploadsRouter } from "./uploads";
 import { scansRouter } from "./scans";
-import electronicFilmRouter, { electronicFilmPublicRouter } from "./electronic-film";
+// Electronic film removed for billing-only version
 import { structuredReportTemplatesRouter } from "./structuredReportTemplates";
 import { floorsRouter, roomsRouter, modalitiesRouter } from "./locations";
-import { aiReportingRouter } from "./aiReporting";
+// AI reporting removed for billing-only version
 import { aiPromptTemplatesRouter } from "./aiPromptTemplates";
 import { aiPromptLibraryRouter } from "./aiPromptLibrary";
 import { aiModelRoutesRouter } from "./aiModelRoutes";
 import { aiComparisonRouter } from "./aiComparison";
 import { teachingCasesRouter } from "./teachingCases";
-import { voiceReportComposerRouter } from "./voiceReportComposer";
-import { reportComposerRouter } from "./reportComposer";
-import { aiPipelineHealthRouter } from "./aiPipelineHealth";
+// AI/radiology routers removed for billing-only version
 import { bankingRouter, bankingWebhookRouter } from "./banking";
 import { syncRouter } from "./sync";
 import { settingsRouter } from "./settings";
@@ -243,9 +241,7 @@ router.use("/internal/automations/whatsapp", n8nAutomationLimiter, internalAutom
 // Called by Conquest PACS scripts and other server-to-server automations.
 // Internal backup download — streams pg_dump output for off-site replication.
 router.use("/internal/backup", internalBackupRouter);
-// CARE Reporting Studio bridge — must mount BEFORE /internal catch-all
-// (internalRadiologyRouter applies requireStaffOrInternalAuth to every path).
-router.use("/internal/reporting-studio", internalReportingStudioRouter);
+// Internal reporting studio removed for billing-only version
 router.use("/portal", portalRouter);
 router.use("/portal/totp", requireStaffAuth, totpRouter);
 router.use("/display", displayRouter);
@@ -771,7 +767,7 @@ router.use(
 // builder; see radiology-report-attachments.ts for the full rationale.
 router.use(
 
-router.use("/electronic-film/public", electronicFilmPublicRouter);
+// Electronic film public router removed for billing-only version
 
 router.use(
   "/electronic-film",
@@ -837,16 +833,14 @@ router.use("/feedback", requireStaffAuth, requireStaffPermission("/reports"), fe
 // additionally by ff_online_payment_links (Shadow Mode, disabled) inside the router.
 router.use("/bill-payment-links", requireStaffAuth, requireStaffPermission("/billing"), billPaymentLinksRouter);
 
-// AI Radiology Reporting — encrypted API keys, audit logging, draft management
-router.use("/ai-reporting", requireStaffAuth, aiReportingRouter);
+// AI reporting removed for billing-only version
 
 // AI Prompt Templates — modality-aware, versioned, editable-without-code prompts
 router.use("/ai-prompt-templates", requireStaffAuth, aiPromptTemplatesRouter);
 router.use("/ai-prompt-library", requireStaffAuth, aiPromptLibraryRouter);
 router.use("/ai-model-routing", requireStaffAuth, aiModelRoutesRouter);
 
-// Unified OCR + local-AI pipeline health / model registry / non-PHI smoke test
-router.use("/ai-pipeline", requireStaffAuth, aiPipelineHealthRouter);
+// AI pipeline health removed for billing-only version
 
 // AI Comparison Workspace
 router.use("/ai-comparison", requireStaffAuth, aiComparisonRouter);

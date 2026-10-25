@@ -48,11 +48,7 @@ import {
   signerDisplayFromStyle,
 } from "../lib/reportStudyIdentity";
 import { checkPcpndtFormFCompliance, PCPNDT_OVERRIDE_ROLES } from "../lib/pcpndtCompliance";
-import {
-  aiReviewStateUnavailableError,
-  checkUnreviewedAiFinalize,
-  unreviewedAiFinalizeError,
-} from "../lib/reportComposer/unreviewedAiGuard";
+// AI guard imports removed for billing-only version
 // ── Ticket D5 — structured signed-report path (flag-gated, legacy default) ───
 import {
   radiologyReportDraftsTable,
@@ -669,18 +665,7 @@ function hasParameterContent(parameters: string | null): boolean {
 async function unreviewedAiVerifyGate(
   existing: { id: number; type: string; studyId: number | null },
 ): Promise<{ blocked: false } | { blocked: true; status: number; body: Record<string, unknown> }> {
-  if (!isRadiologyReportType(existing.type)) return { blocked: false };
-  const aiReview = await checkUnreviewedAiFinalize({
-    worklistId: existing.studyId ?? null,
-    studyId: existing.studyId ?? null,
-    reportId: existing.id,
-  });
-  if (aiReview.state === "unreviewed") {
-    return { blocked: true, status: 409, body: unreviewedAiFinalizeError(aiReview.draft) };
-  }
-  if (aiReview.state === "unknown") {
-    return { blocked: true, status: 503, body: aiReviewStateUnavailableError() };
-  }
+  // AI guard removed for billing-only version — always pass
   return { blocked: false };
 }
 
@@ -2275,20 +2260,7 @@ patientReportsRouter.post("/", async (req, res) => {
   // majority, and every non-AI page) fall straight through. If the check itself
   // fails the finalize is refused too (503): not being able to look is never
   // evidence that there was nothing to review.
-  if (type === "radiology") {
-    const aiReview = await checkUnreviewedAiFinalize({
-      worklistId: bound?.worklistId ?? worklistIdIn ?? studyRef,
-      studyId: studyRef,
-    });
-    if (aiReview.state === "unreviewed") {
-      res.status(409).json(unreviewedAiFinalizeError(aiReview.draft));
-      return;
-    }
-    if (aiReview.state === "unknown") {
-      res.status(503).json(aiReviewStateUnavailableError());
-      return;
-    }
-  }
+  // AI guard removed for billing-only version
 
   // Content guard — same placement rationale as the gate above: refuse BEFORE a
   // patient_reports row exists. The canonical client deliberately swallows a
@@ -2730,25 +2702,7 @@ patientReportsRouter.post("/:id/sign", async (req, res) => {
     });
     return;
   }
-  // Defense in depth: signing an existing row from Report Hub / the legacy
-  // pages goes through THIS route rather than POST /, so the unreviewed-AI rule
-  // is applied here too. `patient_reports.study_id` holds the worklist row id
-  // for workspace finalizes, and the composer job may be scoped by either.
-  if (isRadiologyReportType(existing.type)) {
-    const aiReview = await checkUnreviewedAiFinalize({
-      worklistId: existing.studyId ?? null,
-      studyId: existing.studyId ?? null,
-      reportId: existing.id,
-    });
-    if (aiReview.state === "unreviewed") {
-      res.status(409).json(unreviewedAiFinalizeError(aiReview.draft));
-      return;
-    }
-    if (aiReview.state === "unknown") {
-      res.status(503).json(aiReviewStateUnavailableError());
-      return;
-    }
-  }
+  // AI guard removed for billing-only version
   // Content guard — the last thing standing between an empty row and a signed,
   // printable, deliverable blank report. Placed after every identity and
   // lifecycle refusal so the more specific reason wins, and before the signer is

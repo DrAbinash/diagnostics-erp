@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CARE Ultra-Emergency Billing (USB) — User Guide</title>
+  <style>
+    @media print {
+      body { font-size: 11pt; }
+      .page-break { page-break-before: always; }
+      h1, h2, h3 { page-break-after: avoid; }
+      table { page-break-inside: avoid; }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 {
+      color: #2563eb;
+      border-bottom: 3px solid #2563eb;
+      padding-bottom: 10px;
+    }
+    h2 {
+      color: #1e40af;
+      border-bottom: 2px solid #e5e7eb;
+      padding-bottom: 8px;
+      margin-top: 30px;
+    }
+    h3 {
+      color: #374151;
+      margin-top: 25px;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+    .header h1 {
+      font-size: 28pt;
+      margin-bottom: 10px;
+    }
+    .meta {
+      color: #6b7280;
+      font-size: 10pt;
+    }
+    .toc {
+      background: #f9fafb;
+      padding: 20px;
+      border-radius: 8px;
+      margin: 30px 0;
+    }
+    .toc h2 {
+      margin-top: 0;
+    }
+    .toc ul {
+      list-style: none;
+      padding-left: 0;
+    }
+    .toc li {
+      padding: 5px 0;
+    }
+    .toc a {
+      color: #2563eb;
+      text-decoration: none;
+    }
+    .toc a:hover {
+      text-decoration: underline;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+    }
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 10px;
+      text-align: left;
+    }
+    th {
+      background: #f3f4f6;
+      font-weight: 600;
+    }
+    code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: "Courier New", monospace;
+      font-size: 10pt;
+    }
+    pre {
+      background: #1f2937;
+      color: #f9fafb;
+      padding: 15px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+    pre code {
+      background: none;
+      color: inherit;
+    }
+    .warning {
+      background: #fef3c7;
+      border-left: 4px solid #f59e0b;
+      padding: 15px;
+      margin: 20px 0;
+    }
+    .info {
+      background: #dbeafe;
+      border-left: 4px solid #3b82f6;
+      padding: 15px;
+      margin: 20px 0;
+    }
+    .success {
+      background: #d1fae5;
+      border-left: 4px solid #10b981;
+      padding: 15px;
+      margin: 20px 0;
+    }
+    ul, ol {
+      margin: 15px 0;
+    }
+    li {
+      margin: 8px 0;
+    }
+    .step {
+      background: #f9fafb;
+      padding: 15px;
+      border-radius: 8px;
+      margin: 15px 0;
+    }
+    .step-number {
+      display: inline-block;
+      background: #2563eb;
+      color: white;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      text-align: center;
+      line-height: 30px;
+      font-weight: bold;
+      margin-right: 10px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>CARE Ultra-Emergency Billing (USB)</h1>
+  <h2>User Guide</h2>
+  <p class="meta">Version 1.0 | October 2026</p>
+  <p class="meta"><strong>Use ONLY when:</strong> CARE (NAS) and DS225+ Emergency Billing are BOTH down</p>
+</div>
+
+<div class="toc">
+  <h2>Table of Contents</h2>
+  <ul>
+    <li><a href="#overview">1. Overview</a></li>
+    <li><a href="#requirements">2. System Requirements</a></li>
+    <li><a href="#preparation">3. Preparation (While CARE Works)</a></li>
+    <li><a href="#emergency">4. Emergency Setup</a></li>
+    <li><a href="#using">5. Using the System</a></li>
+    <li><a href="#recovery">6. Recovery (When CARE is Back)</a></li>
+    <li><a href="#troubleshooting">7. Troubleshooting</a></li>
+    <li><a href="#faq">8. FAQ</a></li>
+  </ul>
+</div>
+
+<h1 id="overview">1. Overview</h1>
+
+<p>CARE Ultra-Emergency Billing is a <strong>portable, self-contained billing system</strong> that runs from a USB drive on any clinic PC. It requires:</p>
+
+<ul>
+  <li>❌ No NAS</li>
+  <li>❌ No Docker</li>
+  <li>❌ No network/LAN</li>
+  <li>❌ No internet</li>
+  <li>❌ No installation</li>
+</ul>
+
+<p><strong>Just plug in the USB and double-click to start billing.</strong></p>
+
+<h3>When to Use</h3>
+
+<table>
+  <tr>
+    <th>Scenario</th>
+    <th>Use This?</th>
+  </tr>
+  <tr>
+    <td>CARE (NAS) is down, DS225+ works</td>
+    <td>❌ Use DS225+</td>
+  </tr>
+  <tr>
+    <td>Both CARE and DS225+ are down</td>
+    <td>✅ <strong>Use USB Emergency</strong></td>
+  </tr>
+  <tr>
+    <td>Network outage, NAS still running</td>
+    <td>❌ Access NAS directly</td>
+  </tr>
+  <tr>
+    <td>Power outage (laptop + USB)</td>
+    <td>✅ <strong>Use USB Emergency</strong></td>
+  </tr>
+  <tr>
+    <td>Remote camp/outreach</td>
+    <td>✅ <strong>Use USB Emergency</strong></td>
+  </tr>
+</table>
+
+<div class="page-break"></div>
+
+<h1 id="requirements">2. System Requirements</h1>
+
+<h3>Hardware</h3>
+<ul>
+  <li>USB drive (any size, 8GB+ recommended)</li>
+  <li>Any Windows/Linux/Mac PC</li>
+  <li>Laptop or desktop with USB port</li>
+</ul>
+
+<h3>Software</h3>
+<ul>
+  <li><strong>Node.js v22</strong> (portable, included in runtime folder)</li>
+  <li>Modern web browser (Chrome, Edge, Firefox)</li>
+</ul>
+
+<h3>Files Included</h3>
+
+<pre><code>care-usb-emergency/
+├── runtime/node.exe          ← Portable Node.js (85MB)
+── app/server.mjs            ← Server application
+── public/index.html         ← Web interface
+├── data/seed/                ← Master data from CARE
+├── export/                   ← CSV exports for reconciliation
+├── receipts/                 ← Printed receipts
+├── START-EMERGENCY.bat       ← Windows launcher
+└── START-EMERGENCY.sh        ← Linux/Mac launcher</code></pre>
+
+<div class="page-break"></div>
+
+<h1 id="preparation">3. Preparation (While CARE Works)</h1>
+
+<div class="warning">
+  <strong>️ Important:</strong> Do this BEFORE the emergency, while CARE is still running.
+</div>
+
+<div class="step">
+  <span class="step-number">1</span>
+  <strong>Download USB Seed</strong>
+  <ol>
+    <li>Login to CARE as <strong>super_admin</strong></li>
+    <li>Go to <strong>Settings → Billing → Emergency Billing</strong></li>
+    <li>Click <strong>"Download USB Seed"</strong></li>
+    <li>Save the zip file (e.g., <code>CARE_ULTRA_EMERGENCY_SEED_20261025.zip</code>)</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">2</span>
+  <strong>Extract Seed Files</strong>
+  <p>Extract the zip and copy these files to your USB drive:</p>
+  <pre><code>data/seed/
+├── tests.csv                      ← Test catalogue
+├── doctors.csv                    ← Doctor list
+└── CARE_EMERGENCY_MASTER_V1.json  ← Full master snapshot</code></pre>
+</div>
+
+<div class="step">
+  <span class="step-number">3</span>
+  <strong>Add Node.js Runtime</strong>
+  <ol>
+    <li>Download Node.js v22 portable:
+      <ul>
+        <li><strong>Windows:</strong> https://nodejs.org/dist/v22.11.0/node-v22.11.0-win-x64.zip</li>
+        <li><strong>Linux:</strong> https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz</li>
+        <li><strong>Mac:</strong> https://nodejs.org/dist/v22.11.0/node-v22.11.0-darwin-x64.tar.gz</li>
+      </ul>
+    </li>
+    <li>Extract and copy the executable:
+      <ul>
+        <li><strong>Windows:</strong> Copy <code>node.exe</code> to <code>runtime/node.exe</code></li>
+        <li><strong>Linux/Mac:</strong> Copy <code>node</code> to <code>runtime/node</code></li>
+      </ul>
+    </li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">4</span>
+  <strong>Test the Setup</strong>
+  <ol>
+    <li>Double-click <code>START-EMERGENCY.bat</code> (Windows) or run <code>./START-EMERGENCY.sh</code> (Linux/Mac)</li>
+    <li>Browser should open at <code>http://127.0.0.1:8898/</code></li>
+    <li>Login with default credentials: <strong>owner / 1234</strong></li>
+    <li>Verify you can see tests and doctors from the seed</li>
+    <li>Close the server (Ctrl+C in the terminal)</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">5</span>
+  <strong>Keep Backup Copies</strong>
+  <p><strong>Keep TWO USB drives</strong> with identical content. Store one in a secure location.</p>
+  <p><strong>Refresh the seed</strong> after any of these changes:</p>
+  <ul>
+    <li>New tests added/removed</li>
+    <li>Test prices changed</li>
+    <li>New doctors added</li>
+    <li>Staff credentials changed</li>
+  </ul>
+</div>
+
+<div class="page-break"></div>
+
+<h1 id="emergency">4. Emergency Setup</h1>
+
+<div class="step">
+  <span class="step-number">1</span>
+  <strong>Plug In the USB</strong>
+  <p>Insert the USB drive into any reception PC.</p>
+</div>
+
+<div class="step">
+  <span class="step-number">2</span>
+  <strong>Start the Server</strong>
+  <p><strong>Windows:</strong></p>
+  <pre><code>Double-click: START-EMERGENCY.bat</code></pre>
+  <p><strong>Linux/Mac:</strong></p>
+  <pre><code>chmod +x START-EMERGENCY.sh
+./START-EMERGENCY.sh</code></pre>
+  <p>A terminal window will open showing:</p>
+  <pre><code>CARE Ultra-Emergency Billing (USB)
+Use ONLY if CARE and DS225+ are both down.
+
+Server running at http://127.0.0.1:8898/
+Database: E:\care-usb-emergency\data\emergency.db
+
+Press Ctrl+C to stop.</code></pre>
+</div>
+
+<div class="step">
+  <span class="step-number">3</span>
+  <strong>Open the Web Interface</strong>
+  <p>The browser should automatically open to:</p>
+  <pre><code>http://127.0.0.1:8898/</code></pre>
+  <p>If it doesn't open automatically, manually navigate to the URL above.</p>
+</div>
+
+<div class="step">
+  <span class="step-number">4</span>
+  <strong>Login</strong>
+  <p><strong>Default credentials</strong> (if no seed loaded):</p>
+  <ul>
+    <li>Username: <code>owner</code></li>
+    <li>PIN: <code>1234</code></li>
+  </ul>
+  <p><strong>With seed loaded:</strong></p>
+  <ul>
+    <li>Use any CARE staff username and PIN from the seed</li>
+  </ul>
+</div>
+
+<div class="step">
+  <span class="step-number">5</span>
+  <strong>Start Emergency Session</strong>
+  <p><strong>Only admin/super_admin can start sessions:</strong></p>
+  <ol>
+    <li>Click <strong>"Start Session"</strong> (top right)</li>
+    <li>Confirm the session start</li>
+    <li>Reception can now create bills</li>
+  </ol>
+</div>
+
+<div class="page-break"></div>
+
+<h1 id="using">5. Using the System</h1>
+
+<h3>Dashboard</h3>
+
+<p>After login, you'll see the dashboard with:</p>
+<ul>
+  <li><strong>Today's Bills</strong> count</li>
+  <li><strong>Total Revenue</strong> collected</li>
+  <li><strong>Pending Amount</strong> (unpaid bills)</li>
+  <li><strong>Recent Bills</strong> table</li>
+</ul>
+
+<h3>Creating a New Bill</h3>
+
+<div class="step">
+  <span class="step-number">1</span>
+  Click <strong>"New Bill"</strong> button
+</div>
+
+<div class="step">
+  <span class="step-number">2</span>
+  <strong>Select Patient:</strong>
+  <ul>
+    <li>Choose from existing patients (dropdown)</li>
+    <li>OR click <strong>"+ New Patient"</strong> to create one:
+      <ul>
+        <li>Name (required)</li>
+        <li>Phone</li>
+        <li>Age</li>
+        <li>Gender</li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<div class="step">
+  <span class="step-number">3</span>
+  <strong>Select Doctor</strong> (optional):
+  <ul>
+    <li>Choose referring doctor from dropdown</li>
+  </ul>
+</div>
+
+<div class="step">
+  <span class="step-number">4</span>
+  <strong>Select Tests:</strong>
+  <ul>
+    <li>Search tests by name or code</li>
+    <li>Check boxes for all tests to bill</li>
+    <li>Total updates automatically</li>
+  </ul>
+</div>
+
+<div class="step">
+  <span class="step-number">5</span>
+  <strong>Payment:</strong>
+  <ul>
+    <li><strong>Discount:</strong> Enter discount amount (if any)</li>
+    <li><strong>Amount Received:</strong> Enter cash/UPI/card amount</li>
+    <li><strong>Payment Method:</strong> Select Cash, UPI, or Card</li>
+    <li><strong>Due Amount:</strong> Shows remaining balance</li>
+  </ul>
+</div>
+
+<div class="step">
+  <span class="step-number">6</span>
+  Click <strong>"Create Bill"</strong>
+</div>
+
+<div class="step">
+  <span class="step-number">7</span>
+  <strong>Print Receipt:</strong>
+  <ul>
+    <li>Bill details display automatically</li>
+    <li>Click <strong>"Print Receipt"</strong> for thermal printer</li>
+    <li>Receipt shows: Bill No, Patient, Tests, Total, Paid, Due, UUID</li>
+  </ul>
+</div>
+
+<h3>Bill Numbering</h3>
+
+<p>Bills are numbered: <code>EMG-YYYYMMDD-XXXXX</code></p>
+
+<p>Example: <code>EMG-20261025-00001</code></p>
+
+<h3>Voiding a Bill</h3>
+
+<div class="warning">
+  <strong>️ Never delete bills.</strong> Void with a reason.
+</div>
+
+<ol>
+  <li>Find the bill in "Recent Bills"</li>
+  <li>Click <strong>"Void"</strong></li>
+  <li>Enter void reason (required)</li>
+  <li>Bill marked as voided but kept for audit</li>
+</ol>
+
+<h3>Viewing a Bill</h3>
+
+<ol>
+  <li>Click <strong>"View"</strong> on any bill</li>
+  <li>See full details: patient, tests, payments</li>
+  <li>Print receipt if needed</li>
+</ol>
+
+<h3>Export CSV for Reconciliation</h3>
+
+<p>When ready to sync back to CARE:</p>
+
+<ol>
+  <li>Click <strong>"Export CSV"</strong> button</li>
+  <li>CSV saved to <code>export/</code> folder on USB</li>
+  <li>Filename: <code>CARE_EMERGENCY_BILLING_[timestamp].csv</code></li>
+</ol>
+
+<div class="page-break"></div>
+
+<h1 id="recovery">6. Recovery (When CARE is Back)</h1>
+
+<div class="step">
+  <span class="step-number">1</span>
+  <strong>End Emergency Session</strong>
+  <p><strong>Only admin/super_admin can end sessions:</strong></p>
+  <ol>
+    <li>Click <strong>"End Session"</strong> (top right)</li>
+    <li>Confirm session end</li>
+    <li>No more bills can be created</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">2</span>
+  <strong>Export Final CSV</strong>
+  <ol>
+    <li>Click <strong>"Export CSV"</strong></li>
+    <li>Confirm file exists in <code>export/</code> folder</li>
+    <li>Copy CSV to a safe location (email, cloud, etc.)</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">3</span>
+  <strong>Stop the Server</strong>
+  <ol>
+    <li>Close the browser</li>
+    <li>In the terminal, press <strong>Ctrl+C</strong></li>
+    <li>Wait for "Stopped" message</li>
+    <li>Safely eject USB</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">4</span>
+  <strong>Import to CARE</strong>
+  <ol>
+    <li>Login to CARE as <strong>super_admin</strong></li>
+    <li>Go to <strong>Settings → Billing → Emergency Billing</strong></li>
+    <li>Click <strong>"Upload CSV"</strong></li>
+    <li>Select the exported CSV file</li>
+    <li><strong>Preview</strong> the import:
+      <ul>
+        <li>Check patient matches (EXACT/PROBABLE/NEW/CONFLICT)</li>
+        <li>Resolve any CONFLICT patients manually</li>
+      </ul>
+    </li>
+    <li>Click <strong>"Import Safe"</strong></li>
+    <li>Verify bills appear in CARE</li>
+  </ol>
+</div>
+
+<div class="step">
+  <span class="step-number">5</span>
+  <strong>Verify Import</strong>
+  <ul>
+    <li>Same file imported twice = <strong>0 extra bills</strong> (idempotent)</li>
+    <li>Check bill count matches USB export</li>
+    <li>Verify total revenue matches</li>
+    <li>Do NOT manually type the same visits into CARE</li>
+  </ul>
+</div>
+
+<div class="page-break"></div>
+
+<h1 id="troubleshooting">7. Troubleshooting</h1>
+
+<h3>Server Won't Start</h3>
+
+<p><strong>Error:</strong> "Node.js was not found"</p>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Check <code>runtime/node.exe</code> exists</li>
+  <li>If missing, download Node.js v22 portable and copy to <code>runtime/</code></li>
+  <li>OR install Node.js v22 on the PC: https://nodejs.org/</li>
+</ul>
+
+<h3>Browser Won't Open</h3>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Manually open browser</li>
+  <li>Navigate to: <code>http://127.0.0.1:8898/</code></li>
+  <li>Check firewall isn't blocking localhost</li>
+</ul>
+
+<h3>Login Fails</h3>
+
+<p><strong>Error:</strong> "Invalid credentials"</p>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Try default: <code>owner / 1234</code></li>
+  <li>If seed was loaded, use CARE credentials from seed</li>
+  <li>Check <code>data/seed/CARE_EMERGENCY_MASTER_V1.json</code> exists</li>
+</ul>
+
+<h3>Can't See Tests/Doctors</h3>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Check <code>data/seed/</code> folder has seed files</li>
+  <li>Verify <code>tests.csv</code> and <code>doctors.csv</code> are present</li>
+  <li>Restart server after adding seed files</li>
+</ul>
+
+<h3>Database Locked</h3>
+
+<p><strong>Error:</strong> "database is locked"</p>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Close all browser tabs</li>
+  <li>Restart server (Ctrl+C, then run again)</li>
+  <li>If persistent, delete <code>data/emergency.db</code> and restart (loses unsynced bills)</li>
+</ul>
+
+<h3>Export CSV Empty</h3>
+
+<p><strong>Solution:</strong></p>
+<ul>
+  <li>Check bills were created (see dashboard count)</li>
+  <li>Verify session was started before billing</li>
+  <li>Check <code>data/emergency.db</code> file size > 0</li>
+</ul>
+
+<div class="page-break"></div>
+
+<h1 id="faq">8. FAQ</h1>
+
+<h3>Q: Can I use this if DS225+ is working?</h3>
+
+<p><strong>A:</strong> No. If DS225+ emergency billing is available, use that instead. USB emergency is ONLY for when both CARE and DS225+ are down.</p>
+
+<h3>Q: What happens if I lose the USB drive?</h3>
+
+<p><strong>A:</strong> Paper receipts are your backup. Each receipt has a UUID that can be manually entered into CARE if needed.</p>
+
+<h3>Q: Can multiple PCs use the same USB simultaneously?</h3>
+
+<p><strong>A:</strong> No. The USB database is file-based and doesn't support concurrent access. Use one PC at a time.</p>
+
+<h3>Q: How long can I run emergency billing?</h3>
+
+<p><strong>A:</strong> Indefinitely. The SQLite database can handle thousands of bills. However, sync back to CARE as soon as possible.</p>
+
+<h3>Q: Can I edit a bill after creating it?</h3>
+
+<p><strong>A:</strong> No. Bills are immutable. Void incorrect bills with a reason and create new ones.</p>
+
+<h3>Q: What if I forget to end the session?</h3>
+
+<p><strong>A:</strong> The session stays active. End it before exporting CSV for reconciliation.</p>
+
+<h3>Q: Can I use this for non-emergency billing?</h3>
+
+<p><strong>A:</strong> No. This is designed ONLY for emergencies. Regular billing should use CARE or DS225+.</p>
+
+<h3>Q: How do I update the seed data?</h3>
+
+<p><strong>A:</strong> Download a new USB seed from CARE and replace files in <code>data/seed/</code>. Keep two USB drives and update both.</p>
+
+<h3>Q: What about accounts and expenses?</h3>
+
+<p><strong>A:</strong> USB emergency is <strong>billing only</strong>. No accounts, expenses, or commission tracking. Those are handled in CARE after reconciliation.</p>
+
+<h3>Q: Can I print receipts on a thermal printer?</h3>
+
+<p><strong>A:</strong> Yes. The receipt is formatted for 80mm thermal printers. Use browser print (Ctrl+P) and select your thermal printer.</p>
+
+<div class="page-break"></div>
+
+<h1>Security Notes</h1>
+
+<ul>
+  <li><strong>Never share the USB drive</strong> with unauthorized personnel</li>
+  <li><strong>Keep backup copies</strong> in secure locations</li>
+  <li><strong>Change default PIN</strong> (owner/1234) after first use</li>
+  <li><strong>Delete seed files</strong> from PC after copying to USB</li>
+  <li><strong>Encrypt USB</strong> if storing patient data long-term (optional)</li>
+</ul>
+
+<h1>Support</h1>
+
+<p>For issues or questions:</p>
+<ul>
+  <li>Check this guide first</li>
+  <li>Review CARE documentation: <code>docs/DS225_EMERGENCY_BILLING_ARCHITECTURE.md</code></li>
+  <li>Contact system administrator</li>
+</ul>
+
+<div class="info">
+  <strong>💡 Remember:</strong> This is NOT a second ERP. It's an ultra-emergency fallback for when all other systems are down. Sync back to CARE as soon as possible.
+</div>
+
+</body>
+</html>
