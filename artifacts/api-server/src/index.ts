@@ -27,7 +27,6 @@ dotenv.config({ path: rootEnv });
 initializeDevIsolation();
 
 // Bind clinic Ollama resolver before app/cron/worker side-effects can generate.
-import "./bootstrapLocalAi";
 import app from "./app";
 import { initializePluginLoader } from "./plugin-loader";
 import { bootStep, initializeDevIsolation, mayRunStep } from "./devIsolationBoot";
@@ -42,7 +41,6 @@ import { NETWORK_LAN_HOST, DEFAULT_OHIF_BROWSER_BASE_URL } from "./lib/networkDe
 import { startCronScheduler } from "./cron";
 import { startIntegrationScheduler } from "./services/integration/scheduler";
 import { ensureDefaultLedger } from "./routes/ledgers";
-import { backfillExpirePublicTokens } from "./routes/patient-reports";
 import { db, usersTable } from "@workspace/db";
 import { pool } from "@workspace/db";
 import { prepareSqlStatements } from "./lib/sqlStatementSplitter";

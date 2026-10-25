@@ -16,7 +16,6 @@ import { auditFromRequest } from "../lib/audit";
 import { isFeatureEnabledServer } from "../lib/featureFlags";
 import type { StaffAuthRequest } from "../middleware/requireStaffAuth";
 import { sendReportDelivery } from "./whatsapp";
-import { ensurePublicToken } from "./patient-reports";
 import { recordReceipt, markReminded, findRemindableReceipts } from "../lib/reportDeliveryReceipts";
 
 export const reportDeliveryTrackingRouter = Router();
@@ -155,7 +154,6 @@ reportDeliveryTrackingRouter.post("/remind/:id", async (req: Request, res: Respo
 // ── Delivery-mode settings (manual | auto) ────────────────────────────────────
 // Surfaced under this feature so the WhatsApp settings route stays untouched.
 // 'auto' keeps auto_send_on_verify = true so the existing on-verify auto-send
-// path (routes/patient-reports.ts) fires with no change; 'manual' turns it off
 // and staff send selected reports bill/test-wise from the tracking screen.
 reportDeliveryTrackingRouter.get("/settings", async (_req: Request, res: Response) => {
   const [s] = await db.select().from(whatsappSettingsTable).limit(1);

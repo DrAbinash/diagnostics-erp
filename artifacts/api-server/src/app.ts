@@ -5,7 +5,6 @@ import express, { type Express, type Request, type Response, type NextFunction }
 import cors from "cors";
 import pinoHttp from "pino-http";
 // Bind before routes module graph finishes constructing request handlers.
-import "./bootstrapLocalAi";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import { buildIdentityPayload } from "./lib/buildIdentity";

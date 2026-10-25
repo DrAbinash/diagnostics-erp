@@ -1,7 +1,6 @@
 import { pgTable, serial, text, timestamp, integer, boolean } from "drizzle-orm/pg-core";
 import { patientsTable } from "./patients";
 import { billsTable } from "./bills";
-import { fetalUsgStudiesTable } from "./fetalUsgLevel4";
 
 export const formFRecordsTable = pgTable("form_f_records", {
   id: serial("id").primaryKey(),
