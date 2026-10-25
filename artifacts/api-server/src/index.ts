@@ -39,7 +39,7 @@ bootStep("pluginLoaderUsbScan", () => initializePluginLoader(app));
 import { logger } from "./lib/logger";
 import { reportWeakGuardedSecrets } from "./lib/secretStrength";
 import { NETWORK_LAN_HOST, DEFAULT_OHIF_BROWSER_BASE_URL } from "./lib/networkDefaults";
-import { startAiReportComposeJobConsumer, startCronScheduler, startRadiologyJobConsumer } from "./cron";
+import { startAiReportComposeJobConsumer, startCronScheduler } from "./cron";
 import { startIntegrationScheduler } from "./services/integration/scheduler";
 import { ensureDefaultLedger } from "./routes/ledgers";
 import { backfillExpirePublicTokens } from "./routes/patient-reports";
@@ -48,7 +48,6 @@ import { pool } from "@workspace/db";
 import { prepareSqlStatements } from "./lib/sqlStatementSplitter";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
-import { validateRadiologyConfig } from "./lib/pacs/pacsConfig.js";
 import { shouldForceBootstrapReset } from "./lib/bootstrapAdmin.js";
 import { bootstrapHopeCareIntegration } from "./lib/bootstrapHopeCareIntegration.js";
 import { markStartupMigrationsSettled } from "./lib/startupState";
@@ -2895,17 +2894,6 @@ const server = app.listen(
   // makes what is still exposed loud on every boot rather than silent.
   reportWeakGuardedSecrets((msg) => logger.error(msg));
 
-  // Overnight AI drain MUST start even if ENABLE_SCHEDULERS cron init throws.
-  // A throw inside startCronScheduler previously skipped this call and left
-  // thousands of pending MRI jobs unclaimed. In isolated mode both drains are
-  // suppressed by the registry, because they claim real jobs and open provider
-  // sockets on a tick.
-  try {
-    bootStep("radiologyJobConsumer", () => startRadiologyJobConsumer());
-  } catch (err) {
-    logger.error({ err }, "Overnight AI consumer failed to register");
-  }
-
   // Text report compose drain — same bootstrap requirement as overnight AI.
   try {
     bootStep("aiReportComposeJobConsumer", () => startAiReportComposeJobConsumer());
@@ -3098,20 +3086,6 @@ const server = app.listen(
       logger.warn({ err: e }, "Could not seed PACS env vars into pacs_settings");
     }
   })();
-
-  // Radiology settings validation probes the configured PACS/viewer endpoints, so
-  // it belongs to the same suppressed group as the seeding above.
-  if (mayRunStep("radiologyConfigValidation")) {
-    validateRadiologyConfig().then((warnings) => {
-      if (warnings.length > 0) {
-        logger.warn({ warnings }, `Radiology settings startup validation warnings:\n${warnings.map(w => ` - ${w}`).join("\n")}`);
-      } else {
-        logger.info("Radiology Settings startup validation passed successfully.");
-      }
-    }).catch((err) => {
-      logger.error({ err }, "Failed to run startup validation for Radiology Settings");
-    });
-  }
 });
 
 server.on("error", (err) => {
