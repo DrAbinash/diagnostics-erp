@@ -2900,18 +2900,19 @@ const server = app.listen(
   // thousands of pending MRI jobs unclaimed. In isolated mode both drains are
   // suppressed by the registry, because they claim real jobs and open provider
   // sockets on a tick.
-  try {
-    bootStep("radiologyJobConsumer", () => startRadiologyJobConsumer());
-  } catch (err) {
-    logger.error({ err }, "Overnight AI consumer failed to register");
-  }
+  // billing-only: radiology/AI job consumers disabled
+  // try {
+  //   bootStep("radiologyJobConsumer", () => startRadiologyJobConsumer());
+  // } catch (err) {
+  //   logger.error({ err }, "Overnight AI consumer failed to register");
+  // }
 
   // Text report compose drain — same bootstrap requirement as overnight AI.
-  try {
-    bootStep("aiReportComposeJobConsumer", () => startAiReportComposeJobConsumer());
-  } catch (err) {
-    logger.error({ err }, "AI report compose consumer failed to register");
-  }
+  // try {
+  //   bootStep("aiReportComposeJobConsumer", () => startAiReportComposeJobConsumer());
+  // } catch (err) {
+  //   logger.error({ err }, "AI report compose consumer failed to register");
+  // }
 
   // Cron schedulers must NOT run on autoscale deployments: containers can
   // scale to zero and miss firing windows, and every cold start would

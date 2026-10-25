@@ -10,53 +10,6 @@ import { readStaffSession, canAccess, firstPermissionedPath, firstAllowedPath, l
 
 import { RedirectToRadiologySettings } from "@/components/radiology/RedirectToRadiologySettings";
 
-/**
- * Phase C (Radiology V2): the unified Radiology Worklist at /radiology/worklist
- * is the single staff-facing worklist. Old worklist routes redirect here.
- * The old page components are PRESERVED in the codebase (not deleted).
- */
-function RedirectToUnifiedWorklist() {
-  const [, navigate] = useLocation();
-  useEffect(() => { navigate("/radiology/worklist", { replace: true }); }, [navigate]);
-  return null;
-}
-
-/**
- * Cockpit→Workspace merge cleanup: RadiologistCockpit has been removed — its
- * useful features were merged into the canonical RadiologyReportingWorkspace
- * (route /radiology/reporting-workspace). Non-admin staff who hit a
- * preserved/owner-only page now land there instead.
- */
-function RedirectToWorkspace() {
-  const [, navigate] = useLocation();
-  useEffect(() => { navigate("/radiology/reporting-workspace", { replace: true }); }, [navigate]);
-  return null;
-}
-
-/** Redirect deprecated report routes to the canonical workspace. */
-function RedirectToReportWorkspace({ studyId }: { studyId?: string }) {
-  const [, navigate] = useLocation();
-  useEffect(() => {
-    navigate(studyId ? `/radiology/report/${studyId}` : "/radiology/worklist", { replace: true });
-  }, [navigate, studyId]);
-  return null;
-}
-
-/**
- * Phase D: owner-only wrapper for preserved/deprecated pages.
- * Normal staff are sent to the canonical Workspace; owners can still open the page.
- */
-/**
- * Phase E: admin/owner-only guard for the unified Radiology Settings page.
- * Non-admin staff are sent to the Worklist.
- */
-function AdminOnlySettings({ children }: { children: React.ReactNode }) {
-  const session = readStaffSession();
-  const role = normalizeRole(session?.user?.role || "");
-  if (role === "admin" || role === "super_admin") return <>{children}</>;
-  return <RedirectToUnifiedWorklist />;
-}
-
 /** Legacy General Settings tab strip used ?tab=radiology — canonical home is Settings → Radiology. */
 function SettingsPageOrRedirect() {
   if (typeof window !== "undefined") {
@@ -66,13 +19,6 @@ function SettingsPageOrRedirect() {
     }
   }
   return <Settings />;
-}
-
-function OwnerOnlyPreserved({ children }: { children: React.ReactNode }) {
-  const session = readStaffSession();
-  const role = normalizeRole(session?.user?.role || "");
-  if (role === "admin" || role === "super_admin") return <>{children}</>;
-  return <RedirectToWorkspace />;
 }
 
 
@@ -304,20 +250,10 @@ const queryClient = new QueryClient({
 
 const ERP_NAV_ORDER = [
   "/", "/dashboard", "/my-daily-summary", "/my-day-close", "/reception-command-center", "/daily-summary", "/patients", "/register", "/appointments", "/queue", "/online-bookings",
-  "/radiology", "/radiology/legacy", "/radiology/worklist", "/radiology/open", "/radiology/report-generator", "/radiology/report-builder", "/radiology/findings-manager", "/radiology/reporting-workspace", "/radiology/advanced-tools", "/radiology/pacs-dashboard", "/radiology/operational-health", "/radiology/pacs-settings", "/radiology/network-control-center", "/radiology/pacs-logs",
-  "/radiology/dicom-agent-dashboard", "/radiology/modality-management",
-  "/radiology/agent-setup", "/radiology/ai-reporting-settings", "/radiology/ai-prompt-templates", "/radiology/ai-model-routing", "/radiology/structured-report-templates", "/radiology/mwl-dashboard", "/radiology/study-access-logs", "/radiology/ai-audit-log", "/radiology/ai-egress-inspector",
-  "/radiology/viewer", "/radiology/archive-lifecycle", "/radiology/watchdog", "/radiology/ai-inference-settings", "/radiology/hl7-settings", "/teleradiology",
-  "/radiology/usg-measurements", "/radiology/usg-admin-settings", "/radiology/usg-rollout", "/radiology/usg-demo",
-  "/usg", "/usg/worklist", "/usg/measurements", "/usg/reporting", "/usg/doppler", "/usg/key-images", "/usg/settings", "/usg/critical", "/usg/analytics",
-  "/teaching-cases", "/teaching-collections", "/teaching-favorites", "/teaching-ai", "/teaching-research", "/teaching-mode", "/teaching-analytics", "/teaching-presentation",
-  "/echo", "/fetal-echo", "/fetal-usg", "/fetal-usg/:studyId",
-  "/settings/radiology", "/backup-replication",
   "/orders", "/tests", "/packages", "/billing", "/payments", "/reports",
   "/report-generator", "/report-hub", "/inventory", "/expenses", "/staff", "/people", "/performance", "/attendance-devices", "/my-portal", "/leave", "/roster", "/disciplinary", "/appraisals", "/allowances", "/awards", "/referrals",
   "/accounting", "/discounts", "/form-f", "/machines", "/hr-forms", "/website", "/whatsapp-chatbot", "/settings", "/pathology-registry", "/knowledge-base", "/ai-caller-credentials",
   "/samples",
-  "/pacs", "/dicom-nodes",
   "/outsource/settings", "/outsource/rate-cards", "/outsource/worklist", "/outsource/reconciliation", "/outsource/ledger", "/outsource/dashboard",
 ];
 
@@ -387,8 +323,6 @@ function Router() {
         <Route path="/login/:rest*" component={Portal} />
         <Route path="/erp/login" component={Portal} />
         <Route path="/erp/login/:rest*" component={Portal} />
-        <Route path="/teleradiology" component={TeleradiologyPortal} />
-        <Route path="/teleradiology/:rest*" component={TeleradiologyPortal} />
         <Route path="/verify-receipt/:billId" component={VerifyReceipt} />
         <Route path="/display/payment-qr/:counterKey" component={PaymentQrDisplay} />
         {/* Bare URL defaults to counter1 inside the component — kept for
@@ -447,226 +381,15 @@ function Router() {
               <Route path="/banking" component={Banking} />
               <Route path="/register" component={Register} />
               <Route path="/discounts" component={Discounts} />
-              <Route path="/pacs" component={PACS} />
-              <Route path="/dicom-nodes">
-                {() => <RedirectToRadiologySettings tab="pacs-advanced" />}
-              </Route>
               <Route path="/appointments" component={Appointments} />
               <Route path="/daily-summary" component={DailySummary} />
               <Route path="/my-daily-summary" component={MyDailySummary} />
               <Route path="/online-bookings" component={OnlineBookings} />
               <Route path="/queue" component={QueuePage} />
-              <Route path="/radiology" component={Radiology} />
-              {/* RadiologistCockpit removed (Cockpit→Workspace merge) — its
-                  useful features were ported into the canonical
-                  RadiologyReportingWorkspace. Old links keep working. */}
-              <Route path="/radiology/cockpit" component={RedirectToWorkspace} />
-              <Route path="/radiology/my-collection" component={MyCollection} />
-              <Route path="/radiology/worklist" component={RadiologyWorklist} />
-              {/* Hope OPD / partner deep-link → Reporting Workspace (or MRI worklist). */}
-              <Route path="/radiology/open" component={RadiologyOpenRedirect} />
-              {/* DEPRECATED: /radiology/report-generator redirects to canonical workspace.
-                  Unique macro/key-image admin UI moved to /radiology/snippets. */}
-              <Route path="/radiology/report-generator">
-                {() => <RedirectToReportWorkspace />}
-              </Route>
-              <Route path="/radiology/report-generator/:studyId">
-                {(params) => <RedirectToReportWorkspace studyId={params.studyId} />}
-              </Route>
-              <Route path="/radiology/report-builder" component={RadiologyReportBuilder} />
-              <Route path="/radiology/findings-manager" component={RadiologyFindingsManager} />
-
-              {/* M1.1 canonical workspace consolidation (July 2026).
-                  RadiologyReportingWorkspace is THE canonical radiology reporting page.
-
-                  Route map:
-                    /radiology/report/:studyId            → canonical (primary)
-                    /radiology/reporting-workspace(/:id)  → canonical (named alias)
-                    /radiology/unified-report/:worklistId → canonical (old URL kept)
-                    /radiology/report-legacy/:studyId     → DEPRECATED, redirects to canonical
-                    /radiology/report-generator(/:id)     → DEPRECATED, redirects to canonical
-                                                            (unique macro/key-image admin UI
-                                                            moved to /radiology/snippets)
-
-                  Duplicate pages RadiologyReportUnified, RadiologyReportGenerator,
-                  and RadiologyReportEditor are deprecated. Their routes redirect
-                  to the canonical workspace so old bookmarks keep working. */}
-              <Route path="/radiology/report/:studyId">
-                {(params) => <RadiologyReportingWorkspace studyId={Number(params.studyId)} />}
-              </Route>
-              {/* B-10: the standalone USG shell is retired. It saved and
-                  finalized through the canonical transport but held none of
-                  the protections that live at the authoritative boundary (no
-                  #880 acceptance target, no #882 proposal fingerprint, no
-                  #859/#862 signed refusal, no isFinalized), and its panels fed
-                  AI prose straight into the HTML it signed. Nothing in the
-                  product linked here — ff_radiology_usg_workspace defaulted
-                  OFF, which made the route redirect on its own — and the USG
-                  companion work stays available inside the canonical
-                  workspace via UsgCompanionPanel. The URL is kept as a
-                  redirect so hand-typed and bookmarked deep links still land
-                  on the one authoritative surface with the same study. */}
-              <Route path="/radiology/usg/:studyId">
-                {(params) => <RedirectToReportWorkspace studyId={params.studyId} />}
-              </Route>
-              {/* DEPRECATED: /radiology/report-legacy/:studyId now redirects to canonical workspace */}
-              <Route path="/radiology/report-legacy/:studyId">
-                {(params) => <RedirectToReportWorkspace studyId={params.studyId} />}
-              </Route>
-              <Route path="/radiology/reporting-workspace">
-                {() => <RadiologyReportingWorkspace />}
-              </Route>
-              <Route path="/radiology/reporting-workspace/:studyId">
-                {(params) => <RadiologyReportingWorkspace studyId={Number(params.studyId)} />}
-              </Route>
-              {/* Former /radiology/legacy-workspace → modular workspace (snapshot remains in git history). */}
-              <Route path="/radiology/legacy-workspace">
-                {() => <RadiologyReportingWorkspace />}
-              </Route>
-              <Route path="/radiology/legacy-workspace/:studyId">
-                {(params) => <RadiologyReportingWorkspace studyId={Number(params.studyId)} />}
-              </Route>
-              <Route path="/radiology/unified-report/:worklistId">
-                {(params) => <RadiologyReportingWorkspace studyId={Number(params.worklistId)} />}
-              </Route>
-              <Route path="/radiology/pacs-dashboard" component={PacsDashboard} />
-              <Route path="/radiology/operations-dashboard" component={RadiologyOperationsDashboard} />
-              <Route path="/radiology/operational-health">
-                {() => <AdminOnlySettings><OperationalHealth /></AdminOnlySettings>}
-              </Route>
-              <Route path="/radiology/my-analytics" component={MyReportingAnalytics} />
-              {/* PacsSettings is retired as a standalone page — its full config
-                  now lives in the Radiology Settings hub ("PACS / DICOM (Full)"
-                  tab). Old bookmarks land on the hub. */}
-              <Route path="/radiology/pacs-settings">
-                {() => <AdminOnlySettings><RadiologySettingsCenter /></AdminOnlySettings>}
-              </Route>
-              <Route path="/radiology/electronic-film-settings">
-                {() => <AdminOnlySettings><ElectronicFilmSettings /></AdminOnlySettings>}
-              </Route>
-              <Route path="/radiology/network-control-center" component={NetworkControlCenter} />
-              <Route path="/radiology/pacs-logs" component={PacsLogs} />
-              <Route path="/radiology/dicom-agent-dashboard" component={DicomAgentDashboard} />
-              <Route path="/radiology/modality-management">
-                {() => <RedirectToRadiologySettings tab="modalities" />}
-              </Route>
-              <Route path="/radiology/viewer/:studyInstanceUID" component={DicomViewer} />
-              <Route path="/radiology/agent-setup">
-                {() => <RedirectToRadiologySettings tab="sync" />}
-              </Route>
-              <Route path="/radiology/ai-reporting-settings">
-                {() => <RedirectToRadiologySettings tab="reporting" />}
-              </Route>
-              <Route path="/knowledge-base" component={KnowledgeBaseManager} />
-              <Route path="/ai-caller-credentials" component={AiCallerCredentials} />
               <Route path="/reception-command-center" component={ReceptionCommandCenter} />
-              <Route path="/radiology/ai-prompt-templates" component={AiPromptTemplates} />
-              <Route path="/radiology/ai-prompt-manager" component={AiPromptManager} />
-              <Route path="/radiology/ai-comparison" component={AiComparisonWorkspace} />
-              <Route path="/radiology/missed-finding-detector" component={MissedFindingDetector} />
-              <Route path="/radiology/image-review" component={ImageReviewAssistant} />
-              <Route path="/radiology/provider-fallback" component={ProviderFallback} />
-              <Route path="/teaching-cases" component={TeachingFiles} />
-              <Route path="/teaching-cases/:id" component={TeachingCaseDetail} />
-              <Route path="/teaching-collections" component={TeachingCollections} />
-              <Route path="/teaching-collections/:id" component={TeachingCollections} />
-              <Route path="/teaching-favorites" component={TeachingFavorites} />
-              <Route path="/teaching-ai" component={TeachingAIAssistant} />
-              <Route path="/teaching-research" component={TeachingResearchMode} />
-              <Route path="/teaching-mode" component={TeachingMode} />
-              <Route path="/teaching-analytics" component={TeachingAnalytics} />
-              <Route path="/teaching-presentation" component={TeachingPresentationMode} />
-              <Route path="/radiology/productivity" component={RadiologyProductivity} />
-              <Route path="/radiology/ai-model-routing" component={AiModelRouting} />
-              <Route path="/radiology/structured-report-templates" component={ReportTemplatesPage} />
-              <Route path="/radiology/ai-audit-log" component={AiAuditLog} />
-              <Route path="/radiology/ai-egress-inspector" component={AiEgressInspector} />
-      <Route path="/radiology/ai-quality-scores" component={AiQualityScores} />
-      <Route path="/radiology/ai-prompt-effectiveness" component={AiPromptEffectiveness} />
-      <Route path="/radiology/ai-dicom-findings" component={AiDicomFindings} />
-      <Route path="/radiology/rag-vector-store" component={RagVectorStore} />
-      <Route path="/radiology/ai-search-retrieval" component={AiSearchRetrieval} />
-      <Route path="/radiology/anomaly-alerts" component={AnomalyAlerts} />
-      <Route path="/radiology/report-diff" component={ReportDiffViewer} />
-      <Route path="/radiology/feedback-loop-analytics" component={FeedbackLoopAnalytics} />
-      <Route path="/radiology/template-versions" component={TemplateVersions} />
-      <Route path="/radiology/billing-suggestions" component={AiBillingSuggestions} />
-      <Route path="/radiology/peer-review-assignments" component={PeerReviewAssignments} />
-      <Route path="/radiology/turnaround-times" component={TurnaroundTimeAnalytics} />
-      <Route path="/radiology/training-data-exports" component={TrainingDataExports} />
-      <Route path="/radiology/quality-gates" component={ReportQualityGates} />
-      <Route path="/radiology/critical-findings" component={CriticalFindings} />
-      <Route path="/radiology/provider-health" component={ProviderHealthMonitor} />
-      <Route path="/radiology/voice-dictation" component={VoiceDictation} />
-      <Route path="/radiology/patient-communication" component={PatientCommunication} />
-      <Route path="/radiology/normal-templates" component={NormalReportTemplates} />
-              <Route path="/radiology/archive-lifecycle" component={PacsArchiveLifecycle} />
-              <Route path="/radiology/watchdog" component={PacsWatchdogDashboard} />
-              <Route path="/radiology/ai-inference-settings">
-                {() => <RedirectToRadiologySettings tab="reporting" />}
-              </Route>
-              <Route path="/radiology/hl7-settings">
-                {() => <RedirectToRadiologySettings tab="advanced" />}
-              </Route>
-              {/* Phase 12: Real Radiology Workflow & DICOM Operations */}
-              <Route path="/radiology/command-center/:studyId">
-                {(params) => <OwnerOnlyPreserved><RadiologyCommandCenter studyId={Number(params.studyId)} /></OwnerOnlyPreserved>}
-              </Route>
-              <Route path="/radiology/command-center">
-                {() => <OwnerOnlyPreserved><RadiologyCommandCenter /></OwnerOnlyPreserved>}
-              </Route>
-              <Route path="/radiology/legacy">
-                {() => <OwnerOnlyPreserved><RadiologyLegacy /></OwnerOnlyPreserved>}
-              </Route>
-              <Route path="/radiology/advanced-tools" component={RadiologyAdvancedTools} />
-              <Route path="/radiology/acquisition-gateway" component={AcquisitionGateway} />
-              <Route path="/radiology/mwl-manager" component={MwlManager} />
-              <Route path="/radiology/mwl-dashboard" component={MwlDashboard} />
-              <Route path="/radiology/study-access-logs" component={StudyAccessLogs} />
-              <Route path="/radiology/ai-pipeline" component={AiPipelineManager} />
-              <Route path="/radiology/critical-alerts" component={CriticalAlertsManager} />
-              <Route path="/radiology/storage-lifecycle" component={StorageLifecycle} />
-              <Route path="/radiology/productivity-tools" component={RadiologistTools} />
-              <Route path="/radiology/usg-measurements/:studyInstanceUID" component={UsgMeasurementReview} />
-              <Route path="/radiology/usg-measurements" component={UsgMeasurementReview} />
-              <Route path="/radiology/usg-admin-settings">
-                {() => <RedirectToRadiologySettings tab="usg-extraction" />}
-              </Route>
-              <Route path="/radiology/usg-rollout" component={UsgAdminReadiness} />
-              <Route path="/radiology/usg-demo" component={UsgDemoMode} />
-              {/* USG / DOPPLER module */}
-              <Route path="/usg" component={UsgDoppler} />
-              <Route path="/usg/worklist" component={RedirectToUnifiedWorklist} />
-              <Route path="/usg/measurements/:studyInstanceUID" component={UsgMeasurementReview} />
-              <Route path="/usg/measurements" component={UsgMeasurementReview} />
-              <Route path="/usg/reporting" component={UsgReporting} />
-              <Route path="/usg/doppler" component={UsgDopplerReporting} />
-              <Route path="/usg/key-images" component={UsgKeyImagesGallery} />
-              <Route path="/usg/critical" component={UsgCriticalAlerts} />
-              <Route path="/usg/settings">
-                {() => <RedirectToRadiologySettings tab="usg-extraction" />}
-              </Route>
-              <Route path="/usg/analytics" component={UsgAnalytics} />
-              <Route path="/usg/pregnancy-dashboard" component={PregnancyDashboard} />
-              <Route path="/backup-replication" component={BackupReplication} />
-              {/* Phase 10 RIS/PACS Foundation */}
-              <Route path="/radiology/dicom-study-worklist" component={RedirectToUnifiedWorklist} />
-              <Route path="/radiology/radiologist-queue" component={RedirectToUnifiedWorklist} />
-              <Route path="/radiology/technician-workflow/:studyId">
-                {(params) => <TechnicianWorkflow studyId={Number(params.studyId)} />}
-              </Route>
-              <Route path="/radiology/technician-workflow">
-                {() => <TechnicianWorkflow />}
-              </Route>
-              <Route path="/radiology/ai-extraction-review" component={AiExtractionReview} />
-              <Route path="/radiology/hanging-protocols" component={HangingProtocols} />
-              <Route path="/echo" component={EchoCardiology} />
-              <Route path="/fetal-echo" component={FetalEcho} />
-              <Route path="/fetal-usg" component={FetalUsgLevel4} />
-              <Route path="/fetal-usg/:studyId">
-                {(params) => <FetalUsgLevel4 />}
-              </Route>
-              <Route path="/m/viewer/:studyInstanceUID" component={MobileViewer} />
+              <Route path="/daily-summary" component={DailySummary} />
+              <Route path="/my-daily-summary" component={MyDailySummary} />
+              <Route path="/online-bookings" component={OnlineBookings} />
               <Route path="/packages" component={Packages} />
               <Route path="/expenses" component={Expenses} />
               <Route path="/my-day-close" component={MyDayClose} />
@@ -705,48 +428,8 @@ function Router() {
               <Route path="/samples" component={Samples} />
               <Route path="/scan-station" component={ScanStation} />
               <Route path="/report-delivery" component={ReportDelivery} />
-              {/* Phase E (Radiology V2): RadiologySettingsCenter is the one
-                  owner/admin-only Radiology Settings hub. All legacy settings
-                  URLs render it. (The old RadiologySettings page was deleted —
-                  it was an unrouted, unreachable redirect stub.) */}
-              <Route path="/settings/radiology">
-                {() => <AdminOnlySettings><RadiologySettingsCenter /></AdminOnlySettings>}
-              </Route>
-              {/* M1.3 — the ONE admin diagnostics page (Flight Deck). */}
-              <Route path="/radiology/flight-deck" component={RadiologyFlightDeck} />
-              <Route path="/settings/radiology-quick-select">
-                {() => <RedirectToRadiologySettings tab="quick-select" />}
-              </Route>
-              <Route path="/radiology/settings">
-                {() => <AdminOnlySettings><RadiologySettingsCenter /></AdminOnlySettings>}
-              </Route>
-              <Route path="/radiology/settings-center">
-                {() => <AdminOnlySettings><RadiologySettingsCenter /></AdminOnlySettings>}
-              </Route>
-              {/* CARE Knowledge Pack Engine — admin registry/manager. */}
-              <Route path="/settings/radiology/knowledge-packs">
-                {() => <AdminOnlySettings><RadiologyKnowledgePackManager /></AdminOnlySettings>}
-              </Route>
-              <Route path="/settings/radiology/content-catalog">
-                {() => <AdminOnlySettings><RadiologyCatalogAdmin /></AdminOnlySettings>}
-              </Route>
-              {/* Clinical Recommendation Registry — admin read-only manager. */}
-              <Route path="/settings/radiology/recommendations">
-                {() => <AdminOnlySettings><ClinicalRecommendationRegistryManager /></AdminOnlySettings>}
-              </Route>
-              {/* Clinical Content Coverage Dashboard — management analytics. */}
-              <Route path="/settings/radiology/content-coverage">
-                {() => <AdminOnlySettings><ClinicalContentCoverage /></AdminOnlySettings>}
-              </Route>
-              {/* Clinical Content Validator — read-only content linting. */}
-              <Route path="/settings/radiology/content-validator">
-                {() => <AdminOnlySettings><ClinicalContentValidatorPage /></AdminOnlySettings>}
-              </Route>
               <Route path="/settings" component={SettingsPageOrRedirect} />
               <Route path="/system-settings" component={SystemSettings} />
-              <Route path="/settings/scanner">
-                {() => <AdminOnlySettings><ScannerSettings /></AdminOnlySettings>}
-              </Route>
               <Route path="/whatsapp-chatbot" component={WhatsAppChatbot} />
               <Route path="/system-update" component={SystemUpdate} />
               <Route component={NotFound} />

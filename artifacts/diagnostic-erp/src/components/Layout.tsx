@@ -183,48 +183,6 @@ const navItems: NavEntry[] = [
       { path: "/orders", icon: ClipboardList, label: "Orders" },
     ],
   },
-  {
-    id: "radiology-grp",
-    icon: Radio,
-    label: "Radiology & Imaging",
-    children: [
-      // Daily path only — extra AI/admin/legacy pages live under Settings → Radiology
-      // or /radiology hub → Advanced (routes unchanged; bookmarks still work).
-      { path: "/radiology/worklist",            icon: ScanSearch,     label: "Worklist" },
-      { path: "/radiology/my-collection",        icon: ShieldAlert,    label: "DICOM Match" },
-      { path: "/radiology/reporting-workspace", icon: FilePen,        label: "Reporting Workspace" },
-      { path: "/report-delivery",               icon: Send,           label: "Report Delivery" },
-      // Gated by the optional critical-result COMMUNICATION workflow; the route
-      // itself stays registered so an existing bookmark resolves to the page's
-      // own "switched off" notice instead of a dead link.
-      { path: "/radiology/critical-findings",   icon: AlertCircle,    label: "Critical Findings", featureFlag: "ff_radiology_critical_result_comms" },
-      { path: "/pacs",                          icon: Monitor,        label: "PACS Viewer" },
-      { path: "/echo",                          icon: Heart,          label: "Echo" },
-      {
-        id: "usg-reporting-grp",
-        icon: Baby,
-        label: "USG",
-        children: [
-          { path: "/radiology/worklist?modality=USG",            icon: ScanSearch, label: "USG Worklist" },
-          { path: "/radiology/reporting-workspace?modality=USG", icon: FilePen,    label: "General USG Reporting" },
-          { path: "/fetal-usg",                                  icon: Baby,       label: "Fetal USG" },
-          { path: "/fetal-echo",                                 icon: Baby,       label: "Fetal Echo" },
-          { path: "/usg/doppler",                                icon: Activity,   label: "Doppler Reporting" },
-          // Deep-links into the generic Queue page pre-filtered to USG so
-          // staff working only this nav section can find the "Call" button
-          // that flips a waiting token to "serving" (what the USG TV
-          // display's "Now Serving" card actually reads) — previously only
-          // reachable via the unrelated top-level "Queue Tokens" nav item.
-          { path: "/queue?department=USG",                       icon: Ticket,     label: "USG Queue / Call Next" },
-          // USG / Quick Select admin settings live ONLY under Settings → Radiology
-          // (tabs usg-extraction + quick-select). Sidebar entries removed to kill duplicates.
-        ],
-      },
-      // Owner-only leftovers — not needed in a radiologist's daily rail.
-      { path: "/radiology/operations-dashboard", icon: Gauge,       label: "Ops Dashboard", ownerOnly: true },
-      { path: "/teleradiology",                  icon: Globe,       label: "Teleradiology", ownerOnly: true },
-    ],
-  },
   { path: "/day-close", icon: Lock, label: "Day Close (All Staff)", ownerOnly: true },
   { path: "/patients", icon: Users, label: "Patients" },
   { path: "/register", icon: UserPlus, label: "Quick Register" },
@@ -314,9 +272,6 @@ const navItems: NavEntry[] = [
     children: [
       // General Settings — clinic, users, billing print, integrations hub, etc.
       { path: "/settings",                  icon: Settings2,      label: "General Settings" },
-      // Single radiology admin entry — PACS, MWL, USG, Quick Select, AI, productivity flags.
-      { path: "/settings/radiology",        icon: Radio,          label: "Radiology", ownerOnly: true },
-      { path: "/settings/scanner",          icon: ScanLine,       label: "Scanner Settings", ownerOnly: true },
       { path: "/abdm-abha",                 icon: ShieldCheck,    label: "ABDM / ABHA", featureFlag: "ff_abdm_abha" },
       { path: "/tests",                     icon: FlaskConical,   label: "Test Catalog" },
       { path: "/measurement-registry",        icon: Activity,       label: "Measurement Registry", ownerOnly: true },
@@ -504,57 +459,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const isOnline = useOnlineStatus();
   const { isActive: scannerActive } = useGlobalScanner();
 
-  // ── Study Auto-ingest Notifications ───────────────────────────────────────────────────────────────────────────────
-  const [newStudyCount, setNewStudyCount] = useState(0);
-  const lastCheckRef = useRef<string>(new Date(Date.now() - 5 * 60_000).toISOString());
-  // The server mounts /api/dicom-studies behind requireStaffPermission("/dicom-nodes")
-  // (routes/index.ts). canAccess resolves "/dicom-studies" through
-  // PERMISSION_ALIASES to that same key, so this mirrors the server's rule
-  // rather than restating it and letting the two drift.
-  //
-  // Without this gate, every staff user who lacks the permission polled the
-  // endpoint forever and took a 403 each time. The catch below swallows
-  // errors, so nothing surfaced in the UI and nothing ever stopped the loop —
-  // it showed up only as a steady stream of 403s in the access log.
-  const canSeeNewStudies = canAccess(session, "/dicom-studies");
-  // readStaffSession() JSON.parses localStorage, so `session` is a NEW object
-  // on every render. Depending on it re-ran this effect on every render,
-  // tearing down the interval and firing an extra immediate poll each time —
-  // that is the burst of same-second requests in the access log, not the 30s
-  // interval. Depend on stable values instead.
-  const sessionUserId = session?.user.id;
-  useEffect(() => {
-    if (!sessionUserId || !canSeeNewStudies) return;
-    let mounted = true;
-    let lastPollAt = 0;
-    const poll = async () => {
-      if (isClinicPeakHours() && Date.now() - lastPollAt < 90_000) return;
-      lastPollAt = Date.now();
-      try {
-        const res = await api.get<{ studies: Array<{ id: number; patientName: string; modality: string; studyDescription: string | null; numberOfImages: number }>; serverTime: string }>(
-          `/api/dicom-studies/new?since=${encodeURIComponent(lastCheckRef.current)}`,
-        );
-        if (!mounted) return;
-        if (res.studies && res.studies.length > 0) {
-          setNewStudyCount((c) => c + res.studies.length);
-          // Show toast for the most recent study
-          const latest = res.studies[0];
-          import("@/hooks/use-toast").then(({ toast }) => {
-            toast({
-              title: `New DICOM study: ${latest.patientName || "Unknown"}`,
-              description: `${latest.modality || "OT"} — ${latest.studyDescription || "No description"} (${latest.numberOfImages} images)`,
-            });
-          });
-        }
-        lastCheckRef.current = res.serverTime || new Date().toISOString();
-      } catch {
-        // silently ignore polling errors
-      }
-    };
-    void poll();
-    const id = window.setInterval(() => { void poll(); }, 30_000);
-    return () => { mounted = false; window.clearInterval(id); };
-  }, [sessionUserId, canSeeNewStudies]);
+  // ── Study Auto-ingest Notifications — DISABLED for billing-only build ──
 
   // Mini sidebar theme picker state
   const [themePickerOpen, setThemePickerOpen] = useState(false);
@@ -1026,28 +931,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           </button>
         </div>
 
-        {/* R1.4 — this used to be an external link (with an SSO token) to a
-            standalone "Federated Radiology Service" on port 3002. That
-            service was scaffolded but never built and was explicitly
-            removed from docker-compose (2026-07-07); the link itself was
-            never cleaned up, so it was always visible and always failed to
-            connect — the first "Radiology Cockpit" button a radiologist
-            would find. It now opens the real, in-app Radiology Worklist
-            (from which every study's canonical Reporting Workspace is one
-            click away), reusing the same prominent shortcut placement. */}
-        <Link
-          href="/radiology/worklist"
-          onClick={() => { setSidebarOpen(false); if (autoMinimise) setSidebarCollapsed(true); }}
-          title="Open the Radiology Worklist"
-          className={cn(
-            "flex items-center rounded-lg text-sm font-medium transition-all cursor-pointer bg-primary/15 text-primary hover:bg-primary/25 border border-primary/30",
-            sidebarCollapsed ? "justify-center px-0 py-2.5 mx-1" : "gap-2 px-3 py-2.5 mx-2",
-          )}
-        >
-          <BrainCircuit size={16} />
-          {!sidebarCollapsed && <span>Radiology Worklist</span>}
-        </Link>
-
         {/* Nav */}
         <nav className={cn("flex-1 py-4 space-y-0.5 overflow-y-auto relative z-10", sidebarCollapsed ? "px-1" : "px-3")}>
           {visibleNav.map((entry) => {
@@ -1135,11 +1018,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 >
                   <GroupIcon size={15} />
                   <span className="flex-1 text-left">{label}</span>
-                  {id === "radiology-grp" && newStudyCount > 0 && (
-                    <span className="ml-1 inline-flex items-center justify-center min-w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[10px] font-bold px-1">
-                      {newStudyCount}
-                    </span>
-                  )}
                   <ChevronRight
                     size={13}
                     className={cn("transition-transform duration-150", open && "rotate-90")}

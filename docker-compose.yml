@@ -1,38 +1,12 @@
 # =============================================================================
-# Diagnostics ERP
+# Billing ERP (billing-only deployment)
+#
+# This is a billing-only variant of the diagnostics-erp. All radiology/AI/DICOM
+# files remain in the codebase but are excluded from routing and navigation.
+# Deployed alongside diagnostics-erp at different ports (3200/8300/5434).
 #
 # Schema update flow (automatic, every deployment):
-#   diagnostics-db (healthy) → diagnostics-db-patch-v2 → diagnostics-schema-verify → diagnostics-api → diagnostics-web
-#
-# diagnostics-db-patch-v2 is the SINGLE automatic schema container. It:
-#   1. Waits for PostgreSQL
-#   2. Bootstraps Drizzle migration tracking (idempotent)
-#   3. Applies Drizzle .sql migration files in order (skips already-applied)
-#   4. Applies imperative ADD COLUMN IF NOT EXISTS patches
-#   5. Applies feature migrations from migrations/ (Phase 1: MRI protocols, Phase 2: neuro prompts)
-#   All steps are idempotent. Safe to run on every deployment.
-#
-# diagnostics-schema-verify runs after diagnostics-db-patch-v2 and confirms the schema
-# actually matches what the application expects before diagnostics-api starts —
-# a safety check, not a migration step itself.
-#
-# diagnostics-migrate is MANUAL/EMERGENCY ONLY (profiles: [manual] — never starts
-# during a normal `docker compose up`):
-#   docker compose --profile manual run --rm diagnostics-migrate
-#   (Runs Drizzle TypeScript migrator — same migrations, alternative path.
-#   Use only when debugging a migration issue outside the normal flow.)
-#
-# diagnostics-migrate is ALSO the approved way to run one-off, owner-reviewed data
-# scripts against production (e.g. Phase F template consolidation, blank-
-# accession USG stamp backfill) — same container, same DATABASE_URL, no
-# separate infrastructure:
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:assess
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:execute
-#   docker compose run --rm diagnostics-migrate pnpm --filter @workspace/db run phase-f:rollback
-#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:dry-run
-#   docker compose --profile manual run --rm diagnostics-migrate pnpm --filter @workspace/db run stamp-accession:execute
-#
-# See SYNOLOGY_DB_MIGRATION_DEPLOYMENT.md for full deployment instructions.
+#   billing-erp-db (healthy) → billing-erp-db-patch-v2 → billing-erp-schema-verify → billing-erp-api → billing-erp-web
 # =============================================================================
 
 services:
@@ -42,7 +16,7 @@ services:
   # ---------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
-    container_name: diagnostics-db
+    container_name: billing-erp-db
     restart: unless-stopped
     logging:
       driver: json-file
@@ -77,15 +51,15 @@ services:
       #
       # Setting DB_BIND_ADDR=0.0.0.0 restores the old, exposed behaviour and
       # should only ever be paired with a strong DB_PASSWORD.
-      - "${DB_BIND_ADDR:-127.0.0.1}:${DB_HOST_PORT:-5433}:5432"
+      - "${DB_BIND_ADDR:-127.0.0.1}:${DB_HOST_PORT:-5434}:5432"
     environment:
       POSTGRES_USER: ${DB_USER:-erp}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-      POSTGRES_DB: ${DB_NAME:-diagnostic_erp}
+      POSTGRES_DB: ${DB_NAME:-billing_erp}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-erp} -d ${DB_NAME:-diagnostic_erp}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-erp} -d ${DB_NAME:-billing_erp}"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -112,17 +86,17 @@ services:
   # ---------------------------------------------------------------------------
   db-patch-v2:
     image: postgres:16-alpine
-    container_name: diagnostics-db-patch-v2
+    container_name: billing-erp-db-patch-v2
     restart: "no"
     environment:
       PGPASSWORD: ${DB_PASSWORD:-changeme}
       DB_HOST: db
       DB_USER: ${DB_USER:-erp}
-      DB_NAME: ${DB_NAME:-diagnostic_erp}
+      DB_NAME: ${DB_NAME:-billing_erp}
       # Identity stamp — used by the deployment guard to fail loudly instead
       # of running migrations against the wrong database (see system_database_
       # identity in docker/db-patch-entrypoint.sh and docs/DEPLOYMENT.md).
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-production}
       # Version metadata — stored in schema_deploy_state by the patch script
       ERP_VERSION: ${ERP_VERSION:-2.0.0}
@@ -166,12 +140,12 @@ services:
       context: .
       dockerfile: Dockerfile
       target: migrate
-    container_name: diagnostics-schema-verify
+    container_name: billing-erp-schema-verify
     restart: "no"
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
       # Auto-repair is OFF by default. Set to "true" only when you've reviewed
       # STARTUP_SCHEMA_VERIFICATION.md and specifically want ADD COLUMN/CREATE
       # TABLE/CREATE INDEX IF NOT EXISTS repairs applied on this deploy.
@@ -227,7 +201,7 @@ services:
         GIT_BRANCH: ${GIT_BRANCH:-unknown}
         GIT_TAG: ${GIT_TAG:-unknown}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    container_name: diagnostics-api
+    container_name: billing-erp-api
     restart: unless-stopped
     logging:
       driver: json-file
@@ -235,13 +209,13 @@ services:
         max-size: "10m"
         max-file: "5"
     labels:
-      com.diagnostics.version: ${ERP_VERSION:-2.0.0}
-      com.diagnostics.build: ${BUILD_NUMBER:-0}
-      com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
+      com.billing.version: ${ERP_VERSION:-2.0.0}
+      com.billing.build: ${BUILD_NUMBER:-0}
+      com.billing.git-commit: ${GIT_COMMIT:-unknown}
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      PORT: "8200"
+      PORT: "8300"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       TZ: ${TZ:-Asia/Kolkata}
       # Redis for caching (feature flags, sessions, rate limiting)
@@ -249,7 +223,7 @@ services:
       # Identity stamp checked (read-only) at startup before any compatibility
       # patches run — see runStartupMigrations() in src/index.ts. Must match
       # the same APP_NAME used by diagnostics-db-patch-v2 / diagnostics-schema-verify.
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
 
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env — use a 64-char random string}
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env — use a 64-char random string}
@@ -490,7 +464,7 @@ services:
       #   retries: 5         — 5 consecutive failures (75s after start_period)
       #     required before Docker marks the container unhealthy. Tolerates
       #     brief transient failures without triggering false unhealthy states.
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8300/health"]
       interval: 15s
       timeout: 10s
       start_period: 60s
@@ -527,7 +501,7 @@ services:
         # Canonical env: GIT_COMMIT (set by deploy-synology.sh). The Vite
         # resolver also accepts CARE_GIT_SHA / VITE_GIT_COMMIT as aliases.
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
-    container_name: diagnostics-web
+    container_name: billing-erp-web
     restart: unless-stopped
     logging:
       driver: json-file
@@ -538,11 +512,11 @@ services:
     # service's labels. The SPA also bakes VITE_GIT_COMMIT at build time;
     # Settings → About compares that to GET /api/health build.commit.
     labels:
-      com.diagnostics.version: ${ERP_VERSION:-2.0.0}
-      com.diagnostics.build: ${BUILD_NUMBER:-0}
-      com.diagnostics.git-commit: ${GIT_COMMIT:-unknown}
+      com.billing.version: ${ERP_VERSION:-2.0.0}
+      com.billing.build: ${BUILD_NUMBER:-0}
+      com.billing.git-commit: ${GIT_COMMIT:-unknown}
     ports:
-      - "${HOST_PORT:-3100}:80"
+      - "${HOST_PORT:-3200}:80"
     depends_on:
       api:
         condition: service_healthy
@@ -587,12 +561,12 @@ services:
       context: .
       dockerfile: Dockerfile
       target: migrate
-    container_name: diagnostics-migrate
+    container_name: billing-erp-migrate
     restart: "no"
     environment:
-      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-diagnostic_erp}
+      DATABASE_URL: postgres://${DB_USER:-erp}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-billing_erp}
       NODE_ENV: production
-      APP_NAME: ${APP_NAME:-diagnostics-erp}
+      APP_NAME: ${APP_NAME:-billing-erp}
     depends_on:
       db:
         condition: service_healthy
@@ -621,7 +595,7 @@ services:
   # ───────────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: diagnostics-redis
+    container_name: billing-erp-redis
     restart: unless-stopped
     logging:
       driver: json-file
@@ -644,6 +618,6 @@ services:
 volumes:
   db_data:
     external: true
-    name: diagnostics_main_db_data
+    name: billing_erp_main_db_data
   object_storage:
   uploads_data:

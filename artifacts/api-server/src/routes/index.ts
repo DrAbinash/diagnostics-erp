@@ -274,7 +274,7 @@ router.use("/emergency-bridge", emergencyBridgeRouter);
 // Federated Radiology Service boundary API — API-key auth (X-Boundary-Key),
 // not staff session. Mounted before staff-auth routes so the radiology
 // service can reach it server-to-server without a staff login.
-router.use("/boundary", boundaryRouter);
+// router.use("/boundary", boundaryRouter);  // billing-only: federated radiology service disabled
 // FHIR R4 read façade — Bearer FHIR_API_KEY (server-to-server), not staff session.
 // Returns 503 until FHIR_API_KEY is configured, so patient data stays unexposed by default.
 router.use("/fhir", fhirRouter);
@@ -297,7 +297,7 @@ router.use("/internal/backup", internalBackupRouter);
 // CARE Reporting Studio bridge — must mount BEFORE /internal catch-all
 // (internalRadiologyRouter applies requireStaffOrInternalAuth to every path).
 router.use("/internal/reporting-studio", internalReportingStudioRouter);
-router.use("/internal", internalRadiologyRouter); // [ZONE: radiology] name is generic, content is 100% radiology (DICOM agent callbacks)
+// router.use("/internal", internalRadiologyRouter); // billing-only: radiology disabled
 router.use("/portal", portalRouter);
 router.use("/portal/totp", requireStaffAuth, totpRouter);
 router.use("/display", displayRouter);
@@ -749,329 +749,329 @@ router.use(
   outsourcedLabsRouter,
 );
 
-// [ZONE: radiology] Radiology / PACS / DICOM / USG / AI reporting.
-// No direct billing impact — can be developed and debugged more freely
-// than the billing zone above. See /PROTECTED_FILES.md.
-
-// DICOM / PACS — /dicom-nodes permission
-router.use("/pacs", requireStaffAuth, requireStaffPermission("/dicom-nodes"), pacsRouter);
-router.use("/dicom", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomRouter);
-// DICOM Pull Agent Monitor — staff read-only, gated by /dicom-nodes permission
-router.use("/dicom-agent", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomAgentRouter);
-
-// Enterprise PACS features (upgraded C-ECHO, viewer launch, routing rules,
-// MWL procedures, pulled-studies stats, failed-queue retry).
-// Mounted BEFORE radiologyRouter so its handlers (e.g. echo-test upgrade) win.
-router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), pacsEnterpriseRouter);
-// Orthanc storage purge — admin-only (destructive), and deliberately NOT
-// gated by the /radiology permission so non-admins cannot gain purge via
-// Settings → Users toggles. The admin gate lives on the two purge routes
-// inside orthancPurge.ts, never here — the same shape as featureFlagsRouter
-// above, and for the same reason: this mount shares the bare "/radiology"
-// prefix with the rest of the namespace, and Express runs a mount-level
-// middleware for every request that matches the prefix, before the sub-router
-// gets to decline it. Gating here answered 403 "Admin access required" to
-// every non-admin request for /api/radiology/* — which is all of radiology
-// (worklist, study locks, report-generator, knowledge packs, presentation
-// templates), because radiologyRouter itself is mounted further down.
-router.use("/radiology", requireStaffAuth, orthancPurgeRouter);
-// Phase P3 — AI clinical workflow (scheduler/policy/preferences/draft). Every
-// endpoint is internally gated by the ff_radiology_ai master flag + per-scope
-// policy (default OFF), so mounting it exposes nothing until an admin enables it.
-router.use("/ai", requireStaffAuth, requireStaffPermission("/radiology"), aiClinicalRouter);
-// Phase P4 — AI enterprise interoperability (DICOM SR / FHIR / viewer sync /
-// timeline / comparison / feedback dataset). Same master flag + per-scope
-// gating as the clinical router; exports are admin-gated. Additive only.
-router.use("/ai/interop", requireStaffAuth, requireStaffPermission("/radiology"), aiInteropRouter);
-
-// USG auto-measurement extraction — all authenticated staff can trigger/review;
-// settings writes require admin role (enforced inside the router).
-router.use("/usg-extraction", requireStaffAuth, requireStaffPermission("/radiology"), usgExtractionRouter);
-
-// USG Doppler measurements — all authenticated staff can read/write.
-router.use("/usg-doppler", requireStaffAuth, requireStaffPermission("/radiology"), usgDopplerRouter);
-
-// USG Report Drafts — all authenticated staff can create/edit drafts.
-router.use("/usg-reports", requireStaffAuth, requireStaffPermission("/radiology"), usgReportsRouter);
-router.use("/usg-critical", requireStaffAuth, requireStaffPermission("/radiology"), usgCriticalAlertsRouter);
-router.use("/usg-analytics", requireStaffAuth, requireStaffPermission("/radiology"), usgAnalyticsRouter);
-
-// CARE USG Companion (Phase 1) — study-scoped assembly + telemetry + dashboard
-// stats. Composes existing engines only (no new measurement/template/copilot
-// engine). Study/assembly responses are shared resources (keyed by study), so
-// they are safe for the service worker to cache — no personal-identity scoping.
-router.use("/care-usg-companion", requireStaffAuth, requireStaffPermission("/radiology"), careUsgCompanionRouter);
-
-// USG Companion admin / rollout control plane (P9). Readiness matrix is readable
-// by any radiology staff; flag enable/disable/kill-switch are admin-only and
-// server-enforced (dependency + clinic-validation gates), and every change is
-// audited. This is the one surface that turns USG phase flags on/off.
-router.use("/usg-admin", requireStaffAuth, requireStaffPermission("/radiology"), usgAdminRouter);
-
-// USG P4 prior-study intelligence — comparable priors, structured comparison,
-// pregnancy timeline. Read-only; each endpoint is flag-gated (404 when OFF) and
-// same-patient guarded at both the SQL and the matcher layer.
-router.use("/usg-prior", requireStaffAuth, requireStaffPermission("/radiology"), usgPriorRouter);
-
-// USG P5 OB & Doppler — canonical sections built via the one obstetric engine.
-// Each endpoint is flag-gated (404 when OFF); responses are canonical section +
-// impression payloads the workspace merges into the draft. No fetal sex; Form-F
-// is display-only (the finalize gate stays fail-closed).
-router.use("/usg-ob-doppler", requireStaffAuth, requireStaffPermission("/radiology"), usgObDopplerRouter);
-
-// USG P6 report→PACS return — fail-closed eligibility + enqueue of the durable
-// USG_PACS_RETURN_JOB (drained by the existing per-minute cron). Flag-gated
-// (404 when OFF). The actual push is the canonical archiveReportToPacs; drafts
-// and superseded / PCPNDT-non-compliant reports are never enqueued.
-router.use("/usg-pacs-return", requireStaffAuth, requireStaffPermission("/radiology"), usgPacsReturnRouter);
-
-// USG P8 advisory AI — suggestion-only; accept-only; honest unavailable state
-// when no model gateway. Flag-gated (404 when OFF). AI can never reach a signed
-// report (write-guard throws on any non-draft target).
-router.use("/usg-ai", requireStaffAuth, requireStaffPermission("/radiology"), usgAiRouter);
-
-// USG P7 cine — capture key frames (DICOM references) from multi-frame clips.
-// Flag-gated (404 when OFF); DICOM references only, never a fabricated frame.
-router.use("/usg-cine", requireStaffAuth, requireStaffPermission("/radiology"), usgCineRouter);
-
-// CARE Knowledge Pack Engine — a registry/loader/validator over the existing
-// per-study-type content (quick findings / protocols / history / measurements /
-// impression rules / templates / teaching / knowledge). Reads: any radiology
-// staff. Mutations: admin-only (enforced inside the router). Purely additive.
-router.use("/radiology/knowledge-packs", requireStaffAuth, requireStaffPermission("/radiology"), radiologyKnowledgePacksRouter);
-router.use("/echo-cardiology", requireStaffAuth, requireStaffPermission("/radiology"), echoCardiologyRouter);
-router.use("/fetal-usg", requireStaffAuth, requireStaffPermission("/radiology"), fetalUsgLevel4Router);
-router.use("/fetal-usg-dashboard", requireStaffAuth, requireStaffPermission("/radiology"), pregnancyDashboardRouter);
-router.use("/radiology-copilot/sonologist-assistant", requireStaffAuth, requireStaffPermission("/radiology"), sonologistAssistantRouter);
-
-// Phase 10: RIS/PACS Foundation — DICOM study management + smart workflow
-router.use("/dicom-studies", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomStudyManagerRouter);
-router.use("/dicom-workflow", requireStaffAuth, requireStaffPermission("/radiology"), dicomWorkflowRouter);
-router.use("/smart-radiology", requireStaffAuth, requireStaffPermission("/radiology"), smartRadiologyRouter);
-// PR #101 Phase 2 — canonical Report Quality Engine (shadow; additive, no
-// existing endpoint replaced). Establishes the canonical persistence + API DTO.
-router.use("/report-quality", requireStaffAuth, requireStaffPermission("/radiology"), reportQualityRouter);
-
-// Phase 11: RIS/PACS Production Monitoring & Hardening
-router.use("/ris-monitor", requireStaffAuth, requireStaffPermission("/radiology"), risMonitoringRouter);
-
-// Phase 12: Real Radiology Workflow & DICOM Operations
-router.use("/radiology-workflow", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorkflowRouter);
-
-// Study locks / claiming (Ticket M1.6A) — one active lock per worklist study
-// so two radiologists never unknowingly report the same study. Mounted before
-// radiologyRouter; the /worklist-lock/* subpaths are unique to this router.
-router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorklistLocksRouter);
-
-// Assignment management (Ticket M1.6B1) — organizational ownership, distinct
-// from the lock above. /worklist-assignment/*, /radiologists, /workload.
-router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorklistAssignmentsRouter);
-
-// Voice-command audit (Ticket M1.6B2) — high-risk voice attempts/outcomes
-// into the hash-chained audit log. /voice-command-audit only.
-router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyVoiceRouter);
-
-// Backend v1 operational surface (Ticket BEND-1): health, consistency,
-// re-delivery obligations, durable jobs, audit verification, restore proof,
-// safe repairs. GET /health is staff-readable (masked); the rest is admin.
-router.use("/radiology-ops", requireStaffAuth, requireStaffPermission("/radiology"), radiologyOpsRouter);
-
-// Clinical-activation diagnostics toolkit (Ticket M1.3 "Flight Deck") —
-// read-only deployment/viewer/network/study/workflow/settings diagnostics.
-// Admin-only end to end (exposes unmasked endpoint topology).
-router.use("/radiology-diagnostics", requireStaffAuth, requireStaffPermission("/radiology"), radiologyDiagnosticsRouter);
-
-// Enterprise report template engine (Ticket R1.2): versioned presentation
-// templates. Reads/previews are staff-visible; mutations are admin-only,
-// audited, and version-creating only (published versions are immutable).
-router.use("/radiology/presentation-templates", requireStaffAuth, requireStaffPermission("/radiology"), presentationTemplatesRouter);
-
-// Radiology studies — open to all authenticated staff (doctors, radiologists, etc.)
-router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyRouter);
-
-// Radiology Report Generator — staff-accessible report builder with voice dictation,
-// key image upload, template library, draft save, and final report creation.
-router.use(
-  "/radiology/report-generator",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyReportGeneratorRouter,
-);
-
-// Attach an externally-produced (Word/PDF) final report to a radiology
-// study — the clinic composes reports in Word, not this app's structured
-// builder; see radiology-report-attachments.ts for the full rationale.
-router.use(
-  "/radiology/report-attachments",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyReportAttachmentsRouter,
-);
-
-router.use("/electronic-film/public", electronicFilmPublicRouter);
-
-router.use(
-  "/electronic-film",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  electronicFilmRouter,
-);
-
-// Editable findings library (Report Builder) — add/modify/delete abnormal
-// findings per modality + organ; seeded once from the mined house catalogue.
-router.use(
-  "/radiology/finding-library",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyFindingLibraryRouter,
-);
-
-// Structured report templates — open to all authenticated staff for reading.
-router.use(
-  "/radiology/structured-report-templates",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  structuredReportTemplatesRouter,
-);
-
-// Radiology Quick Select — configurable study tabs + one-click finding
-// buttons for the Reporting Workspace side panel. Reads: any radiology
-// staff. Mutations: admin-only (enforced inside the router).
-router.use(
-  "/radiology/quick-select",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyQuickFindingsRouter,
-);
-
-// Radiology Canonical Catalog (Tickets B1 + B2) — the canonical parameter
-// library + finding graph. FOUNDATION ONLY: the router itself is gated behind
-// the ff_radiology_catalog feature flag (default OFF) and returns 404 until
-// enabled, so nothing in the running product consumes these tables yet. Reads:
-// radiology staff. Mutations: admin-only (enforced inside the router).
-router.use(
-  "/radiology/catalog",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyCatalogRouter,
-);
-
-// Radiology Content Pack Tiles — serves YAML content-pack findings as QuickSelectTiles
-// to the reporting workspace. NOT gated behind ff_radiology_catalog — reads seed YAML.
-router.use(
-  "/radiology/content-pack-tiles",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyContentPackTilesRouter,
-);
-
-// Radiology Whisper Proxy — local STT for air-gapped deployments
-router.use(
-  "/radiology/whisper",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyWhisperProxyRouter,
-);
-
-// Radiology Snippets — Quick Add, Smart Format, Favorites, Macros
-router.use(
-  "/radiology/snippets",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologySnippetsRouter,
-);
-
-// Whole-report formats (Z.ai ReportFormat library) — radiology_snippets type=report_format
-router.use(
-  "/radiology/report-formats",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyReportFormatsRouter,
-);
-
-// Phase 4: Radiology Knowledge Platform — Master Templates, Personal Library, Knowledge Base
-router.use(
-  "/radiology/knowledge",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologyKnowledgeRouter,
-);
-
-// Phase 5: Structured Smart Reporting Engine — Deterministic rules-based text generation
-router.use(
-  "/radiology/smart",
-  requireStaffAuth,
-  requireStaffPermission("/radiology"),
-  radiologySmartFindingsRouter,
-);
-
-// Clinical report & compliance routes — /reports permission.
-// These expose patient PHI (names, codes, phone, email, test details),
-// clinician signature records, and compliance Form-F data. Restricting them
-// to the /reports permission matches every other sensitive clinical module.
-router.use("/form-f", requireStaffAuth, requireStaffPermission("/form-f"), formFRouter);
-router.use("/patient-reports", requireStaffAuth, requireStaffPermission("/reports"), patientReportsRouter);
-router.use("/signatures", requireStaffAuth, requireStaffPermission("/reports"), signaturesRouter);
-// Same permission as /patient-reports — this is the result-entry grid's own
-// flag-suggestion call, not the admin-only /pathology-registry console.
-router.use("/pathology-flag-preview", requireStaffAuth, requireStaffPermission("/reports"), pathologyFlagPreviewRouter);
-// Staff-selected WhatsApp report delivery + read-receipt tracking + reminders.
-// Gated additionally by ff_report_delivery_receipts (Shadow Mode) inside the router.
-router.use("/report-delivery-tracking", requireStaffAuth, requireStaffPermission("/reports"), reportDeliveryTrackingRouter);
-// Recall / follow-up engine. Gated additionally by ff_recall_engine (Shadow Mode) inside the router.
-router.use("/recall", requireStaffAuth, requireStaffPermission("/reports"), recallRouter);
-// Patient feedback / NPS dashboard (staff). Gated additionally by ff_feedback_nps (Shadow Mode) inside the router.
-router.use("/feedback", requireStaffAuth, requireStaffPermission("/reports"), feedbackRouter);
-// Online payment links for bills — additive scaffolding that reuses the
-// sanctioned gateway/webhook path (no writes to bills/payments/vouchers). Gated
-// additionally by ff_online_payment_links (Shadow Mode, disabled) inside the router.
-router.use("/bill-payment-links", requireStaffAuth, requireStaffPermission("/billing"), billPaymentLinksRouter);
-
-// AI Radiology Reporting — encrypted API keys, audit logging, draft management
-router.use("/ai-reporting", requireStaffAuth, aiReportingRouter);
-
-// AI Prompt Templates — modality-aware, versioned, editable-without-code prompts
-router.use("/ai-prompt-templates", requireStaffAuth, aiPromptTemplatesRouter);
-router.use("/ai-prompt-library", requireStaffAuth, aiPromptLibraryRouter);
-router.use("/ai-model-routing", requireStaffAuth, aiModelRoutesRouter);
-
-// Unified OCR + local-AI pipeline health / model registry / non-PHI smoke test
-router.use("/ai-pipeline", requireStaffAuth, aiPipelineHealthRouter);
-
-// AI Comparison Workspace
-router.use("/ai-comparison", requireStaffAuth, aiComparisonRouter);
-
-// Phase 8: Teaching Files
-router.use("/teaching-cases", requireStaffAuth, teachingCasesRouter);
-
-// Phase 8: Radiology Copilot — Prior Study, Measurements, Smart Impression, Consistency, Follow-up
-router.use("/radiology-copilot", requireStaffAuth, radiologyCopilotRouter);
-
-// Phase 9: Radiology Memory + Context Engine
-router.use("/radiology-memory", requireStaffAuth, radiologyMemoryRouter);
-
-// Phase 5: Personal Reporting Analytics
-router.use("/radiology/my-analytics", requireStaffAuth, requireStaffPermission("/radiology"), radiologyMyAnalyticsRouter);
-
-// Phase 10A: Lesion Tracker + Measurement Assistant
-router.use("/radiology-lesions", requireStaffAuth, radiologyLesionsRouter);
-
-// Phase 10B: Organ Intelligence — Spine, Brain, Tumor follow-up
-router.use("/radiology-spine", requireStaffAuth, radiologySpineIntelligenceRouter);
-router.use("/radiology-brain", requireStaffAuth, radiologyBrainIntelligenceRouter);
-router.use("/radiology-tumor", requireStaffAuth, radiologyTumorFollowupRouter);
-
-// Phase 10C: AI Research Platform — Annotations, Ollama local models
-router.use("/radiology-annotations", requireStaffAuth, radiologyAnnotationsRouter);
-router.use("/radiology-ollama", requireStaffAuth, radiologyOllamaRouter);
-router.use("/radiology/voice-report-composer", requireStaffAuth, voiceReportComposerRouter);
-router.use("/radiology/report-composer", requireStaffAuth, reportComposerRouter);
-
-// AI endpoints — each sub-route applies its own requireStaffPermission matching
-// the data domain it accesses (patients PHI, billing records, or radiology
-// orders). requireStaffAuth here provides the outer authentication guard;
-// per-route permission checks inside aiRouter enforce module-level access.
-router.use("/ai", requireStaffAuth, aiRouter);
+// // [ZONE: radiology] Radiology / PACS / DICOM / USG / AI reporting.
+// // No direct billing impact — can be developed and debugged more freely
+// // than the billing zone above. See /PROTECTED_FILES.md.
+// 
+// // DICOM / PACS — /dicom-nodes permission
+// router.use("/pacs", requireStaffAuth, requireStaffPermission("/dicom-nodes"), pacsRouter);
+// router.use("/dicom", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomRouter);
+// // DICOM Pull Agent Monitor — staff read-only, gated by /dicom-nodes permission
+// router.use("/dicom-agent", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomAgentRouter);
+// 
+// // Enterprise PACS features (upgraded C-ECHO, viewer launch, routing rules,
+// // MWL procedures, pulled-studies stats, failed-queue retry).
+// // Mounted BEFORE radiologyRouter so its handlers (e.g. echo-test upgrade) win.
+// router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), pacsEnterpriseRouter);
+// // Orthanc storage purge — admin-only (destructive), and deliberately NOT
+// // gated by the /radiology permission so non-admins cannot gain purge via
+// // Settings → Users toggles. The admin gate lives on the two purge routes
+// // inside orthancPurge.ts, never here — the same shape as featureFlagsRouter
+// // above, and for the same reason: this mount shares the bare "/radiology"
+// // prefix with the rest of the namespace, and Express runs a mount-level
+// // middleware for every request that matches the prefix, before the sub-router
+// // gets to decline it. Gating here answered 403 "Admin access required" to
+// // every non-admin request for /api/radiology/* — which is all of radiology
+// // (worklist, study locks, report-generator, knowledge packs, presentation
+// // templates), because radiologyRouter itself is mounted further down.
+// router.use("/radiology", requireStaffAuth, orthancPurgeRouter);
+// // Phase P3 — AI clinical workflow (scheduler/policy/preferences/draft). Every
+// // endpoint is internally gated by the ff_radiology_ai master flag + per-scope
+// // policy (default OFF), so mounting it exposes nothing until an admin enables it.
+// router.use("/ai", requireStaffAuth, requireStaffPermission("/radiology"), aiClinicalRouter);
+// // Phase P4 — AI enterprise interoperability (DICOM SR / FHIR / viewer sync /
+// // timeline / comparison / feedback dataset). Same master flag + per-scope
+// // gating as the clinical router; exports are admin-gated. Additive only.
+// router.use("/ai/interop", requireStaffAuth, requireStaffPermission("/radiology"), aiInteropRouter);
+// 
+// // USG auto-measurement extraction — all authenticated staff can trigger/review;
+// // settings writes require admin role (enforced inside the router).
+// router.use("/usg-extraction", requireStaffAuth, requireStaffPermission("/radiology"), usgExtractionRouter);
+// 
+// // USG Doppler measurements — all authenticated staff can read/write.
+// router.use("/usg-doppler", requireStaffAuth, requireStaffPermission("/radiology"), usgDopplerRouter);
+// 
+// // USG Report Drafts — all authenticated staff can create/edit drafts.
+// router.use("/usg-reports", requireStaffAuth, requireStaffPermission("/radiology"), usgReportsRouter);
+// router.use("/usg-critical", requireStaffAuth, requireStaffPermission("/radiology"), usgCriticalAlertsRouter);
+// router.use("/usg-analytics", requireStaffAuth, requireStaffPermission("/radiology"), usgAnalyticsRouter);
+// 
+// // CARE USG Companion (Phase 1) — study-scoped assembly + telemetry + dashboard
+// // stats. Composes existing engines only (no new measurement/template/copilot
+// // engine). Study/assembly responses are shared resources (keyed by study), so
+// // they are safe for the service worker to cache — no personal-identity scoping.
+// router.use("/care-usg-companion", requireStaffAuth, requireStaffPermission("/radiology"), careUsgCompanionRouter);
+// 
+// // USG Companion admin / rollout control plane (P9). Readiness matrix is readable
+// // by any radiology staff; flag enable/disable/kill-switch are admin-only and
+// // server-enforced (dependency + clinic-validation gates), and every change is
+// // audited. This is the one surface that turns USG phase flags on/off.
+// router.use("/usg-admin", requireStaffAuth, requireStaffPermission("/radiology"), usgAdminRouter);
+// 
+// // USG P4 prior-study intelligence — comparable priors, structured comparison,
+// // pregnancy timeline. Read-only; each endpoint is flag-gated (404 when OFF) and
+// // same-patient guarded at both the SQL and the matcher layer.
+// router.use("/usg-prior", requireStaffAuth, requireStaffPermission("/radiology"), usgPriorRouter);
+// 
+// // USG P5 OB & Doppler — canonical sections built via the one obstetric engine.
+// // Each endpoint is flag-gated (404 when OFF); responses are canonical section +
+// // impression payloads the workspace merges into the draft. No fetal sex; Form-F
+// // is display-only (the finalize gate stays fail-closed).
+// router.use("/usg-ob-doppler", requireStaffAuth, requireStaffPermission("/radiology"), usgObDopplerRouter);
+// 
+// // USG P6 report→PACS return — fail-closed eligibility + enqueue of the durable
+// // USG_PACS_RETURN_JOB (drained by the existing per-minute cron). Flag-gated
+// // (404 when OFF). The actual push is the canonical archiveReportToPacs; drafts
+// // and superseded / PCPNDT-non-compliant reports are never enqueued.
+// router.use("/usg-pacs-return", requireStaffAuth, requireStaffPermission("/radiology"), usgPacsReturnRouter);
+// 
+// // USG P8 advisory AI — suggestion-only; accept-only; honest unavailable state
+// // when no model gateway. Flag-gated (404 when OFF). AI can never reach a signed
+// // report (write-guard throws on any non-draft target).
+// router.use("/usg-ai", requireStaffAuth, requireStaffPermission("/radiology"), usgAiRouter);
+// 
+// // USG P7 cine — capture key frames (DICOM references) from multi-frame clips.
+// // Flag-gated (404 when OFF); DICOM references only, never a fabricated frame.
+// router.use("/usg-cine", requireStaffAuth, requireStaffPermission("/radiology"), usgCineRouter);
+// 
+// // CARE Knowledge Pack Engine — a registry/loader/validator over the existing
+// // per-study-type content (quick findings / protocols / history / measurements /
+// // impression rules / templates / teaching / knowledge). Reads: any radiology
+// // staff. Mutations: admin-only (enforced inside the router). Purely additive.
+// router.use("/radiology/knowledge-packs", requireStaffAuth, requireStaffPermission("/radiology"), radiologyKnowledgePacksRouter);
+// router.use("/echo-cardiology", requireStaffAuth, requireStaffPermission("/radiology"), echoCardiologyRouter);
+// router.use("/fetal-usg", requireStaffAuth, requireStaffPermission("/radiology"), fetalUsgLevel4Router);
+// router.use("/fetal-usg-dashboard", requireStaffAuth, requireStaffPermission("/radiology"), pregnancyDashboardRouter);
+// router.use("/radiology-copilot/sonologist-assistant", requireStaffAuth, requireStaffPermission("/radiology"), sonologistAssistantRouter);
+// 
+// // Phase 10: RIS/PACS Foundation — DICOM study management + smart workflow
+// router.use("/dicom-studies", requireStaffAuth, requireStaffPermission("/dicom-nodes"), dicomStudyManagerRouter);
+// router.use("/dicom-workflow", requireStaffAuth, requireStaffPermission("/radiology"), dicomWorkflowRouter);
+// router.use("/smart-radiology", requireStaffAuth, requireStaffPermission("/radiology"), smartRadiologyRouter);
+// // PR #101 Phase 2 — canonical Report Quality Engine (shadow; additive, no
+// // existing endpoint replaced). Establishes the canonical persistence + API DTO.
+// router.use("/report-quality", requireStaffAuth, requireStaffPermission("/radiology"), reportQualityRouter);
+// 
+// // Phase 11: RIS/PACS Production Monitoring & Hardening
+// router.use("/ris-monitor", requireStaffAuth, requireStaffPermission("/radiology"), risMonitoringRouter);
+// 
+// // Phase 12: Real Radiology Workflow & DICOM Operations
+// router.use("/radiology-workflow", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorkflowRouter);
+// 
+// // Study locks / claiming (Ticket M1.6A) — one active lock per worklist study
+// // so two radiologists never unknowingly report the same study. Mounted before
+// // radiologyRouter; the /worklist-lock/* subpaths are unique to this router.
+// router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorklistLocksRouter);
+// 
+// // Assignment management (Ticket M1.6B1) — organizational ownership, distinct
+// // from the lock above. /worklist-assignment/*, /radiologists, /workload.
+// router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyWorklistAssignmentsRouter);
+// 
+// // Voice-command audit (Ticket M1.6B2) — high-risk voice attempts/outcomes
+// // into the hash-chained audit log. /voice-command-audit only.
+// router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyVoiceRouter);
+// 
+// // Backend v1 operational surface (Ticket BEND-1): health, consistency,
+// // re-delivery obligations, durable jobs, audit verification, restore proof,
+// // safe repairs. GET /health is staff-readable (masked); the rest is admin.
+// router.use("/radiology-ops", requireStaffAuth, requireStaffPermission("/radiology"), radiologyOpsRouter);
+// 
+// // Clinical-activation diagnostics toolkit (Ticket M1.3 "Flight Deck") —
+// // read-only deployment/viewer/network/study/workflow/settings diagnostics.
+// // Admin-only end to end (exposes unmasked endpoint topology).
+// router.use("/radiology-diagnostics", requireStaffAuth, requireStaffPermission("/radiology"), radiologyDiagnosticsRouter);
+// 
+// // Enterprise report template engine (Ticket R1.2): versioned presentation
+// // templates. Reads/previews are staff-visible; mutations are admin-only,
+// // audited, and version-creating only (published versions are immutable).
+// router.use("/radiology/presentation-templates", requireStaffAuth, requireStaffPermission("/radiology"), presentationTemplatesRouter);
+// 
+// // Radiology studies — open to all authenticated staff (doctors, radiologists, etc.)
+// router.use("/radiology", requireStaffAuth, requireStaffPermission("/radiology"), radiologyRouter);
+// 
+// // Radiology Report Generator — staff-accessible report builder with voice dictation,
+// // key image upload, template library, draft save, and final report creation.
+// router.use(
+//   "/radiology/report-generator",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyReportGeneratorRouter,
+// );
+// 
+// // Attach an externally-produced (Word/PDF) final report to a radiology
+// // study — the clinic composes reports in Word, not this app's structured
+// // builder; see radiology-report-attachments.ts for the full rationale.
+// router.use(
+//   "/radiology/report-attachments",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyReportAttachmentsRouter,
+// );
+// 
+// router.use("/electronic-film/public", electronicFilmPublicRouter);
+// 
+// router.use(
+//   "/electronic-film",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   electronicFilmRouter,
+// );
+// 
+// // Editable findings library (Report Builder) — add/modify/delete abnormal
+// // findings per modality + organ; seeded once from the mined house catalogue.
+// router.use(
+//   "/radiology/finding-library",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyFindingLibraryRouter,
+// );
+// 
+// // Structured report templates — open to all authenticated staff for reading.
+// router.use(
+//   "/radiology/structured-report-templates",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   structuredReportTemplatesRouter,
+// );
+// 
+// // Radiology Quick Select — configurable study tabs + one-click finding
+// // buttons for the Reporting Workspace side panel. Reads: any radiology
+// // staff. Mutations: admin-only (enforced inside the router).
+// router.use(
+//   "/radiology/quick-select",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyQuickFindingsRouter,
+// );
+// 
+// // Radiology Canonical Catalog (Tickets B1 + B2) — the canonical parameter
+// // library + finding graph. FOUNDATION ONLY: the router itself is gated behind
+// // the ff_radiology_catalog feature flag (default OFF) and returns 404 until
+// // enabled, so nothing in the running product consumes these tables yet. Reads:
+// // radiology staff. Mutations: admin-only (enforced inside the router).
+// router.use(
+//   "/radiology/catalog",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyCatalogRouter,
+// );
+// 
+// // Radiology Content Pack Tiles — serves YAML content-pack findings as QuickSelectTiles
+// // to the reporting workspace. NOT gated behind ff_radiology_catalog — reads seed YAML.
+// router.use(
+//   "/radiology/content-pack-tiles",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyContentPackTilesRouter,
+// );
+// 
+// // Radiology Whisper Proxy — local STT for air-gapped deployments
+// router.use(
+//   "/radiology/whisper",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyWhisperProxyRouter,
+// );
+// 
+// // Radiology Snippets — Quick Add, Smart Format, Favorites, Macros
+// router.use(
+//   "/radiology/snippets",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologySnippetsRouter,
+// );
+// 
+// // Whole-report formats (Z.ai ReportFormat library) — radiology_snippets type=report_format
+// router.use(
+//   "/radiology/report-formats",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyReportFormatsRouter,
+// );
+// 
+// // Phase 4: Radiology Knowledge Platform — Master Templates, Personal Library, Knowledge Base
+// router.use(
+//   "/radiology/knowledge",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologyKnowledgeRouter,
+// );
+// 
+// // Phase 5: Structured Smart Reporting Engine — Deterministic rules-based text generation
+// router.use(
+//   "/radiology/smart",
+//   requireStaffAuth,
+//   requireStaffPermission("/radiology"),
+//   radiologySmartFindingsRouter,
+// );
+// 
+// // Clinical report & compliance routes — /reports permission.
+// // These expose patient PHI (names, codes, phone, email, test details),
+// // clinician signature records, and compliance Form-F data. Restricting them
+// // to the /reports permission matches every other sensitive clinical module.
+// router.use("/form-f", requireStaffAuth, requireStaffPermission("/form-f"), formFRouter);
+// router.use("/patient-reports", requireStaffAuth, requireStaffPermission("/reports"), patientReportsRouter);
+// router.use("/signatures", requireStaffAuth, requireStaffPermission("/reports"), signaturesRouter);
+// // Same permission as /patient-reports — this is the result-entry grid's own
+// // flag-suggestion call, not the admin-only /pathology-registry console.
+// router.use("/pathology-flag-preview", requireStaffAuth, requireStaffPermission("/reports"), pathologyFlagPreviewRouter);
+// // Staff-selected WhatsApp report delivery + read-receipt tracking + reminders.
+// // Gated additionally by ff_report_delivery_receipts (Shadow Mode) inside the router.
+// router.use("/report-delivery-tracking", requireStaffAuth, requireStaffPermission("/reports"), reportDeliveryTrackingRouter);
+// // Recall / follow-up engine. Gated additionally by ff_recall_engine (Shadow Mode) inside the router.
+// router.use("/recall", requireStaffAuth, requireStaffPermission("/reports"), recallRouter);
+// // Patient feedback / NPS dashboard (staff). Gated additionally by ff_feedback_nps (Shadow Mode) inside the router.
+// router.use("/feedback", requireStaffAuth, requireStaffPermission("/reports"), feedbackRouter);
+// // Online payment links for bills — additive scaffolding that reuses the
+// // sanctioned gateway/webhook path (no writes to bills/payments/vouchers). Gated
+// // additionally by ff_online_payment_links (Shadow Mode, disabled) inside the router.
+// router.use("/bill-payment-links", requireStaffAuth, requireStaffPermission("/billing"), billPaymentLinksRouter);
+// 
+// // AI Radiology Reporting — encrypted API keys, audit logging, draft management
+// router.use("/ai-reporting", requireStaffAuth, aiReportingRouter);
+// 
+// // AI Prompt Templates — modality-aware, versioned, editable-without-code prompts
+// router.use("/ai-prompt-templates", requireStaffAuth, aiPromptTemplatesRouter);
+// router.use("/ai-prompt-library", requireStaffAuth, aiPromptLibraryRouter);
+// router.use("/ai-model-routing", requireStaffAuth, aiModelRoutesRouter);
+// 
+// // Unified OCR + local-AI pipeline health / model registry / non-PHI smoke test
+// router.use("/ai-pipeline", requireStaffAuth, aiPipelineHealthRouter);
+// 
+// // AI Comparison Workspace
+// router.use("/ai-comparison", requireStaffAuth, aiComparisonRouter);
+// 
+// // Phase 8: Teaching Files
+// router.use("/teaching-cases", requireStaffAuth, teachingCasesRouter);
+// 
+// // Phase 8: Radiology Copilot — Prior Study, Measurements, Smart Impression, Consistency, Follow-up
+// router.use("/radiology-copilot", requireStaffAuth, radiologyCopilotRouter);
+// 
+// // Phase 9: Radiology Memory + Context Engine
+// router.use("/radiology-memory", requireStaffAuth, radiologyMemoryRouter);
+// 
+// // Phase 5: Personal Reporting Analytics
+// router.use("/radiology/my-analytics", requireStaffAuth, requireStaffPermission("/radiology"), radiologyMyAnalyticsRouter);
+// 
+// // Phase 10A: Lesion Tracker + Measurement Assistant
+// router.use("/radiology-lesions", requireStaffAuth, radiologyLesionsRouter);
+// 
+// // Phase 10B: Organ Intelligence — Spine, Brain, Tumor follow-up
+// router.use("/radiology-spine", requireStaffAuth, radiologySpineIntelligenceRouter);
+// router.use("/radiology-brain", requireStaffAuth, radiologyBrainIntelligenceRouter);
+// router.use("/radiology-tumor", requireStaffAuth, radiologyTumorFollowupRouter);
+// 
+// // Phase 10C: AI Research Platform — Annotations, Ollama local models
+// router.use("/radiology-annotations", requireStaffAuth, radiologyAnnotationsRouter);
+// router.use("/radiology-ollama", requireStaffAuth, radiologyOllamaRouter);
+// router.use("/radiology/voice-report-composer", requireStaffAuth, voiceReportComposerRouter);
+// router.use("/radiology/report-composer", requireStaffAuth, reportComposerRouter);
+// 
+// // AI endpoints — each sub-route applies its own requireStaffPermission matching
+// // the data domain it accesses (patients PHI, billing records, or radiology
+// // orders). requireStaffAuth here provides the outer authentication guard;
+// // per-route permission checks inside aiRouter enforce module-level access.
+// router.use("/ai", requireStaffAuth, aiRouter);
 
 // ─── Unrestricted staff-authenticated routes ──────────────────────────────────
 // These routes serve operational functions genuinely shared across all staff
