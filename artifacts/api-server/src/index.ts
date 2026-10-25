@@ -39,7 +39,7 @@ bootStep("pluginLoaderUsbScan", () => initializePluginLoader(app));
 import { logger } from "./lib/logger";
 import { reportWeakGuardedSecrets } from "./lib/secretStrength";
 import { NETWORK_LAN_HOST, DEFAULT_OHIF_BROWSER_BASE_URL } from "./lib/networkDefaults";
-import { startAiReportComposeJobConsumer, startCronScheduler } from "./cron";
+import { startCronScheduler } from "./cron";
 import { startIntegrationScheduler } from "./services/integration/scheduler";
 import { ensureDefaultLedger } from "./routes/ledgers";
 import { backfillExpirePublicTokens } from "./routes/patient-reports";
@@ -2896,7 +2896,6 @@ const server = app.listen(
 
   // Text report compose drain — same bootstrap requirement as overnight AI.
   try {
-    bootStep("aiReportComposeJobConsumer", () => startAiReportComposeJobConsumer());
   } catch (err) {
     logger.error({ err }, "AI report compose consumer failed to register");
   }

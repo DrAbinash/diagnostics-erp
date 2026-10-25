@@ -36,7 +36,6 @@ import {
 let currentTask: ReturnType<typeof cron.schedule> | null = null;
 let overnightAiTickInFlight = false;
 let overnightAiInterval: ReturnType<typeof setInterval> | null = null;
-let aiReportComposeConsumerStarted = false;
 // Track already-fired events per day to avoid double-firing
 const firedToday = new Set<string>();
 
@@ -158,56 +157,6 @@ function scheduleAiSchedulerModes() {
  * unset (same class of bootstrap gap as overnight AI). Drains ai_report_compose
  * only; never shares the overnight vision lane.
  */
-export function startAiReportComposeJobConsumer(): void {
-  if (aiReportComposeConsumerStarted) return;
-  aiReportComposeConsumerStarted = true;
-  // Re-entrancy guard: a cloud call can outlast the tick that started it, and two
-  // overlapping ticks on one worker only mean the second one polls while the
-  // first is still holding a job.
-  let inFlight = false;
-  const run = () => {
-    if (inFlight) return;
-    inFlight = true;
-    fireAiReportComposeTick()
-      .catch((err) => {
-        console.error("[cron] ai report compose tick failed:", err);
-      })
-      .finally(() => {
-        inFlight = false;
-      });
-  };
-  setTimeout(run, 10_000).unref?.();
-  // 20 s, not just the minute hand. The radiologist clicked "professionalise
-  // this report" and is looking at a spinner: on a minute-only cron the request
-  // could sit queued for 59 seconds before the model was even asked, which is
-  // more latency than the slowest local model in this clinic adds to the answer.
-  setInterval(run, 20_000).unref?.();
-  cron.schedule("* * * * *", async () => {
-    try {
-      await fireAiReportComposeTick();
-    } catch (err) {
-      console.error("[cron] ai report compose cron tick failed:", err);
-    }
-  });
-  console.log("[cron] ai report compose consumer registered (10s first poll, then every 20s; independent of ENABLE_SCHEDULERS)");
-}
-
-async function fireAiReportComposeTick(): Promise<void> {
-  const { AI_REPORT_COMPOSE_JOB } = await import("./lib/reportComposer/jobService");
-  const handler = RADIOLOGY_JOB_HANDLERS[AI_REPORT_COMPOSE_JOB];
-  if (!handler) {
-    console.error("[cron] ai_report_compose handler missing from RADIOLOGY_JOB_HANDLERS");
-    return;
-  }
-  await runRadiologyJobTick(
-    { [AI_REPORT_COMPOSE_JOB]: handler },
-    {
-      maxJobs: 2,
-      concurrencyByType: { [AI_REPORT_COMPOSE_JOB]: 1 },
-      workerId: `ai-report-compose-${process.pid}`,
-    },
-  );
-}
 
 /** Non-AI dicom_retry_queue types (restore-verify, redelivery, PACS). ENABLE_SCHEDULERS only. */
 // ── BEND-1: scheduled audit-chain verification (safe default cadence) ────────

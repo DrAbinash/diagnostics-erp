@@ -43,13 +43,7 @@ export {
   formatReferenceRange,
 } from "./referenceRanges";
 
-export {
-  sanitizeDicomSex,
-  dicomSexForDisplay,
-  genderToDicomSex,
-  isPlausibleDicomSex,
-  type DicomSexCode,
-} from "./dicomSex";
+// dicomSex removed for billing-only version
 
 export {
   parseNumericResult,

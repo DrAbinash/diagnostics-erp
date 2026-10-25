@@ -73,7 +73,7 @@ import { aiCallerCredentialsRouter } from "./aiCallerCredentials";
 import { abnormalFindingsRouter } from "./abnormal-findings";
 import formFRouter from "./form-f";
 import { portalRouter } from "./portal";
-import { patientReportsRouter, signaturesRouter, publicReportsRouter } from "./patient-reports";
+// Patient reports removed for billing-only version
 import { pathologyFlagPreviewRouter } from "./pathologyFlagPreview";
 import { machinesRouter } from "./machines";
 import { departmentsRouter } from "./departments";
@@ -252,7 +252,7 @@ router.use("/settings/queue-display", queueDisplaySettingsRouter);
 router.use("/payment-display", paymentDisplayRouter);
 router.use("/bridge", bridgeRouter);
 // Public tokenized PDF download for patient WhatsApp links — no staff auth.
-router.use("/p/r", publicReportsRouter);
+// Public reports router removed for billing-only version
 router.use("/share", publicShareRouter);
 // Public tokenized patient feedback / NPS form — no staff auth. Serves a
 // self-contained HTML page and records the response. Gated by ff_feedback_nps.
@@ -816,8 +816,7 @@ router.use(
 // clinician signature records, and compliance Form-F data. Restricting them
 // to the /reports permission matches every other sensitive clinical module.
 router.use("/form-f", requireStaffAuth, requireStaffPermission("/form-f"), formFRouter);
-router.use("/patient-reports", requireStaffAuth, requireStaffPermission("/reports"), patientReportsRouter);
-router.use("/signatures", requireStaffAuth, requireStaffPermission("/reports"), signaturesRouter);
+// Patient reports and signatures routers removed for billing-only version
 // Same permission as /patient-reports — this is the result-entry grid's own
 // flag-suggestion call, not the admin-only /pathology-registry console.
 router.use("/pathology-flag-preview", requireStaffAuth, requireStaffPermission("/reports"), pathologyFlagPreviewRouter);
