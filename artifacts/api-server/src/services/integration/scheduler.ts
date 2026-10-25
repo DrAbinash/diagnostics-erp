@@ -15,8 +15,6 @@ import { dispatchPendingOutbox } from "./outbox";
 import { reconcileResults } from "./resultsEmitter";
 import { reconcileStatuses } from "./statusReconciler";
 import { escalateCriticalResults } from "./criticalEscalation";
-import { pollElectronicFilmJobs } from "../electronicFilm/poller";
-import { getElectronicFilmSettings } from "../electronicFilm/settings";
 
 let flagCache: { value: boolean; at: number } | null = null;
 export async function integrationEnabled(): Promise<boolean> {

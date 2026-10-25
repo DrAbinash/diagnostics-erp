@@ -420,7 +420,6 @@ export async function dispatchPendingOutbox(opts: { limit?: number; workerId?: s
         if (row.eventType === "diagnostic_electronic_film.available") {
           const payload = row.payload as { careFilmArtifactId?: number };
           if (payload?.careFilmArtifactId) {
-            const { markFilmHopeSent } = await import("../electronicFilm/hopeEmitter.js");
             await markFilmHopeSent(payload.careFilmArtifactId).catch(() => {});
           }
         }
@@ -489,7 +488,6 @@ async function markFilmHopeUndelivered(
   if (row.eventType !== "diagnostic_electronic_film.available") return;
   const artifactId = (row.payload as { careFilmArtifactId?: number } | null)?.careFilmArtifactId;
   if (!artifactId) return;
-  const { markFilmHopeFailed } = await import("../electronicFilm/hopeEmitter.js");
   await markFilmHopeFailed(artifactId, `Hope did not accept this film: ${reason}`)
     .catch((e) => console.error(`[integration] film artifact ${artifactId} failure marking failed:`, (e as Error)?.message));
 }

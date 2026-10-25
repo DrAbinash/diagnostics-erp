@@ -808,9 +808,6 @@ router.use(
 // Phase 4: Radiology Knowledge Platform — Master Templates, Personal Library, Knowledge Base
 router.use(
 
-// Phase 5: Structured Smart Reporting Engine — Deterministic rules-based text generation
-router.use(
-
 // Clinical report & compliance routes — /reports permission.
 // These expose patient PHI (names, codes, phone, email, test details),
 // clinician signature records, and compliance Form-F data. Restricting them
