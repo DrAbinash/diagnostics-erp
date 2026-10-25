@@ -73,7 +73,6 @@ import { aiCallerCredentialsRouter } from "./aiCallerCredentials";
 import { abnormalFindingsRouter } from "./abnormal-findings";
 import formFRouter from "./form-f";
 import { portalRouter } from "./portal";
-// Patient reports removed for billing-only version
 import { pathologyFlagPreviewRouter } from "./pathologyFlagPreview";
 import { machinesRouter } from "./machines";
 import { departmentsRouter } from "./departments";
@@ -85,7 +84,6 @@ import { websiteRouter } from "./website";
 import { verifyRouter } from "./verify";
 import internalCronRouter from "./internal-cron";
 import internalAutomationsWhatsappRouter from "./internal-automations-whatsapp";
-// Internal reporting studio removed for billing-only version
 import { publicBookingRouter } from "./public-booking";
 import { mobileConfigRouter } from "./mobileConfig";
 import { mobileBillDeskRouter } from "./mobileBillDesk";
@@ -120,16 +118,13 @@ import userPreferencesRouter from "./userPreferences";
 import barcodeResolverRouter from "./barcode-resolver";
 import { uploadsRouter } from "./uploads";
 import { scansRouter } from "./scans";
-// Electronic film removed for billing-only version
 import { structuredReportTemplatesRouter } from "./structuredReportTemplates";
 import { floorsRouter, roomsRouter, modalitiesRouter } from "./locations";
-// AI reporting removed for billing-only version
 import { aiPromptTemplatesRouter } from "./aiPromptTemplates";
 import { aiPromptLibraryRouter } from "./aiPromptLibrary";
 import { aiModelRoutesRouter } from "./aiModelRoutes";
 import { aiComparisonRouter } from "./aiComparison";
 import { teachingCasesRouter } from "./teachingCases";
-// AI/radiology routers removed for billing-only version
 import { bankingRouter, bankingWebhookRouter } from "./banking";
 import { syncRouter } from "./sync";
 import { settingsRouter } from "./settings";
@@ -241,7 +236,8 @@ router.use("/internal/automations/whatsapp", n8nAutomationLimiter, internalAutom
 // Called by Conquest PACS scripts and other server-to-server automations.
 // Internal backup download — streams pg_dump output for off-site replication.
 router.use("/internal/backup", internalBackupRouter);
-// Internal reporting studio removed for billing-only version
+// CARE Reporting Studio bridge — must mount BEFORE /internal catch-all
+// (internalRadiologyRouter applies requireStaffOrInternalAuth to every path).
 router.use("/portal", portalRouter);
 router.use("/portal/totp", requireStaffAuth, totpRouter);
 router.use("/display", displayRouter);
@@ -252,7 +248,6 @@ router.use("/settings/queue-display", queueDisplaySettingsRouter);
 router.use("/payment-display", paymentDisplayRouter);
 router.use("/bridge", bridgeRouter);
 // Public tokenized PDF download for patient WhatsApp links — no staff auth.
-// Public reports router removed for billing-only version
 router.use("/share", publicShareRouter);
 // Public tokenized patient feedback / NPS form — no staff auth. Serves a
 // self-contained HTML page and records the response. Gated by ff_feedback_nps.
@@ -326,6 +321,7 @@ router.use("/patients", requireStaffAuth, requireStaffPermission("/patients"), p
 // Doctor catalogue: any authenticated staff can READ (Billing Desk's
 // referring-doctor picker and Register.tsx both need the doctor list, same
 // as /tests). Mutations (create/update/delete/import) stay /doctors-gated.
+router.use(
   "/doctors",
   requireStaffAuth,
   (req, res, next) => {
@@ -338,6 +334,7 @@ router.use("/patients", requireStaffAuth, requireStaffPermission("/patients"), p
 // Test catalogue — /tests permission
 // Tests catalog: any authenticated staff can READ (Billing Desk, Packages,
 // Reports, Orders all need the test list). Mutations stay /tests-gated.
+router.use(
   "/tests",
   requireStaffAuth,
   (req, res, next) => {
@@ -370,6 +367,7 @@ router.use("/bills", requireStaffAuth, requireStaffPermission("/billing"), bills
 
 // One-shot desk save (order+bill) — needs BOTH /orders and /billing, same as
 // the two-call path the desk used before.
+router.use(
   "/billing",
   requireStaffAuth,
   requireStaffPermission("/orders"),
@@ -447,6 +445,7 @@ router.use("/discounts", requireStaffAuth, requireStaffPermission("/discounts"),
 // Discount reasons — /discounts permission (configuration for the discounts module)
 // Discount reasons — any authenticated staff can READ (the Billing Desk
 // dropdown needs the active reasons). Mutations stay /discounts-gated.
+router.use(
   "/discount-reasons",
   requireStaffAuth,
   (req, res, next) => {
@@ -460,6 +459,7 @@ router.use("/discounts", requireStaffAuth, requireStaffPermission("/discounts"),
 // dialog). Same read-open/write-gated shape as discount-reasons above: any
 // authenticated staff can READ (the re-print dialog dropdown needs the
 // active reasons), mutations require /billing.
+router.use(
   "/reprint-reasons",
   requireStaffAuth,
   (req, res, next) => {
@@ -600,6 +600,7 @@ router.get("/clinic-settings/branding", async (_req, res) => {
   });
 });
 
+router.use(
   "/clinic-settings",
   requireStaffAuth,
   (req, res, next) => {
@@ -647,6 +648,7 @@ router.use("/time", careTimeRouter);
 // Test categories: anyone with staff auth can READ the list (Test Catalog,
 // Billing Desk, Reports filter all need it). Mutations stay admin-only via
 // the /settings permission.
+router.use(
   "/test-categories",
   requireStaffAuth,
   (req, res, next) => {
@@ -675,6 +677,7 @@ router.use("/printers", requireStaffAuth, requireStaffSubPermission("/settings",
 router.use("/vendors", requireStaffAuth, requireStaffSubPermission("/settings", "infrastructure"), vendorsRouter);
 
 // Outsourced labs — /tests permission (test catalog management)
+router.use(
   "/outsourced-labs",
   requireStaffAuth,
   (req, res, next) => {
@@ -752,42 +755,62 @@ router.use("/vendors", requireStaffAuth, requireStaffSubPermission("/settings", 
 
 // Radiology Report Generator — staff-accessible report builder with voice dictation,
 // key image upload, template library, draft save, and final report creation.
+router.use(
 
 // Attach an externally-produced (Word/PDF) final report to a radiology
 // study — the clinic composes reports in Word, not this app's structured
 // builder; see radiology-report-attachments.ts for the full rationale.
+router.use(
 
-// Electronic film public router removed for billing-only version
+router.use("/electronic-film/public", electronicFilmPublicRouter);
 
+router.use(
   "/electronic-film",
   requireStaffAuth,
 
 // Editable findings library (Report Builder) — add/modify/delete abnormal
 // findings per modality + organ; seeded once from the mined house catalogue.
+router.use(
 
 // Structured report templates — open to all authenticated staff for reading.
+router.use(
 
 // Radiology Quick Select — configurable study tabs + one-click finding
 // buttons for the Reporting Workspace side panel. Reads: any radiology
 // staff. Mutations: admin-only (enforced inside the router).
+router.use(
 
 // Radiology Canonical Catalog (Tickets B1 + B2) — the canonical parameter
 // library + finding graph. FOUNDATION ONLY: the router itself is gated behind
 // the ff_radiology_catalog feature flag (default OFF) and returns 404 until
 // enabled, so nothing in the running product consumes these tables yet. Reads:
 // radiology staff. Mutations: admin-only (enforced inside the router).
+router.use(
 
 // Radiology Content Pack Tiles — serves YAML content-pack findings as QuickSelectTiles
 // to the reporting workspace. NOT gated behind ff_radiology_catalog — reads seed YAML.
+router.use(
 
 // Radiology Whisper Proxy — local STT for air-gapped deployments
+router.use(
+
+// Radiology Snippets — Quick Add, Smart Format, Favorites, Macros
+router.use(
+
+// Whole-report formats (Z.ai ReportFormat library) — radiology_snippets type=report_format
+router.use(
+
+// Phase 4: Radiology Knowledge Platform — Master Templates, Personal Library, Knowledge Base
+router.use(
+
+// Phase 5: Structured Smart Reporting Engine — Deterministic rules-based text generation
+router.use(
 
 // Clinical report & compliance routes — /reports permission.
 // These expose patient PHI (names, codes, phone, email, test details),
 // clinician signature records, and compliance Form-F data. Restricting them
 // to the /reports permission matches every other sensitive clinical module.
 router.use("/form-f", requireStaffAuth, requireStaffPermission("/form-f"), formFRouter);
-// Patient reports and signatures routers removed for billing-only version
 // Same permission as /patient-reports — this is the result-entry grid's own
 // flag-suggestion call, not the admin-only /pathology-registry console.
 router.use("/pathology-flag-preview", requireStaffAuth, requireStaffPermission("/reports"), pathologyFlagPreviewRouter);
@@ -803,14 +826,14 @@ router.use("/feedback", requireStaffAuth, requireStaffPermission("/reports"), fe
 // additionally by ff_online_payment_links (Shadow Mode, disabled) inside the router.
 router.use("/bill-payment-links", requireStaffAuth, requireStaffPermission("/billing"), billPaymentLinksRouter);
 
-// AI reporting removed for billing-only version
+// AI Radiology Reporting — encrypted API keys, audit logging, draft management
 
 // AI Prompt Templates — modality-aware, versioned, editable-without-code prompts
 router.use("/ai-prompt-templates", requireStaffAuth, aiPromptTemplatesRouter);
 router.use("/ai-prompt-library", requireStaffAuth, aiPromptLibraryRouter);
 router.use("/ai-model-routing", requireStaffAuth, aiModelRoutesRouter);
 
-// AI pipeline health removed for billing-only version
+// Unified OCR + local-AI pipeline health / model registry / non-PHI smoke test
 
 // AI Comparison Workspace
 router.use("/ai-comparison", requireStaffAuth, aiComparisonRouter);
