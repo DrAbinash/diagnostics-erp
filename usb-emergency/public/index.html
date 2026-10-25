@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CARE Ultra-Emergency (USB)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .header { background: #2563eb; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+    .header h1 { font-size: 24px; }
+    .header p { opacity: 0.9; margin-top: 5px; }
+    .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .card h2 { font-size: 18px; margin-bottom: 15px; color: #333; }
+    .form-group { margin-bottom: 15px; }
+    .form-group label { display: block; margin-bottom: 5px; font-weight: 500; color: #555; }
+    .form-group input, .form-group select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+    .btn { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-success { background: #10b981; color: white; }
+    .btn-success:hover { background: #059669; }
+    .btn-danger { background: #ef4444; color: white; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-secondary { background: #6b7280; color: white; }
+    .btn-secondary:hover { background: #4b5563; }
+    .table { width: 100%; border-collapse: collapse; }
+    .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+    .table th { background: #f9fafb; font-weight: 600; color: #374151; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+    .badge-success { background: #d1fae5; color: #065f46; }
+    .badge-warning { background: #fef3c7; color: #92400e; }
+    .badge-danger { background: #fee2e2; color: #991b1b; }
+    .hidden { display: none; }
+    .login-container { max-width: 400px; margin: 100px auto; }
+    .alert { padding: 12px; border-radius: 4px; margin-bottom: 15px; }
+    .alert-error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+    .alert-success { background: #d1fae5; color: #065f46; border: 1px solid #a7f3d0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+    .stat { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .stat h3 { font-size: 14px; color: #6b7280; margin-bottom: 10px; }
+    .stat .value { font-size: 32px; font-weight: 700; color: #111; }
+    .modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+    .modal-content { background: white; padding: 30px; border-radius: 8px; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .modal-header h2 { font-size: 20px; }
+    .close-btn { background: none; border: none; font-size: 24px; cursor: pointer; color: #6b7280; }
+    .test-list { max-height: 300px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
+    .test-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+    .test-item:last-child { border-bottom: none; }
+    .test-item input[type="checkbox"] { margin-right: 10px; }
+    .receipt { background: white; padding: 20px; max-width: 400px; margin: 0 auto; font-family: monospace; }
+    .receipt-header { text-align: center; border-bottom: 2px dashed #000; padding-bottom: 10px; margin-bottom: 10px; }
+    .receipt-body { margin: 15px 0; }
+    .receipt-footer { border-top: 2px dashed #000; padding-top: 10px; text-align: center; font-size: 12px; }
+    @media print {
+      body * { visibility: hidden; }
+      .receipt, .receipt * { visibility: visible; }
+      .receipt { position: absolute; left: 0; top: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8898";
+    let token = localStorage.getItem("emergency_token");
+    let currentUser = null;
+
+    async function api(endpoint, options = {}) {
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
+      if (res.status === 401) {
+        localStorage.removeItem("emergency_token");
+        token = null;
+        showLogin();
+        throw new Error("Session expired");
+      }
+      return res.json();
+    }
+
+    function showLogin() {
+      document.getElementById("app").innerHTML = `
+        <div class="login-container">
+          <div class="card">
+            <h2 style="margin-bottom: 20px;">CARE Ultra-Emergency Login</h2>
+            <div id="login-error"></div>
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="username" autofocus />
+            </div>
+            <div class="form-group">
+              <label>PIN</label>
+              <input type="password" id="pin" />
+            </div>
+            <button class="btn btn-primary" style="width: 100%;" onclick="doLogin()">Login</button>
+            <p style="margin-top: 15px; font-size: 12px; color: #6b7280;">
+              Default: owner / 1234 (if no seed loaded)
+            </p>
+          </div>
+        </div>
+      `;
+    }
+
+    async function doLogin() {
+      const username = document.getElementById("username").value;
+      const pin = document.getElementById("pin").value;
+
+      try {
+        const data = await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ username, pin }),
+        });
+
+        if (data.error) {
+          document.getElementById("login-error").innerHTML = `<div class="alert alert-error">${data.error}</div>`;
+          return;
+        }
+
+        token = data.token;
+        currentUser = data.user;
+        localStorage.setItem("emergency_token", token);
+        showDashboard();
+      } catch (err) {
+        document.getElementById("login-error").innerHTML = `<div class="alert alert-error">${err.message}</div>`;
+      }
+    }
+
+    async function showDashboard() {
+      const [session, bills, patients, tests] = await Promise.all([
+        api("/api/session"),
+        api("/api/bills").catch(() => []),
+        api("/api/patients?search=").catch(() => []),
+        api("/api/tests?search=").catch(() => []),
+      ]);
+
+      currentUser = session.user;
+
+      document.getElementById("app").innerHTML = `
+        <div class="container">
+          <div class="header">
+            <h1>CARE Ultra-Emergency Billing</h1>
+            <p>Welcome, ${currentUser.name} (${currentUser.role})</p>
+          </div>
+
+          <div class="grid">
+            <div class="stat">
+              <h3>Today's Bills</h3>
+              <div class="value">${bills.filter(b => b.created_at?.startsWith(new Date().toISOString().slice(0, 10))).length}</div>
+            </div>
+            <div class="stat">
+              <h3>Total Revenue</h3>
+              <div class="value">₹${bills.reduce((sum, b) => sum + (b.paid || 0), 0).toFixed(2)}</div>
+            </div>
+            <div class="stat">
+              <h3>Pending Amount</h3>
+              <div class="value">₹${bills.reduce((sum, b) => sum + (b.due || 0), 0).toFixed(2)}</div>
+            </div>
+          </div>
+
+          <div style="margin-top: 20px; display: flex; gap: 10px;">
+            <button class="btn btn-primary" onclick="showNewBill()">New Bill</button>
+            <button class="btn btn-secondary" onclick="showPatients()">Patients</button>
+            <button class="btn btn-secondary" onclick="exportCSV()">Export CSV</button>
+            <button class="btn btn-danger" onclick="logout()" style="margin-left: auto;">Logout</button>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <h2>Recent Bills</h2>
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Bill No</th>
+                  <th>Patient</th>
+                  <th>Total</th>
+                  <th>Paid</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${bills.slice(-10).reverse().map(b => `
+                  <tr>
+                    <td>${b.bill_no}</td>
+                    <td>${b.patient_name || "N/A"}</td>
+                    <td>₹${b.total?.toFixed(2)}</td>
+                    <td>₹${b.paid?.toFixed(2)}</td>
+                    <td><span class="badge badge-${b.status === 'paid' ? 'success' : b.status === 'partial' ? 'warning' : 'danger'}">${b.status}</span></td>
+                    <td>
+                      <button class="btn btn-secondary" onclick="viewBill(${b.id})">View</button>
+                      ${b.status !== 'voided' ? `<button class="btn btn-danger" onclick="voidBill(${b.id})">Void</button>` : ''}
+                    </td>
+                  </tr>
+                `).join("") || '<tr><td colspan="6" style="text-align: center; color: #6b7280;">No bills yet</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+    async function showNewBill() {
+      const patients = await api("/api/patients?search=");
+      const doctors = await api("/api/doctors");
+      const tests = await api("/api/tests?search=");
+
+      document.getElementById("app").innerHTML = `
+        <div class="container">
+          <div class="header">
+            <h1>New Bill</h1>
+            <button class="btn btn-secondary" onclick="showDashboard()" style="float: right;">Back</button>
+          </div>
+
+          <div class="card">
+            <h2>Patient</h2>
+            <div class="form-group">
+              <label>Select Patient</label>
+              <select id="patient-select" onchange="onPatientSelect()">
+                <option value="">-- Select Patient --</option>
+                ${patients.map(p => `<option value="${p.id}">${p.name} (${p.uhid})</option>`).join("")}
+              </select>
+            </div>
+            <div id="new-patient-form" class="hidden">
+              <div class="form-group">
+                <label>Patient Name</label>
+                <input type="text" id="new-patient-name" />
+              </div>
+              <div class="form-group">
+                <label>Phone</label>
+                <input type="text" id="new-patient-phone" />
+              </div>
+              <div class="form-group">
+                <label>Age</label>
+                <input type="number" id="new-patient-age" />
+              </div>
+              <div class="form-group">
+                <label>Gender</label>
+                <select id="new-patient-gender">
+                  <option value="M">Male</option>
+                  <option value="F">Female</option>
+                  <option value="O">Other</option>
+                </select>
+              </div>
+              <button class="btn btn-success" onclick="createPatient()">Create Patient</button>
+            </div>
+            <button class="btn btn-secondary" onclick="toggleNewPatient()">+ New Patient</button>
+          </div>
+
+          <div class="card">
+            <h2>Doctor (Optional)</h2>
+            <div class="form-group">
+              <select id="doctor-select">
+                <option value="">-- Select Doctor --</option>
+                ${doctors.map(d => `<option value="${d.id}">${d.name}${d.specialty ? ` (${d.specialty})` : ""}</option>`).join("")}
+              </select>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Tests</h2>
+            <input type="text" id="test-search" placeholder="Search tests..." oninput="filterTests()" style="margin-bottom: 10px;" />
+            <div class="test-list" id="test-list">
+              ${tests.map(t => `
+                <div class="test-item" data-name="${t.name.toLowerCase()}" data-code="${t.code.toLowerCase()}">
+                  <label>
+                    <input type="checkbox" value="${t.id}" data-price="${t.price}" onchange="updateTotal()" />
+                    ${t.name} (${t.code})
+                  </label>
+                  <span>₹${t.price.toFixed(2)}</span>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Payment</h2>
+            <div class="form-group">
+              <label>Total: <strong id="total-amount">₹0.00</strong></label>
+            </div>
+            <div class="form-group">
+              <label>Discount</label>
+              <input type="number" id="discount" value="0" onchange="updateTotal()" />
+            </div>
+            <div class="form-group">
+              <label>Amount Received</label>
+              <input type="number" id="amount-received" value="0" onchange="updateTotal()" />
+            </div>
+            <div class="form-group">
+              <label>Payment Method</label>
+              <select id="payment-method">
+                <option value="cash">Cash</option>
+                <option value="upi">UPI</option>
+                <option value="card">Card</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Due Amount: <strong id="due-amount">₹0.00</strong></label>
+            </div>
+            <button class="btn btn-success" style="width: 100%;" onclick="createBill()">Create Bill</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function toggleNewPatient() {
+      document.getElementById("new-patient-form").classList.toggle("hidden");
+    }
+
+    function onPatientSelect() {
+      const select = document.getElementById("patient-select");
+      if (select.value) {
+        document.getElementById("new-patient-form").classList.add("hidden");
+      }
+    }
+
+    async function createPatient() {
+      const name = document.getElementById("new-patient-name").value;
+      const phone = document.getElementById("new-patient-phone").value;
+      const age = document.getElementById("new-patient-age").value;
+      const gender = document.getElementById("new-patient-gender").value;
+
+      if (!name) {
+        alert("Patient name required");
+        return;
+      }
+
+      const patient = await api("/api/patients", {
+        method: "POST",
+        body: JSON.stringify({ name, phone, age, gender }),
+      });
+
+      alert(`Patient created: ${patient.name} (${patient.uhid})`);
+      showNewBill();
+    }
+
+    function filterTests() {
+      const search = document.getElementById("test-search").value.toLowerCase();
+      document.querySelectorAll(".test-item").forEach(item => {
+        const name = item.dataset.name;
+        const code = item.dataset.code;
+        item.style.display = (name.includes(search) || code.includes(search)) ? "flex" : "none";
+      });
+    }
+
+    function updateTotal() {
+      const checkboxes = document.querySelectorAll("#test-list input[type='checkbox']:checked");
+      let total = 0;
+      checkboxes.forEach(cb => total += parseFloat(cb.dataset.price));
+
+      const discount = parseFloat(document.getElementById("discount").value) || 0;
+      const received = parseFloat(document.getElementById("amount-received").value) || 0;
+      const net = total - discount;
+      const due = net - received;
+
+      document.getElementById("total-amount").textContent = `₹${total.toFixed(2)}`;
+      document.getElementById("due-amount").textContent = `₹${due.toFixed(2)}`;
+    }
+
+    async function createBill() {
+      const patientId = document.getElementById("patient-select").value;
+      const doctorId = document.getElementById("doctor-select").value;
+      const testCheckboxes = document.querySelectorAll("#test-list input[type='checkbox']:checked");
+      const testIds = Array.from(testCheckboxes).map(cb => parseInt(cb.value));
+      const discount = parseFloat(document.getElementById("discount").value) || 0;
+      const amountReceived = parseFloat(document.getElementById("amount-received").value) || 0;
+      const paymentMethod = document.getElementById("payment-method").value;
+
+      if (!patientId) {
+        alert("Please select a patient");
+        return;
+      }
+
+      if (testIds.length === 0) {
+        alert("Please select at least one test");
+        return;
+      }
+
+      try {
+        const order = await api("/api/orders", {
+          method: "POST",
+          body: JSON.stringify({ patientId, doctorId, testIds }),
+        });
+
+        const bill = await api("/api/bills", {
+          method: "POST",
+          body: JSON.stringify({
+            orderId: order.id,
+            discount,
+            amountReceived,
+            paymentMethod,
+          }),
+        });
+
+        alert(`Bill created: ${bill.billNo}`);
+        viewBill(bill.id);
+      } catch (err) {
+        alert(`Error: ${err.message}`);
+      }
+    }
+
+    async function viewBill(billId) {
+      const bill = await api(`/api/bills/${billId}`);
+
+      document.getElementById("app").innerHTML = `
+        <div class="container">
+          <div class="header">
+            <h1>Bill Details</h1>
+            <button class="btn btn-secondary" onclick="showDashboard()" style="float: right;">Back</button>
+          </div>
+
+          <div class="receipt" id="receipt">
+            <div class="receipt-header">
+              <h2>CARE DIAGNOSTICS</h2>
+              <p>Emergency Bill</p>
+              <p>${bill.bill.bill_no}</p>
+              <p>${new Date(bill.bill.created_at).toLocaleString()}</p>
+            </div>
+
+            <div class="receipt-body">
+              <p><strong>Patient:</strong> ${bill.patient.name}</p>
+              <p><strong>UHID:</strong> ${bill.patient.uhid}</p>
+              <p><strong>Phone:</strong> ${bill.patient.phone || "N/A"}</p>
+              <hr style="margin: 10px 0;" />
+              ${bill.tests.map(t => `
+                <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                  <span>${t.name}</span>
+                  <span>₹${t.final_price.toFixed(2)}</span>
+                </div>
+              `).join("")}
+              <hr style="margin: 10px 0;" />
+              <div style="display: flex; justify-content: space-between;">
+                <span><strong>Total:</strong></span>
+                <span><strong>₹${bill.bill.total.toFixed(2)}</strong></span>
+              </div>
+              <div style="display: flex; justify-content: space-between;">
+                <span>Discount:</span>
+                <span>₹${bill.bill.discount.toFixed(2)}</span>
+              </div>
+              <div style="display: flex; justify-content: space-between;">
+                <span><strong>Net:</strong></span>
+                <span><strong>₹${bill.bill.net.toFixed(2)}</strong></span>
+              </div>
+              <div style="display: flex; justify-content: space-between;">
+                <span>Paid:</span>
+                <span>₹${bill.bill.paid.toFixed(2)}</span>
+              </div>
+              <div style="display: flex; justify-content: space-between;">
+                <span><strong>Due:</strong></span>
+                <span><strong>₹${bill.bill.due.toFixed(2)}</strong></span>
+              </div>
+            </div>
+
+            <div class="receipt-footer">
+              <p>UUID: ${bill.bill.emergency_uuid}</p>
+              <p>Status: ${bill.bill.status.toUpperCase()}</p>
+              <p style="margin-top: 10px;">Thank you!</p>
+            </div>
+          </div>
+
+          <div style="margin-top: 20px; text-align: center;">
+            <button class="btn btn-primary" onclick="window.print()">Print Receipt</button>
+            <button class="btn btn-secondary" onclick="showDashboard()">Back to Dashboard</button>
+          </div>
+        </div>
+      `;
+    }
+
+    async function voidBill(billId) {
+      const reason = prompt("Enter void reason:");
+      if (!reason) return;
+
+      await api(`/api/bills/${billId}/void`, {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+
+      alert("Bill voided");
+      showDashboard();
+    }
+
+    async function exportCSV() {
+      const result = await api("/api/export/csv");
+      alert(`CSV exported: ${result.filename} (${result.count} bills)`);
+    }
+
+    function showPatients() {
+      alert("Patient management coming soon. Use New Bill to create patients.");
+    }
+
+    function logout() {
+      localStorage.removeItem("emergency_token");
+      token = null;
+      currentUser = null;
+      showLogin();
+    }
+
+    // Initialize
+    if (token) {
+      showDashboard().catch(() => showLogin());
+    } else {
+      showLogin();
+    }
+  </script>
+</body>
+</html>
