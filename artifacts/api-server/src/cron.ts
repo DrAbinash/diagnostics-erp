@@ -3,10 +3,10 @@ import { db, pool } from "@workspace/db";
 import {
   emailSettingsTable, billsTable, billAuditsTable, paymentsTable,
   doctorsTable, commissionRulesTable, orderTestsTable, ordersTable, testsTable,
-  dicomNodesTable, dicomPullJobsTable, whatsappSettingsTable,
+  whatsappSettingsTable,
   expensesTable, patientsTable,
   clinicSettingsTable, commissionStatusEventsTable,
-  patientReportsTable, radiologyStudiesTable, testTokensTable,
+  patientReportsTable, testTokensTable,
 } from "@workspace/db/schema";
 import { sendDailySummaryEmail, sendMonthlyAuditEmail } from "./email";
 import { runBooksSanity } from "./routes/books-sanity";
@@ -18,20 +18,9 @@ import { gte, and, lte, eq, inArray, isNull, or, lt, sql, ne } from "drizzle-orm
 import { encryptBackupFile, resolveBackupPassphrase, sha256File, verifyBackupRoundTrip } from "./lib/backupCrypto";
 import { formatBackupRunProof } from "./lib/backupJobEvidence";
 import { decideBackupRun, describeSchedule, formatLocalMinute } from "./lib/backupSchedule";
-import {
-  startDimsePullAgent,
-  stopDimsePullAgent,
-  isDimsePullAgentRunning,
-} from "./services/dicom-pull-agent/dimse-agent";
-import { runRadiologyJobTick, countDueJobs } from "./lib/radiologyJobs";
-import { PACS_REARCHIVE_JOB, RADIOLOGY_JOB_HANDLERS } from "./lib/radiologyJobHandlers";
 import { runScheduledAuditChainVerification } from "./lib/auditVerification";
 import { todayIST, istHourMinute } from "./lib/istDate";
 import { isClinicPeakHours, clinicPeakHoursLabel } from "./lib/clinicPeakHours";
-import {
-  markRadiologyJobConsumerRegistered,
-  recordRadiologyJobCronTick,
-} from "./lib/radiologyJobConsumerHeartbeat";
 import { classifyPaymentMethod, isDigitalSettlement, isPhysicalCash } from "./lib/paymentMethodClassifier";
 import {
   calcTestCommission,
@@ -45,10 +34,8 @@ import {
 } from "./lib/commissionCalc";
 
 let currentTask: ReturnType<typeof cron.schedule> | null = null;
-let radiologyJobConsumerStarted = false;
 let overnightAiTickInFlight = false;
 let overnightAiInterval: ReturnType<typeof setInterval> | null = null;
-let otherRadiologyJobsStarted = false;
 let aiReportComposeConsumerStarted = false;
 // Track already-fired events per day to avoid double-firing
 const firedToday = new Set<string>();
@@ -57,7 +44,6 @@ export function startCronScheduler() {
   scheduleDaily();
   scheduleCommissionReconcile();
   scheduleDeferredPaymentVouchers();
-  scheduleDicomAutoPull();
   scheduleMonthlyAudit();
   scheduleMonthlyReferralSummary();
   scheduleBankingAutoSync();
@@ -67,7 +53,6 @@ export function startCronScheduler() {
   scheduleBackupDeadMan();
   scheduleSessionIdleSweep();
   scheduleAuditLogPurge();
-  schedulePacsPullerWatchdog();
   scheduleWhatsappReminders();
   scheduleWhatsAppOutboxDispatch();
   scheduleRecall();
@@ -80,17 +65,6 @@ export function startCronScheduler() {
   scheduleQueueDisplayAlerts();
   scheduleInventoryLowStockAlerts();
   scheduleEmergencyMasterPush();
-
-  // Start the in-process DIMSE pull agent if enabled.
-  // When ENABLE_DICOM_PULL_AGENT is set, the agent polls for pull jobs and
-  // executes C-FIND / C-MOVE natively via dcmjs-dimse (no external PC needed).
-  const enableDimse =
-    process.env["ENABLE_DICOM_PULL_AGENT"] === "1" ||
-    process.env["ENABLE_DICOM_PULL_AGENT"] === "true";
-  if (enableDimse && !isDimsePullAgentRunning()) {
-    startDimsePullAgent();
-    console.log("[cron] In-process DIMSE pull agent started");
-  }
 }
 
 /** Push the minimum master-data snapshot to DS225+. Interval is
@@ -178,31 +152,6 @@ function scheduleAiSchedulerModes() {
  * overnight tick. Duplicate registration is a no-op. Concurrent processes are
  * safe: claim uses FOR UPDATE SKIP LOCKED; in-process overlap is mutexed.
  */
-export function startRadiologyJobConsumer(): void {
-  if (radiologyJobConsumerStarted) return;
-  radiologyJobConsumerStarted = true;
-  markRadiologyJobConsumerRegistered();
-  const run = () => {
-    void fireOvernightAiTick().catch((err) => {
-      console.error("[cron] overnight AI tick failed:", err);
-    });
-  };
-  // First poll soon so diagnostics are not STOPPED for a full minute after boot,
-  // and so we do not depend on node-cron timezone matching.
-  setTimeout(run, 8_000).unref?.();
-  overnightAiInterval = setInterval(run, 60_000);
-  overnightAiInterval.unref?.();
-  // Backup minute trigger (no timezone — * * * * * is TZ-independent).
-  cron.schedule("* * * * *", async () => {
-    try {
-      await fireOvernightAiTick();
-    } catch (err) {
-      console.error("[cron] overnight AI cron tick failed:", err);
-    }
-  });
-  scheduleAiSchedulerModes();
-  console.log("[cron] overnight AI consumer registered (8s first poll, then every 60s; independent of ENABLE_SCHEDULERS)");
-}
 
 /**
  * Background text report composition — MUST run even when ENABLE_SCHEDULERS is
@@ -261,162 +210,6 @@ async function fireAiReportComposeTick(): Promise<void> {
 }
 
 /** Non-AI dicom_retry_queue types (restore-verify, redelivery, PACS). ENABLE_SCHEDULERS only. */
-export function startOtherRadiologyJobConsumer(): void {
-  if (otherRadiologyJobsStarted) return;
-  otherRadiologyJobsStarted = true;
-  cron.schedule("* * * * *", async () => {
-    try {
-      await fireOtherRadiologyJobTick();
-    } catch (err) {
-      console.error("[cron] other radiology job tick failed:", err);
-    }
-  });
-}
-
-function scheduleRadiologyJobs() {
-  // Kept for tests that grep this name; overnight drain is startRadiologyJobConsumer.
-  startRadiologyJobConsumer();
-}
-
-/** One overnight AI drain pass. Used by the 60s timer and POST /api/internal/cron/radiology-jobs. */
-export async function fireRadiologyJobTick(opts: {
-  canary?: boolean;
-  jobId?: number;
-} = {}): Promise<{
-  requeuedStale: number;
-  ran: Array<{ id: number; operationType: string; outcome: string }>;
-  skipped?: string;
-}> {
-  return fireOvernightAiTick(opts);
-}
-
-export async function fireOvernightAiTick(opts: {
-  canary?: boolean;
-  jobId?: number;
-} = {}): Promise<{
-  requeuedStale: number;
-  ran: Array<{ id: number; operationType: string; outcome: string }>;
-  skipped?: string;
-}> {
-  if (overnightAiTickInFlight && opts.jobId == null) {
-    return { requeuedStale: 0, ran: [], skipped: "in_flight" };
-  }
-  overnightAiTickInFlight = true;
-  const peak = isClinicPeakHours();
-  let aiMax = 1;
-  let dueAi = 0;
-  // Targeted canary (explicit jobId) is for ops/tests — run even during peak hold.
-  const aiBlocked = peak && !(opts.canary === true && opts.jobId != null);
-  recordRadiologyJobCronTick({
-    peak,
-    aiBlocked,
-    dueAi: 0,
-    ran: 0,
-  });
-  let legacyHoldFilter: { holdBefore: string; releasedJobIds: number[] } | null = null;
-  let opsLoadFailed = false;
-  try {
-    const { getOvernightVisionInferenceOptions } = await import("./lib/ai/overnightVisionConfig");
-    const { getSchedulerConfig, getOvernightOpsControls } = await import("./lib/ai/clinicalConfigService");
-    const { resolveLegacyHoldClaimFilter } = await import("./lib/ai/overnightOpsControls");
-    const vision = await getOvernightVisionInferenceOptions();
-    const sched = await getSchedulerConfig();
-    if (vision.policy.overnightPaused && !(opts.canary === true && opts.jobId != null)) {
-      recordRadiologyJobCronTick({ peak, aiBlocked: true, dueAi: 0, ran: 0 });
-      return { requeuedStale: 0, ran: [], skipped: "overnight_paused" };
-    }
-    aiMax = Math.max(1, Math.min(1, vision.concurrency, sched.maxConcurrentJobs));
-    // Cutover auto-init happens in getOvernightOpsControls (first deploy of this feature).
-    legacyHoldFilter = resolveLegacyHoldClaimFilter(await getOvernightOpsControls());
-  } catch {
-    opsLoadFailed = true;
-  }
-  // Fail-closed: unreadable overnight ops must NOT auto-claim (prefer HELD).
-  // Explicit canary by jobId still allowed.
-  if (opsLoadFailed && opts.jobId == null) {
-    recordRadiologyJobCronTick({ peak, aiBlocked: true, dueAi: 0, ran: 0 });
-    return { requeuedStale: 0, ran: [], skipped: "ops_unreadable_fail_closed" };
-  }
-  try {
-    const { AI_SHADOW_PIPELINE_JOB } = await import("./lib/ai/shadowPipeline");
-    // STARVED must use eligible (post–legacy-hold) due count — not raw backlog.
-    if (legacyHoldFilter) {
-      try {
-        const { getOvernightOpsControls } = await import("./lib/ai/clinicalConfigService");
-        const { countLegacyBacklogHold } = await import("./lib/ai/legacyBacklogHold");
-        const held = await countLegacyBacklogHold(await getOvernightOpsControls());
-        dueAi = held.newEligible;
-      } catch {
-        dueAi = await countDueJobs(AI_SHADOW_PIPELINE_JOB);
-      }
-    } else {
-      dueAi = await countDueJobs(AI_SHADOW_PIPELINE_JOB);
-    }
-    if (aiBlocked) {
-      recordRadiologyJobCronTick({ peak, aiBlocked: true, dueAi, ran: 0 });
-      return { requeuedStale: 0, ran: [], skipped: "peak_hold" };
-    }
-    const handler = RADIOLOGY_JOB_HANDLERS[AI_SHADOW_PIPELINE_JOB];
-    if (!handler) return { requeuedStale: 0, ran: [], skipped: "no_handler" };
-    const result = await runRadiologyJobTick(
-      { [AI_SHADOW_PIPELINE_JOB]: handler },
-      {
-        maxJobs: 1,
-        concurrencyByType: { [AI_SHADOW_PIPELINE_JOB]: aiMax },
-        claimStrategy: "overnight_ai",
-        jobId: opts.jobId,
-        preferNewest: opts.canary === true && opts.jobId == null,
-        // Explicit jobId canary bypasses hold inside claimNextJob.
-        legacyHold: opts.jobId != null ? null : legacyHoldFilter,
-        workerId: opts.canary ? `canary-${process.pid}` : `overnight-${process.pid}`,
-      },
-    );
-    const aiRun = result.ran[0];
-    recordRadiologyJobCronTick({
-      peak,
-      aiBlocked: false,
-      dueAi,
-      ran: result.ran.length,
-      claimedJobId: aiRun?.id ?? null,
-      claimedType: aiRun?.operationType ?? null,
-      outcome: aiRun?.outcome ?? null,
-    });
-    if (result.ran.length > 0 || result.requeuedStale > 0) {
-      console.log("[cron] overnight AI:", JSON.stringify(result));
-    }
-    return result;
-  } catch (err) {
-    recordRadiologyJobCronTick({
-      peak,
-      aiBlocked,
-      dueAi,
-      ran: 0,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  } finally {
-    overnightAiTickInFlight = false;
-  }
-}
-
-async function fireOtherRadiologyJobTick(): Promise<void> {
-  const { AI_SHADOW_PIPELINE_JOB } = await import("./lib/ai/shadowPipeline");
-  const { AI_REPORT_COMPOSE_JOB } = await import("./lib/reportComposer/jobService");
-  const others: typeof RADIOLOGY_JOB_HANDLERS = {};
-  for (const [k, h] of Object.entries(RADIOLOGY_JOB_HANDLERS)) {
-    // Overnight vision + text compose have dedicated always-on consumers.
-    if (k !== AI_SHADOW_PIPELINE_JOB && k !== AI_REPORT_COMPOSE_JOB) others[k] = h;
-  }
-  const peak = isClinicPeakHours();
-  await runRadiologyJobTick(others, {
-    maxJobs: peak ? 2 : 4,
-    concurrencyByType: {
-      ...(peak ? { [PACS_REARCHIVE_JOB]: 0 } : {}),
-    },
-    workerId: `radiology-other-${process.pid}`,
-  });
-}
-
 // ── BEND-1: scheduled audit-chain verification (safe default cadence) ────────
 // Daily windowed verification of the most recent slice; the result persists
 // to radiology_ops_checks so health reports last-verified time + outcome.
@@ -1267,79 +1060,6 @@ export async function fireMonthlyAudit(now: Date): Promise<void> {
   }
 }
 
-// ── DICOM Auto-Pull scheduler ────────────────────────────────────────────────
-// Every 5 minutes: find all active nodes with autoPull=true whose last pull
-// is older than their configured pullIntervalSeconds (or never pulled), and
-// create a new dicom_pull_job for each. The local DICOM Pull Agent picks these
-// jobs up and executes the actual findscu + movescu commands.
-
-function scheduleDicomAutoPull() {
-  cron.schedule("*/5 * * * *", async () => {
-    try {
-      await fireDicomAutoPull();
-    } catch (err) {
-      console.error("[cron] DICOM auto-pull check failed:", err);
-    }
-  });
-  console.log("[cron] DICOM auto-pull scheduler started (checks every 5 minutes)");
-}
-
-async function fireDicomAutoPull() {
-  if (isClinicPeakHours()) {
-    console.log(`[cron] DICOM auto-pull skipped — clinic peak hours (${clinicPeakHoursLabel()}); billing / USG C-STORE have Orthanc`);
-    return;
-  }
-  const now = new Date();
-
-  // Fetch all active nodes with autoPull enabled
-  const nodes = await db.select().from(dicomNodesTable)
-    .where(and(eq(dicomNodesTable.isActive, true), eq(dicomNodesTable.autoPull, true)));
-
-  if (nodes.length === 0) return;
-
-  for (const node of nodes) {
-    const intervalMs = (node.pullIntervalSeconds ?? 300) * 1000;
-    const lastPull   = node.lastPullAt ? new Date(node.lastPullAt).getTime() : 0;
-    const dueAt      = lastPull + intervalMs;
-
-    if (now.getTime() < dueAt) continue; // not yet due
-
-    // Check if there's already a pending or running job for this node
-    const [existing] = await db.select({ id: dicomPullJobsTable.id })
-      .from(dicomPullJobsTable)
-      .where(
-        and(
-          eq(dicomPullJobsTable.nodeId, node.id),
-          or(
-            eq(dicomPullJobsTable.status, "pending"),
-            eq(dicomPullJobsTable.status, "running"),
-          ),
-        ),
-      )
-      .limit(1);
-
-    if (existing) continue; // already queued
-
-    // Calculate date range
-    const todayStr = now.toISOString().split("T")[0];
-    const hoursBack = node.queryLookbackHours ?? 24;
-    const daysBack = Math.max(1, Math.ceil(hoursBack / 24));
-    const fromDate = new Date(now);
-    fromDate.setDate(fromDate.getDate() - (daysBack - 1));
-    fromDate.setHours(0, 0, 0, 0);
-    const fromStr = fromDate.toISOString().split("T")[0];
-
-    await db.insert(dicomPullJobsTable).values({
-      nodeId:       node.id,
-      triggerType:  "auto",
-      status:       "pending",
-      queryDateFrom: fromStr,
-      queryDateTo:   todayStr,
-    });
-
-    console.log(`[cron] Created auto pull job for DICOM node ${node.aeTitle} (${node.modality})`);
-  }
-}
 
 // Catch-up safe: fires as soon as each configured slot's time has passed on
 // any day the container happens to be up, as long as today (IST) isn't
@@ -1660,13 +1380,11 @@ async function fireCommissionReconcile(): Promise<{ transitions: number }> {
   if (needsReport) {
     const activeByOrder = new Map<number, number[]>();
     for (const ot of orderTests) { const a = activeByOrder.get(ot.orderId) ?? []; a.push(ot.id); activeByOrder.set(ot.orderId, a); }
-    const [prs, rss] = await Promise.all([
+    const [prs] = await Promise.all([
       db.select({ orderTestId: patientReportsTable.orderTestId, status: patientReportsTable.status }).from(patientReportsTable).where(inArray(patientReportsTable.orderId, orderIds)),
-      db.select({ orderTestId: radiologyStudiesTable.orderTestId, status: radiologyStudiesTable.status }).from(radiologyStudiesTable).where(inArray(radiologyStudiesTable.orderId, orderIds)),
     ]);
     const fin = new Set<number>(), del = new Set<number>();
     for (const r of prs) { if (r.orderTestId == null) continue; if (r.status === "verified" || r.status === "delivered") fin.add(r.orderTestId); if (r.status === "delivered") del.add(r.orderTestId); }
-    for (const r of rss) { if (r.orderTestId == null) continue; if (r.status === "reported_final" || r.status === "delivered") fin.add(r.orderTestId); if (r.status === "delivered") del.add(r.orderTestId); }
     for (const [oid, ids] of activeByOrder) reportStatus.set(oid, { finalized: ids.length > 0 && ids.every(i => fin.has(i)), delivered: ids.length > 0 && ids.every(i => del.has(i)) });
   }
 
@@ -2250,75 +1968,3 @@ function scheduleFraudDetection() {
 //   2. Sends a one-off alert email (max one per stall period)
 //   3. Logs clearly so monitoring dashboards pick it up
 
-const STALL_THRESHOLD_MS = 20 * 60 * 1000; // 20 minutes
-const STALL_SERVICE_NAME  = "dicom_pull_agent";
-
-function schedulePacsPullerWatchdog() {
-  cron.schedule("*/10 * * * *", async () => {
-    try {
-      await checkPacsPullerStall();
-    } catch (err) {
-      console.error("[cron] PACS puller watchdog failed:", err);
-    }
-  });
-  console.log("[cron] PACS puller stall watchdog started (checks every 10 minutes)");
-}
-
-async function checkPacsPullerStall() {
-  // Only run if PACS/DICOM is configured
-  if (!process.env["ORTHANC_URL"]) return;
-
-  const [row] = await db
-    .select()
-    .from(watchdogStatusTable)
-    .where(eq(watchdogStatusTable.serviceName, STALL_SERVICE_NAME))
-    .limit(1);
-
-  if (!row) return; // Not registered yet — agent hasn't started
-  if (!row.lastHeartbeat) return; // Never started — not a stall
-
-  const ageMs = Date.now() - row.lastHeartbeat.getTime();
-  if (ageMs <= STALL_THRESHOLD_MS) return; // Healthy
-
-  // Already marked degraded by a previous watchdog run — don't spam emails
-  if (row.status === "degraded") return;
-
-  // Mark as stalled in watchdog table
-  await db
-    .update(watchdogStatusTable)
-    .set({
-      status:    "degraded",
-      lastError: `No heartbeat for ${Math.round(ageMs / 60000)} minutes (threshold: 20 min)`,
-      updatedAt: new Date(),
-    })
-    .where(eq(watchdogStatusTable.id, row.id))
-    .catch(() => {});
-
-  const stalledMinutes = Math.round(ageMs / 60000);
-  console.warn(
-    `[watchdog] PACS pull agent stalled — last heartbeat ${stalledMinutes} minutes ago`,
-  );
-
-  // Send one alert email (uses the existing email module — best-effort)
-  try {
-    const { sendAlertEmail } = await import("./email");
-    await sendAlertEmail({
-      subject: `⚠️ PACS Pull Agent Stalled — ${stalledMinutes} minutes without activity`,
-      html: [
-        `<p><strong>Care Diagnostics — Automated Alert</strong></p>`,
-        `<p>The DICOM pull agent has not sent a heartbeat for <strong>${stalledMinutes} minutes</strong>.</p>`,
-        `<p>New studies from modalities may not be appearing in the worklist.</p>`,
-        `<p><strong>Action required:</strong></p>`,
-        `<ul>`,
-        `  <li>Check the Radiology Operations Dashboard for current Orthanc status.</li>`,
-        `  <li>Verify Orthanc is running and accessible: ${process.env["ORTHANC_URL"] || "check ORTHANC_URL env"}</li>`,
-        `  <li>Check the care-api container logs: <code>docker logs care-api --tail 100</code></li>`,
-        `  <li>If needed, restart the ERP stack to restart the pull agent.</li>`,
-        `</ul>`,
-        `<p style="color:#888;font-size:12px">This alert was generated by the automated PACS watchdog. It fires once per stall period and will not repeat until the agent recovers and stalls again.</p>`,
-      ].join(""),
-    });
-  } catch {
-    // Email failure is non-fatal — the DB record update above is the primary signal
-  }
-}

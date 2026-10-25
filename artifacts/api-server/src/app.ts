@@ -10,11 +10,8 @@ import router from "./routes";
 import { logger } from "./lib/logger";
 import { buildIdentityPayload } from "./lib/buildIdentity";
 import { errorHandler } from "./middleware/errorHandler";
-import { dicomUploadLimiter } from "./middleware/rateLimits";
-import { dicomUploadsRouter } from "./routes/dicom-uploads";
 import { whatsappWebhookRouter } from "./routes/whatsapp";
 import { recordRequest } from "./lib/requestMetrics";
-import { KEY_IMAGE_MOUNT, radiologyKeyImageHandlers } from "./lib/radiologyKeyImageStatic";
 
 // Helmet is required in production. In dev it is optional so a missing
 // install (or CSP that would break Vite HMR) never blocks local work —
@@ -287,8 +284,6 @@ app.get("/api/health/schema", async (_req, res) => {
   }
 });
 
-app.use("/api/dicom-uploads", dicomUploadLimiter, dicomUploadsRouter);
-
 // Meta WhatsApp Cloud API webhook — mounted here, BEFORE the global
 // express.json() below, same reason as dicom-uploads above: its POST route
 // verifies Meta's x-hub-signature-256 HMAC against the EXACT raw bytes Meta
@@ -336,17 +331,6 @@ app.use("/api", (req: Request, res: Response, next: NextFunction) => {
 // request and can 429 login even when the dedicated staff/patient login
 // limiters would still allow the attempt.
 app.use("/api", router);
-
-// Radiology key images are clinical pictures: a viewport capture can carry the
-// patient's name, UHID or accession burned into the raster by the modality, and
-// no code in CARE inspects pixels — so the file itself is the PHI. This prefix
-// used to sit on the public static mount below, protected only by a UUID
-// filename. It now admits either a Bearer staff session that holds
-// /radiology, or a short-lived grant minted for that one file by
-// POST /api/radiology/report-generator/key-images/access-urls — never the
-// `?staffToken=` session query token. See lib/radiologyKeyImageStatic.ts.
-// Server-side readers (composer, print) are unaffected: they read from disk.
-app.use(KEY_IMAGE_MOUNT, ...radiologyKeyImageHandlers());
 
 // Serve user-uploaded site assets (favicon, photos, hero images, etc.)
 // from data/uploads. Path matches what /api/website/photos returns.
