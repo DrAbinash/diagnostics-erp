@@ -326,7 +326,6 @@ router.use("/patients", requireStaffAuth, requireStaffPermission("/patients"), p
 // Doctor catalogue: any authenticated staff can READ (Billing Desk's
 // referring-doctor picker and Register.tsx both need the doctor list, same
 // as /tests). Mutations (create/update/delete/import) stay /doctors-gated.
-router.use(
   "/doctors",
   requireStaffAuth,
   (req, res, next) => {
@@ -339,7 +338,6 @@ router.use(
 // Test catalogue — /tests permission
 // Tests catalog: any authenticated staff can READ (Billing Desk, Packages,
 // Reports, Orders all need the test list). Mutations stay /tests-gated.
-router.use(
   "/tests",
   requireStaffAuth,
   (req, res, next) => {
@@ -372,7 +370,6 @@ router.use("/bills", requireStaffAuth, requireStaffPermission("/billing"), bills
 
 // One-shot desk save (order+bill) — needs BOTH /orders and /billing, same as
 // the two-call path the desk used before.
-router.use(
   "/billing",
   requireStaffAuth,
   requireStaffPermission("/orders"),
@@ -450,7 +447,6 @@ router.use("/discounts", requireStaffAuth, requireStaffPermission("/discounts"),
 // Discount reasons — /discounts permission (configuration for the discounts module)
 // Discount reasons — any authenticated staff can READ (the Billing Desk
 // dropdown needs the active reasons). Mutations stay /discounts-gated.
-router.use(
   "/discount-reasons",
   requireStaffAuth,
   (req, res, next) => {
@@ -464,7 +460,6 @@ router.use(
 // dialog). Same read-open/write-gated shape as discount-reasons above: any
 // authenticated staff can READ (the re-print dialog dropdown needs the
 // active reasons), mutations require /billing.
-router.use(
   "/reprint-reasons",
   requireStaffAuth,
   (req, res, next) => {
@@ -605,7 +600,6 @@ router.get("/clinic-settings/branding", async (_req, res) => {
   });
 });
 
-router.use(
   "/clinic-settings",
   requireStaffAuth,
   (req, res, next) => {
@@ -653,7 +647,6 @@ router.use("/time", careTimeRouter);
 // Test categories: anyone with staff auth can READ the list (Test Catalog,
 // Billing Desk, Reports filter all need it). Mutations stay admin-only via
 // the /settings permission.
-router.use(
   "/test-categories",
   requireStaffAuth,
   (req, res, next) => {
@@ -682,7 +675,6 @@ router.use("/printers", requireStaffAuth, requireStaffSubPermission("/settings",
 router.use("/vendors", requireStaffAuth, requireStaffSubPermission("/settings", "infrastructure"), vendorsRouter);
 
 // Outsourced labs — /tests permission (test catalog management)
-router.use(
   "/outsourced-labs",
   requireStaffAuth,
   (req, res, next) => {
@@ -760,41 +752,33 @@ router.use(
 
 // Radiology Report Generator — staff-accessible report builder with voice dictation,
 // key image upload, template library, draft save, and final report creation.
-router.use(
 
 // Attach an externally-produced (Word/PDF) final report to a radiology
 // study — the clinic composes reports in Word, not this app's structured
 // builder; see radiology-report-attachments.ts for the full rationale.
-router.use(
 
 // Electronic film public router removed for billing-only version
 
-router.use(
   "/electronic-film",
   requireStaffAuth,
 
 // Editable findings library (Report Builder) — add/modify/delete abnormal
 // findings per modality + organ; seeded once from the mined house catalogue.
-router.use(
 
 // Structured report templates — open to all authenticated staff for reading.
-router.use(
 
 // Radiology Quick Select — configurable study tabs + one-click finding
 // buttons for the Reporting Workspace side panel. Reads: any radiology
 // staff. Mutations: admin-only (enforced inside the router).
-router.use(
 
 // Radiology Canonical Catalog (Tickets B1 + B2) — the canonical parameter
 // library + finding graph. FOUNDATION ONLY: the router itself is gated behind
 // the ff_radiology_catalog feature flag (default OFF) and returns 404 until
 // enabled, so nothing in the running product consumes these tables yet. Reads:
 // radiology staff. Mutations: admin-only (enforced inside the router).
-router.use(
 
 // Radiology Content Pack Tiles — serves YAML content-pack findings as QuickSelectTiles
 // to the reporting workspace. NOT gated behind ff_radiology_catalog — reads seed YAML.
-router.use(
 
 // Radiology Whisper Proxy — local STT for air-gapped deployments
 
