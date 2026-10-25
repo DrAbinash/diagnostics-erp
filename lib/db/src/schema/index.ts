@@ -41,12 +41,9 @@ export * from "./abnormalFindings";
 export * from "./formF";
 export * from "./portalSessions";
 export * from "./patientAuth";
-export * from "./dicom";
 export * from "./samples";
 export * from "./testTokens";
 export * from "./dayClosures";
-export * from "./radiology";
-export * from "./radiologyShareLinks";
 export * from "./signatures";
 export * from "./patientReports";
 export * from "./patientReportAmendments";
@@ -62,119 +59,40 @@ export * from "./sitePages";
 export * from "./sitePopups";
 export * from "./onlineBookings";
 export * from "./outsourcedLabs";
-export * from "./radiologyWorklist";
-export * from "./radiologyReportGenerator";
 export * from "./presentationTemplates";
-export {
-  radiologyTextMacrosTable,
-  radiologyReportPreferencesTable,
-  radiologyImageReferencesTable,
-  radiologyNormalSnippetsTable,
-  radiologistStylePreferencesTable,
-  radiologyReportLifecycleLogTable,
-  spinalMeasurementsTable,
-  radiologySmartMacrosTable,
-} from "./radiologyReportGenerator";
 export * from "./reportDeliveryLogs";
 export * from "./reportDeliveryReceipts";
 export * from "./recall";
 export * from "./patientFeedback";
 export * from "./billPaymentLinks";
-export * from "./abdmConsent";
 export * from "./whatsapp";
 export * from "./whatsappOutbox";
 export * from "./whatsappDelivery";
 export * from "./structuredReportTemplates";
-export * from "./radiologyFindingLibrary";
-export * from "./teleradiologyUsers";
 export * from "./hl7Schema";
 export * from "./whatsappConversations";
-export * from "./pacsSettings";
-export * from "./dicomAgent";
-export * from "./dicomPulledStudies";
-export * from "./radiologyScheduledProcedures";
-export * from "./dicomRoutingRules";
 export * from "./syncQueue";
-export * from "./dayClosures";
 export * from "./banking";
 export * from "./userDayClosures";
 export * from "./floors";
 export * from "./rooms";
-export * from "./modalities";
-export * from "./aiReporting";
-export * from "./aiPromptTemplates";
-export * from "./aiPromptLibrary";
-export * from "./teachingCases";
-export * from "./aiModelRoutes";
-export * from "./aiQualityScores";
-export * from "./aiDicomFindings";
-export * from "./ragDocuments";
-export * from "./anomalyAlerts";
-export * from "./reportTemplateVersions";
-export * from "./aiBillingSuggestions";
-export * from "./peerReviewAssignments";
-export * from "./turnaroundTimes";
-export * from "./aiTrainingDataExports";
-export * from "./reportQualityGates";
-export * from "./criticalFindings";
-export * from "./aiProviderHealth";
-export * from "./aiVoiceTranscriptions";
-export * from "./aiPatientCommunications";
-export * from "./aiNormalReportTemplates";
-export * from "./drawerAuditLog";
-export * from "./enterpriseRadiology";
-export * from "./usgMeasurements";
-export * from "./usgCompanion";
-export * from "./knowledgePacks";
-export * from "./echoCardiology";
-export * from "./fetalUsgLevel4";
-export * from "./dicomStudies";
-export * from "./smartRadiology";
-export * from "./risMonitoring";
-export * from "./radiologyOps";
-export * from "./radiologyWorkflow";
 export * from "./auditLogs";
 export * from "./paymentGatewayDiagnostics";
 export * from "./rolePermissions";
 export * from "./uploadFiles";
-export * from "./radiologySnippets";
-export * from "./radiologyKnowledge";
 export * from "./knowledgeBase";
-export * from "./aiCallerCredentials";
-export * from "./radiologySmartFindings";
-export * from "./radiologyMemory";
-export * from "./radiologyLesions";
-export * from "./radiologyOrganIntelligence";
-export * from "./radiologyAnnotations";
-export * from "./radiologyAiReviewAudits";
 export * from "./scanSessions";
 export * from "./pairedDevices";
 export * from "./scanAuditLogs";
 export * from "./scannedDocuments";
 export * from "./paymentLogs";
-export * from "./voiceDictationLogs";
 export * from "./pregnancyEpisodes";
-export * from "./radiologistLearningSettings";
-export * from "./mriProtocolSpecs";
-export * from "./radiologyQuickFindings";
-export * from "./radiologySmartDictation";
 export * from "./featureFlags";
-export * from "./reportFindingInstances";
-export * from "./radiologyCatalog";
-export * from "./clinicalCatalogue";
 export * from "./staffQuickDoctors";
-export * from "./reportQualityEngine";
-export * from "./canonicalStudy";
-export * from "./aiExecution";
-export * from "./aiModelCapabilities";
-export * from "./aiEvaluation";
-export * from "./aiClinicalConfig";
-export * from "./aiReportComposer";
-export * from "./aiInterop";
-export * from "./operationalHealthRuns";
-export * from "./bridgeSyncLog";
-// ── HOPE → CARE diagnostic referral integration (additive; see
-// docs/hope-care-integration/) ──────────────────────────────────────────────
+export * from "./emergencyBilling";
+export * from "./timeIntegrity";
+export * from "./settings";
+// HOPE integration
 export * from "./integrationPartners";
 export * from "./externalPatientLinks";
 export * from "./externalProviderLinks";
@@ -182,12 +100,8 @@ export * from "./serviceCatalogueMappings";
 export * from "./diagnosticReferrals";
 export * from "./integrationOutbox";
 export * from "./externalResultLinks";
-export * from "./electronicFilmArtifacts";
-// ── ABDM / ABHA national health stack integration (additive scaffold) ────────
+// ABDM
 export * from "./abdm";
-// ── PCPNDT self-referral OPD auto-prescriptions ─────────────────────────────
+export * from "./abdmConsent";
+// PCPNDT
 export * from "./selfReferralPrescriptions";
-export * from "./emergencyBilling";
-// ── CARE business-time integrity: forward-only cutover + append-only evidence ─
-export * from "./timeIntegrity";
-export * from "./settings";
