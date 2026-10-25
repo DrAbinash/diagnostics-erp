@@ -797,16 +797,6 @@ router.use(
 router.use(
 
 // Radiology Whisper Proxy — local STT for air-gapped deployments
-router.use(
-
-// Radiology Snippets — Quick Add, Smart Format, Favorites, Macros
-router.use(
-
-// Whole-report formats (Z.ai ReportFormat library) — radiology_snippets type=report_format
-router.use(
-
-// Phase 4: Radiology Knowledge Platform — Master Templates, Personal Library, Knowledge Base
-router.use(
 
 // Clinical report & compliance routes — /reports permission.
 // These expose patient PHI (names, codes, phone, email, test details),
