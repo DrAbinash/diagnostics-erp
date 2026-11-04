@@ -17,6 +17,14 @@ job can be spooled.
   DICOM_PORT                     SCP listen port                      104
   ALLOWED_CALLING_AETS           comma-separated allow-list, empty=any (none)
 
+  STORAGE_ENABLED                enable Storage SCP (receive from modalities) true
+  STORAGE_AET                    Storage SCP AE Title                 PRINTSCP
+  STORAGE_PORT                   Storage SCP listen port              104
+  FORWARD_TO_ORTHANC             forward received studies to Orthanc  true
+  ORTHANC_HOST                   Orthanc host for forwarding          192.168.1.137
+  ORTHANC_PORT                   Orthanc DICOM port                   5680
+  ORTHANC_AET                    Orthanc AE Title                     ORTHANC2
+
   GAMMA                          gamma correction exponent             2.0
   CONTRAST_LOW_PERCENTILE        black-point percentile for stretch    1.0
   CONTRAST_HIGH_PERCENTILE       white-point percentile for stretch    99.0
@@ -39,7 +47,7 @@ job can be spooled.
            Series description and image number under each image, when the
            modality sends them.
   IMAGE_LABEL_HEIGHT_MM          height of that caption strip           4.5
-  PAGE_ORIENTATION               AUTO | SCU | PORTRAIT | LANDSCAPE      AUTO
+  PAGE_ORIENTATION               AUTO | SCU | PORTRAIT | LANDSCAPE      SCU
            AUTO turns the sheet whichever way prints the images largest: a
            3-column grid of 4:3 frames on an upright A4 gets cells twice as
            tall as they are wide, so each frame prints at about half the size
@@ -194,12 +202,34 @@ from pynetdicom.sop_class import (
     BasicFilmSession,
     BasicGrayscaleImageBox,
     BasicGrayscalePrintManagementMeta,
+    CTImageStorage,
+    MRImageStorage,
+    NuclearMedicineImageStorage,
+    EnhancedPETImageStorage,
     PrintJob,
     Printer,
     PrinterConfigurationRetrieval,
     PrinterInstance,
+    SecondaryCaptureImageStorage,
+    UltrasoundImageStorage,
+    UltrasoundMultiFrameImageStorage,
     Verification,
+    XRayAngiographicImageStorage,
+    XRayRadiofluoroscopicImageStorage,
 )
+
+# All storage SOP classes we support for receiving from modalities
+STORAGE_SOP_CLASSES = [
+    CTImageStorage,
+    MRImageStorage,
+    NuclearMedicineImageStorage,
+    EnhancedPETImageStorage,
+    SecondaryCaptureImageStorage,
+    UltrasoundImageStorage,
+    UltrasoundMultiFrameImageStorage,
+    XRayAngiographicImageStorage,
+    XRayRadiofluoroscopicImageStorage,
+]
 
 import admin_routes
 import identity_audit
@@ -255,6 +285,16 @@ ALLOWED_CALLING_AETS = [
     a.strip()[:16] for a in _env_str("ALLOWED_CALLING_AETS", "").split(",") if a.strip()
 ]
 
+# Storage SCP + Orthanc forwarding
+STORAGE_ENABLED = _env_bool("STORAGE_ENABLED", True)
+STORAGE_AE_TITLE = _env_str("STORAGE_AET", "PRINTSCP").strip()[:16] or "PRINTSCP"
+STORAGE_PORT = _env_int("STORAGE_PORT", 104)
+FORWARD_TO_ORTHANC = _env_bool("FORWARD_TO_ORTHANC", True)
+ORTHANC_HOST = _env_str("ORTHANC_HOST", "192.168.1.137")
+ORTHANC_PORT = _env_int("ORTHANC_PORT", 5680)
+ORTHANC_AE_TITLE = _env_str("ORTHANC_AET", "ORTHANC2").strip()[:16] or "ORTHANC2"
+FORWARD_AE_TITLES = _env_str("FORWARD_AE_TITLES", "").strip()
+
 GAMMA = max(0.01, _env_float("GAMMA", 2.0))
 CONTRAST_LOW_PCT = min(max(_env_float("CONTRAST_LOW_PERCENTILE", 1.0), 0.0), 49.0)
 CONTRAST_HIGH_PCT = min(max(_env_float("CONTRAST_HIGH_PERCENTILE", 99.0), 51.0), 100.0)
@@ -270,15 +310,15 @@ HONOR_SCU_LAYOUT = _env_bool("HONOR_SCU_LAYOUT", True)
 PRESERVE_CONSOLE_LAYOUT = _env_bool("PRESERVE_CONSOLE_LAYOUT", True)
 BRANDING_SOURCE = _env_str("BRANDING_SOURCE", "LOCAL").strip().upper()
 
-PAGE_SIZE = _env_str("PAGE_SIZE", "A4").strip().upper()
+PAGE_SIZE = _env_str("PAGE_SIZE", "8X10").strip().upper()
 # Validated against _PAGE_SIZES_MM once that table is defined, below.
 HONOR_SCU_FILM_SIZE = _env_bool("HONOR_SCU_FILM_SIZE", False)
 # AUTO turns the sheet whichever way prints the images largest (see
 # choose_orientation); SCU keeps the old behaviour of echoing the Film Box's
 # Film Orientation. PORTRAIT/LANDSCAPE pin it.
-PAGE_ORIENTATION = _env_str("PAGE_ORIENTATION", "AUTO").strip().upper()
+PAGE_ORIENTATION = _env_str("PAGE_ORIENTATION", "PORTRAIT").strip().upper()
 if PAGE_ORIENTATION not in ("AUTO", "SCU", "PORTRAIT", "LANDSCAPE"):
-    PAGE_ORIENTATION = "AUTO"
+    PAGE_ORIENTATION = "PORTRAIT"
 DPI = max(72, _env_int("DPI", 300))
 MARGIN_MM = max(0.0, _env_float("MARGIN_MM", 5.0))
 GUTTER_MM = max(0.0, _env_float("GUTTER_MM", 2.0))
@@ -367,13 +407,17 @@ MODALITY_LAYOUTS = _parse_modality_layouts()
 
 OUTPUT_DIR = Path(_env_str("OUTPUT_DIR", "/data/print-jobs"))
 OUTPUT_FORMAT = _env_str("OUTPUT_FORMAT", "pdf").strip().lower()
-if OUTPUT_FORMAT not in ("pdf", "png"):
+if OUTPUT_FORMAT not in ("pdf", "png", "jpeg", "jpg"):
     OUTPUT_FORMAT = "pdf"
+if OUTPUT_FORMAT == "jpg":
+    OUTPUT_FORMAT = "jpeg"
 JOB_RETENTION_DAYS = _env_int("JOB_RETENTION_DAYS", 30)
 
 PRINT_METHOD = _env_str("PRINT_METHOD", "cups").strip().lower()
 CUPS_SERVER = _env_str("CUPS_SERVER", "localhost:631").strip()
 CUPS_PRINTER_NAME = _env_str("CUPS_PRINTER_NAME", "").strip()
+PRINT_PREVIEW_ENABLED = _env_bool("PRINT_PREVIEW_ENABLED", False)
+PRINT_PREVIEW_TIMEOUT_SECONDS = _env_int("PRINT_PREVIEW_TIMEOUT_SECONDS", 30)
 # CUPS media name passed as `lp -o media=...`. Left empty it is derived from
 # PAGE_SIZE, which is right for the standard A-series names. Sizes whose CUPS
 # name is driver-specific - A3+ above all, which PPDs variously call SuperA3,
@@ -493,7 +537,10 @@ def cups_media_for(page_size: str) -> str:
 # =============================================================================
 
 logging.basicConfig(
-    stream=sys.stdout,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(Path(__file__).parent / "dicom-print-scp.log", encoding="utf-8"),
+    ],
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
@@ -525,6 +572,7 @@ def reload_live_config() -> None:
     global ERP_BRANDING_REFRESH_SECONDS, ERP_BRANDING_TIMEOUT_SECONDS
     global OUTPUT_DIR, OUTPUT_FORMAT, JOB_RETENTION_DAYS, PRINT_METHOD, CUPS_SERVER
     global CUPS_PRINTER_NAME, CUPS_MEDIA, JETDIRECT_HOST, JETDIRECT_PORT, HTTP_BRIDGE_SECRET
+    global PRINT_PREVIEW_ENABLED, PRINT_PREVIEW_TIMEOUT_SECONDS
     global MAX_IMAGES_PER_PAGE, MODALITY_LAYOUTS
 
     GAMMA = max(0.01, float(_config_store.get("GAMMA")))
@@ -576,10 +624,18 @@ def reload_live_config() -> None:
     PRINT_METHOD = str(_config_store.get("PRINT_METHOD")).lower()
     CUPS_SERVER = str(_config_store.get("CUPS_SERVER"))
     CUPS_PRINTER_NAME = str(_config_store.get("CUPS_PRINTER_NAME") or "").strip()
+    PRINT_PREVIEW_ENABLED = bool(_config_store.get("PRINT_PREVIEW_ENABLED"))
+    PRINT_PREVIEW_TIMEOUT_SECONDS = max(5, int(_config_store.get("PRINT_PREVIEW_TIMEOUT_SECONDS")))
     CUPS_MEDIA = str(_config_store.get("CUPS_MEDIA") or "").strip()
     JETDIRECT_HOST = str(_config_store.get("JETDIRECT_HOST") or "").strip()
     JETDIRECT_PORT = int(_config_store.get("JETDIRECT_PORT"))
     HTTP_BRIDGE_SECRET = str(_config_store.get("HTTP_BRIDGE_SECRET") or "").strip()
+    FORWARD_TO_ORTHANC = bool(_config_store.get("FORWARD_TO_ORTHANC"))
+    ORTHANC_HOST = str(_config_store.get("ORTHANC_HOST") or "192.168.1.137").strip()
+    ORTHANC_PORT = int(_config_store.get("ORTHANC_PORT") or 5680)
+    ORTHANC_AE_TITLE = str(_config_store.get("ORTHANC_AE_TITLE") or "ORTHANC2").strip()[:16] or "ORTHANC2"
+    FORWARD_AE_TITLES = str(_config_store.get("FORWARD_AE_TITLES") or "").strip()
+    PROFILES = dict(_config_store.get("PROFILES") or {})
     MODALITY_LAYOUTS = _parse_modality_layouts()
     MAX_IMAGES_PER_PAGE = LAYOUT_ROWS * LAYOUT_COLS
 
@@ -1439,13 +1495,23 @@ def save_pages(canvases: list[Image.Image], out_path: Path) -> list[Path]:
     """Save one or more rendered pages, returning the file(s) actually written.
 
     Multi-page PDFs use Pillow's native multi-page support (a single file).
-    PNG has no multi-page concept, so a multi-page PNG job (OUTPUT_FORMAT=png)
+    PNG and JPEG have no multi-page concept, so a multi-page job (OUTPUT_FORMAT=png or jpeg)
     gets one file per page instead, suffixed _p1, _p2, ...
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if OUTPUT_FORMAT == "pdf":
         canvases[0].save(str(out_path), "PDF", resolution=float(DPI), save_all=True, append_images=canvases[1:])
         return [out_path]
+    if OUTPUT_FORMAT == "jpeg":
+        if len(canvases) == 1:
+            canvases[0].convert("RGB").save(str(out_path), "JPEG", quality=95, dpi=(DPI, DPI))
+            return [out_path]
+        paths = []
+        for index, canvas in enumerate(canvases, start=1):
+            page_path = out_path.with_name(f"{out_path.stem}_p{index}{out_path.suffix}")
+            canvas.convert("RGB").save(str(page_path), "JPEG", quality=95, dpi=(DPI, DPI))
+            paths.append(page_path)
+        return paths
     if len(canvases) == 1:
         canvases[0].save(str(out_path), dpi=(DPI, DPI))
         return [out_path]
@@ -1482,6 +1548,64 @@ def print_via_cups(path: Path, copies: int, page_size: str = "") -> None:
     log.info("CUPS accepted the job: %s", result.stdout.strip())
 
 
+def print_via_windows(path: Path, copies: int, page_size: str = "") -> None:
+    """Print using Windows PowerShell/Get-Printer."""
+    if not CUPS_PRINTER_NAME:
+        raise RuntimeError("CUPS_PRINTER_NAME (printer name) is not set; cannot submit the print job")
+    
+    # Convert to absolute Windows path
+    abs_path = path.resolve()
+    if not abs_path.exists():
+        raise RuntimeError(f"Print file not found: {abs_path}")
+    
+    # Try using SumatraPDF (common on Windows) or Adobe Reader
+    pdf_readers = [
+        r"C:\Users\abina\AppData\Local\DicomViewer\SumatraPDF-3.5.2-64.exe",
+        r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+        r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+        r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+    ]
+    
+    pdf_reader = None
+    for reader_path in pdf_readers:
+        if Path(reader_path).exists():
+            pdf_reader = reader_path
+            break
+    
+    if pdf_reader:
+        # Use PDF reader command line printing
+        cmd = [pdf_reader, "-print-to", CUPS_PRINTER_NAME, str(abs_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if result.returncode != 0:
+            raise RuntimeError(f"PDF reader print failed: {(result.stderr or result.stdout).strip()}")
+        log.info("Printed via %s to %s: %s", pdf_reader, CUPS_PRINTER_NAME, abs_path.name)
+    else:
+        # Fallback: Use win32api ShellExecute to print
+        try:
+            import win32api
+            import win32print
+            
+            # Set default printer temporarily
+            current_printer = win32print.GetDefaultPrinter()
+            win32print.SetDefaultPrinter(CUPS_PRINTER_NAME)
+            
+            try:
+                # Use ShellExecute to print
+                win32api.ShellExecute(0, "print", str(abs_path), None, ".", 0)
+                import time
+                time.sleep(5)  # Wait for print to complete
+                log.info("Printed via ShellExecute to %s: %s", CUPS_PRINTER_NAME, abs_path.name)
+            finally:
+                # Restore default printer
+                if current_printer:
+                    win32print.SetDefaultPrinter(current_printer)
+        except ImportError:
+            raise RuntimeError("No PDF reader found and win32api not available. Install SumatraPDF or Adobe Reader.")
+        except Exception as exc:
+            raise RuntimeError(f"ShellExecute print failed: {exc}")
+
+
 def print_via_jetdirect(path: Path, copies: int) -> None:
     if not JETDIRECT_HOST:
         raise RuntimeError("JETDIRECT_HOST is not set; cannot open a raw print socket")
@@ -1493,8 +1617,24 @@ def print_via_jetdirect(path: Path, copies: int) -> None:
 
 
 def spool_print_job(path: Path, copies: int, page_size: str = "") -> None:
+    if PRINT_PREVIEW_ENABLED:
+        log.info("Print preview enabled - opening %s for review (auto-close in %ds)", path.name, PRINT_PREVIEW_TIMEOUT_SECONDS)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path.resolve()))
+            else:
+                import subprocess
+                subprocess.run(["xdg-open", str(path)], timeout=5)
+            import time
+            log.info("Review the preview window. Print will proceed in %d seconds...", PRINT_PREVIEW_TIMEOUT_SECONDS)
+            time.sleep(PRINT_PREVIEW_TIMEOUT_SECONDS)
+        except Exception as exc:
+            log.warning("Print preview failed: %s - proceeding with print", exc)
+    
     if PRINT_METHOD == "jetdirect":
         print_via_jetdirect(path, copies)
+    elif sys.platform == "win32":
+        print_via_windows(path, copies, page_size)
     else:
         print_via_cups(path, copies, page_size)
 
@@ -1532,6 +1672,129 @@ def check_printer_status() -> tuple[str, str]:
 # Background print-job worker
 # =============================================================================
 
+def _forward_print_job_to_orthanc(
+    job_key: str,
+    patient_info: PatientInfo,
+    modality: str,
+    film_session_uid: str,
+    source_calling_ae: str,
+) -> None:
+    """Forward a print job to Orthanc as a DICOM study for ERP sync."""
+    if not FORWARD_TO_ORTHANC:
+        return
+    if FORWARD_AE_TITLES:
+        allowed = [ae.strip().upper() for ae in FORWARD_AE_TITLES.split(",") if ae.strip()]
+        if allowed and source_calling_ae.upper() not in allowed:
+            log.info("Skipping Orthanc forward for job %s: AE %s not in FORWARD_AE_TITLES", job_key, source_calling_ae)
+            return
+    
+    try:
+        from pynetdicom import AE as SCU_AE
+        from pynetdicom.sop_class import SecondaryCaptureImageStorage, Verification
+        from pydicom.dataset import Dataset, FileDataset
+        from pydicom.uid import generate_uid
+        import tempfile
+        
+        # Create a DICOM dataset from the print job
+        study_uid = generate_uid()
+        series_uid = generate_uid()
+        sop_uid = generate_uid()
+        
+        ds = Dataset()
+        ds.file_meta = Dataset()
+        ds.file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+        ds.file_meta.MediaStorageSOPInstanceUID = sop_uid
+        ds.file_meta.ImplementationClassUID = "1.2.826.0.1.3680043.8.498.1.1"
+        ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.1"  # Explicit VR Little Endian
+        
+        # Patient Module
+        ds.PatientName = patient_info.name or "UNKNOWN"
+        ds.PatientID = patient_info.patient_id or "UNKNOWN"
+        
+        # Study Module
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = patient_info.study_date or datetime.now().strftime("%Y%m%d")
+        ds.StudyTime = datetime.now().strftime("%H%M%S")
+        ds.StudyDescription = f"Print Job {job_key}"[:64]
+        
+        # Series Module
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesNumber = 1
+        ds.Modality = modality or "OT"
+        ds.SeriesDescription = "DICOM Print Job"
+        
+        # SOP Module
+        ds.SOPClassUID = SecondaryCaptureImageStorage
+        ds.SOPInstanceUID = sop_uid
+        ds.InstanceNumber = 1
+        
+        # Create a minimal pixel data (1x1 white pixel)
+        ds.Rows = 1
+        ds.Columns = 1
+        ds.BitsAllocated = 8
+        ds.BitsStored = 8
+        ds.HighBit = 7
+        ds.PixelRepresentation = 0
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelData = b'\xff'  # Single white pixel
+        
+        # C-STORE to Orthanc
+        ae = SCU_AE(ae_title=STORAGE_AE_TITLE)
+        ae.add_requested_context(Verification)
+        ae.add_requested_context(SecondaryCaptureImageStorage)
+        
+        assoc = ae.associate(ORTHANC_HOST, ORTHANC_PORT, ae_title=ORTHANC_AE_TITLE)
+        if not assoc.is_established:
+            log.error("Failed to associate with Orthanc for job %s", job_key)
+            return
+        
+        try:
+            status = assoc.send_c_store(ds)
+            if status and status.Status == 0x0000:
+                log.info(
+                    "Forwarded print job %s to Orthanc: study=%s patient=%s",
+                    job_key, study_uid, ds.PatientName
+                )
+            else:
+                log.error(
+                    "Orthanc rejected C-STORE for job %s: status=%s",
+                    job_key, status.Status if status else "NO_STATUS"
+                )
+        finally:
+            assoc.release()
+            
+    except Exception as exc:
+        log.exception("Error forwarding job %s to Orthanc", job_key)
+
+
+def _lookup_profile(ae: str, modality: str) -> dict:
+    """Look up a profile matching AE title and modality.
+    
+    Priority: exact "AE:MODALITY" > "AE:*" > "*:MODALITY" > None
+    """
+    if not PROFILES:
+        return {}
+    ae_upper = ae.upper().strip()
+    mod_upper = modality.upper().strip()
+    # Exact match
+    key = f"{ae_upper}:{mod_upper}"
+    if key in PROFILES:
+        return PROFILES[key]
+    # AE wildcard
+    key = f"{ae_upper}:*"
+    if key in PROFILES:
+        return PROFILES[key]
+    # Modality wildcard
+    key = f"*:{mod_upper}"
+    if key in PROFILES:
+        return PROFILES[key]
+    return {}
+
+
+PROFILES: dict[str, dict] = {}
+
+
 def process_print_job(
     job_key: str,
     page_groups: list[list[np.ndarray]],
@@ -1557,11 +1820,26 @@ def process_print_job(
     per-page image lists - the DICOM print path always submits a single page
     (`[images]`/`[color_flags]`); the HTTP print API can submit several pages
     at once for a job with more images than fit in one layout.
-
-    Records its own outcome in PRINT_JOB_STATUS (queryable via
-    GET /api/v1/print-jobs/{jobKey}) so a fire-and-forget 202 isn't the last
-    word on whether a job actually printed.
+    
+    Profile lookup: checks PROFILES for a matching "AE:MODALITY" or "AE:*" or "*:MODALITY"
+    entry and applies those settings as overrides.
     """
+    # Apply profile settings if matched
+    profile = _lookup_profile(source_calling_ae, modality)
+    if profile:
+        log.info("Profile matched for %s:%s - applying overrides", source_calling_ae, modality)
+        # Override settings from profile
+        if profile.get("page_size"):
+            page_size = profile["page_size"]
+        if profile.get("orientation"):
+            orientation_hint = profile["orientation"]
+        if profile.get("printer"):
+            global CUPS_PRINTER_NAME
+            CUPS_PRINTER_NAME = profile["printer"]
+        # Store profile for this job
+        _current_profile = profile
+    else:
+        _current_profile = {}
     total_images = sum(len(page) for page in page_groups)
     _mark_job_queued(job_key, pages=len(page_groups), images=total_images, copies=copies)
     _mark_job_processing(job_key, pages=len(page_groups), images=total_images, copies=copies)
@@ -1650,6 +1928,19 @@ def process_print_job(
             LAST_PHYSICAL_PRINT = {"jobKey": job_key, "at": datetime.now().isoformat()}
             job_store.update_job(job_key, physicalPrintStatus="printed")
             log.info("Print job %s dispatched successfully (%d file(s) sent to the printer)", job_key, len(out_paths))
+            
+            # Forward to Orthanc if enabled
+            if FORWARD_TO_ORTHANC and patient_info:
+                try:
+                    _forward_print_job_to_orthanc(
+                        job_key=job_key,
+                        patient_info=patient_info,
+                        modality=modality,
+                        film_session_uid=film_session_uid,
+                        source_calling_ae=source_calling_ae,
+                    )
+                except Exception as exc:
+                    log.exception("Orthanc forwarding failed for job %s", job_key)
     except Exception as exc:
         log.exception("Print job %s failed", job_key)
         job_store.update_job(job_key, captureStatus="failed", captureError=str(exc)[:500])
@@ -1901,8 +2192,8 @@ def _create_film_box(event, uid: str, attrs: Dataset):
     IDENTITY_AUDIT_BUFFER.append(box_audit)
 
     log.info(
-        "Film Box created: %s (%dx%d grid, %d image box(es), FilmSizeID=%s, session=%s)",
-        uid, rows, cols, box_count, box.film_size_id or "(none)", session_uid,
+        "Film Box created: %s (%dx%d grid, %d image box(es), FilmSizeID=%s, FilmOrientation=%s, session=%s)",
+        uid, rows, cols, box_count, box.film_size_id or "(none)", box.orientation, session_uid,
     )
 
     resp = Dataset()
@@ -2511,7 +2802,13 @@ class _PrintBridgeHTTPHandler(BaseHTTPRequestHandler):
                     self._send_json(404, {"error": "artifact file missing"})
                     return
                 data = artifact.read_bytes()
-                ctype = "application/pdf" if artifact.suffix.lower() == ".pdf" else "image/png"
+                suffix = artifact.suffix.lower()
+                if suffix == ".pdf":
+                    ctype = "application/pdf"
+                elif suffix in (".jpg", ".jpeg"):
+                    ctype = "image/jpeg"
+                else:
+                    ctype = "image/png"
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
@@ -2722,13 +3019,152 @@ def start_http_server() -> None:
 
 
 # =============================================================================
+# Storage SCP + Orthanc forwarding
+# =============================================================================
+
+def _forward_to_orthanc(dataset: Dataset, calling_aet: str) -> bool:
+    """Forward a received DICOM study to Orthanc via C-STORE SCU."""
+    if not FORWARD_TO_ORTHANC:
+        return True
+
+    try:
+        from pynetdicom import AE as SCU_AE
+
+        ae = SCU_AE(ae_title=STORAGE_AE_TITLE)
+        ae.add_requested_context(Verification)
+
+        # Add all storage SOP classes
+        for context in STORAGE_SOP_CLASSES:
+            ae.add_requested_context(context)
+
+        assoc = ae.associate(ORTHANC_HOST, ORTHANC_PORT, ae_title=ORTHANC_AE_TITLE)
+        if not assoc.is_established:
+            log.error("Failed to associate with Orthanc at %s:%d", ORTHANC_HOST, ORTHANC_PORT)
+            return False
+
+        try:
+            study_uid = getattr(dataset, "StudyInstanceUID", None)
+            series_uid = getattr(dataset, "SeriesInstanceUID", None)
+            sop_uid = getattr(dataset, "SOPInstanceUID", None)
+            sop_class = getattr(dataset, "SOPClassUID", None)
+
+            if not sop_class or not sop_uid:
+                log.warning("Missing SOPClassUID or SOPInstanceUID, cannot forward")
+                return False
+
+            status = assoc.send_c_store(dataset, sop_class, sop_uid)
+            if status and status.Status == 0x0000:
+                log.info(
+                    "Forwarded to Orthanc: study=%s series=%s instance=%s (from %s)",
+                    study_uid, series_uid, sop_uid, calling_aet
+                )
+                return True
+            else:
+                log.error(
+                    "Orthanc rejected C-STORE: status=%s study=%s",
+                    status.Status if status else "NO_STATUS", study_uid
+                )
+                return False
+        finally:
+            assoc.release()
+
+    except Exception as exc:
+        log.exception("Error forwarding to Orthanc: %s", exc)
+        return False
+
+
+def handle_storage(event) -> int:
+    """Handle C-STORE requests from modalities (X-ray, etc.)."""
+    try:
+        dataset = event.dataset
+        dataset.file_meta = event.file_meta
+
+        calling_aet = event.assoc.requestor.ae_title.decode('ascii') if isinstance(
+            event.assoc.requestor.ae_title, bytes) else str(event.assoc.requestor.ae_title)
+
+        study_uid = getattr(dataset, "StudyInstanceUID", "UNKNOWN")
+        modality = getattr(dataset, "Modality", "UNKNOWN")
+        patient_id = getattr(dataset, "PatientID", "UNKNOWN")
+
+        log.info(
+            "Received DICOM: calling_aet=%s patient=%s study=%s modality=%s",
+            calling_aet, patient_id, study_uid, modality
+        )
+
+        # Forward to Orthanc
+        success = _forward_to_orthanc(dataset, calling_aet)
+
+        return 0x0000 if success else 0xA700  # 0xA700 = out of resources
+
+    except Exception as exc:
+        log.exception("Error handling C-STORE: %s", exc)
+        return 0xA700
+
+
+def start_storage_scp() -> None:
+    """Start the Storage SCP on a separate port to receive DICOM from modalities."""
+    if not STORAGE_ENABLED:
+        log.info("Storage SCP disabled (STORAGE_ENABLED=false)")
+        return
+
+    if STORAGE_PORT == DICOM_PORT:
+        log.info(
+            "Storage SCP sharing Print SCP port %d (STORAGE_PORT=DICOM_PORT)",
+            STORAGE_PORT
+        )
+        return
+
+    try:
+        from pynetdicom import AE as StorageAE
+
+        ae = StorageAE(ae_title=STORAGE_AE_TITLE)
+
+        # Add verification
+        ae.add_supported_context(Verification)
+
+        # Add all storage SOP classes
+        for context in STORAGE_SOP_CLASSES:
+            ae.add_supported_context(context)
+
+        if ALLOWED_CALLING_AETS:
+            ae.require_calling_aet = ALLOWED_CALLING_AETS
+
+        ae.maximum_pdu_size = 0
+        ae.network_timeout = 120
+        ae.acse_timeout = 60
+        ae.dimse_timeout = 90
+        ae.maximum_associations = 10
+
+        handlers = [
+            (evt.EVT_C_STORE, handle_storage),
+            (evt.EVT_C_ECHO, handle_echo),
+        ]
+
+        log.info(
+            "Storage SCP starting on port %d (AE: %s) - forwarding to Orthanc %s:%d (AE: %s)",
+            STORAGE_PORT, STORAGE_AE_TITLE, ORTHANC_HOST, ORTHANC_PORT, ORTHANC_AE_TITLE
+        )
+
+        ae.start_server(("0.0.0.0", STORAGE_PORT), evt_handlers=handlers, block=False)
+
+    except PermissionError:
+        log.error(
+            "Permission denied binding to storage port %d. Ports below 1024 need root.",
+            STORAGE_PORT
+        )
+    except OSError as exc:
+        log.error("Could not start Storage SCP on port %d: %s", STORAGE_PORT, exc)
+
+
+# =============================================================================
 # AE bootstrap / main
 # =============================================================================
 
 def build_ae() -> tuple[AE, list]:
     ae = AE(ae_title=AE_TITLE)
 
-    for sop_class in (
+    # Print management SOP classes
+    print_sop_classes = [
         Verification,
         BasicGrayscalePrintManagementMeta,
         BasicColorPrintManagementMeta,
@@ -2739,7 +3175,13 @@ def build_ae() -> tuple[AE, list]:
         Printer,
         PrintJob,
         PrinterConfigurationRetrieval,
-    ):
+    ]
+
+    # Add storage SOP classes if sharing the same port
+    if STORAGE_ENABLED and STORAGE_PORT == DICOM_PORT:
+        print_sop_classes.extend(STORAGE_SOP_CLASSES)
+
+    for sop_class in print_sop_classes:
         ae.add_supported_context(sop_class)
 
     if ALLOWED_CALLING_AETS:
@@ -2760,12 +3202,22 @@ def build_ae() -> tuple[AE, list]:
         (evt.EVT_N_DELETE, handle_delete),
         (evt.EVT_N_GET, handle_get),
     ]
+
+    # Add C-STORE handler if sharing the same port
+    if STORAGE_ENABLED and STORAGE_PORT == DICOM_PORT:
+        handlers.append((evt.EVT_C_STORE, handle_storage))
     return ae, handlers
 
 
 def _log_startup_banner() -> None:
     log.info("=" * 72)
     log.info("DICOM Print SCP  |  AE Title=%s  Port=%d", AE_TITLE, DICOM_PORT)
+    if STORAGE_ENABLED:
+        log.info(
+            "Storage SCP      |  AE Title=%s  Port=%d  ->  Orthanc %s:%d (AE: %s) [%s]",
+            STORAGE_AE_TITLE, STORAGE_PORT, ORTHANC_HOST, ORTHANC_PORT, ORTHANC_AE_TITLE,
+            "forwarding" if FORWARD_TO_ORTHANC else "receive-only"
+        )
     if ALLOWED_CALLING_AETS:
         log.info("Accepting calling AE Titles: %s", ", ".join(ALLOWED_CALLING_AETS))
     else:
@@ -2852,6 +3304,7 @@ def main() -> None:
     start_batch_flush_thread()
     start_erp_branding_thread()
     start_http_server()
+    start_storage_scp()
 
     ae, handlers = build_ae()
     try:

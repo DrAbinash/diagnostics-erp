@@ -48,11 +48,13 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
 </header>
 <nav id="tabs">
   <button class="active" data-tab="dashboard">Dashboard</button>
+  <button data-tab="settings">Settings</button>
   <button data-tab="dicom">DICOM</button>
   <button data-tab="film">Film / Layout</button>
   <button data-tab="calibration">Calibration</button>
   <button data-tab="branding">Branding</button>
   <button data-tab="printer">Printer</button>
+  <button data-tab="profiles">Profiles</button>
   <button data-tab="storage">Storage</button>
   <button data-tab="jobs">Job History</button>
   <button data-tab="diagnostics">Diagnostics</button>
@@ -70,6 +72,63 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
     </div>
     <p id="actionResult" class="muted"></p>
   </div>
+</section>
+
+<section id="tab-settings" class="tab hidden">
+  <div class="card">
+    <h2>General Settings</h2>
+    <div class="grid">
+      <div><label>Output Directory</label><input id="outputDir"></div>
+      <div><label>Output Format</label>
+        <select id="outputFormat"><option value="pdf">PDF</option><option value="png">PNG</option></select>
+      </div>
+      <div><label>Job Retention (days)</label><input id="jobRetention" type="number"></div>
+      <div><label>Log Level</label>
+        <select id="logLevel"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Layout & Margins</h2>
+    <div class="grid">
+      <div><label>Margin (mm)</label><input id="marginMm" type="number" step="0.5" min="0" max="20"></div>
+      <div><label>Gutter between images (mm)</label><input id="gutterMm" type="number" step="0.5" min="0" max="10"></div>
+      <div><label>Patient Banner Height (mm)</label><input id="patientBannerH" type="number" step="1" min="0" max="30"></div>
+    </div>
+    <p class="muted">Reduce margin to fill more of the page. Increase patient banner height if the name gets cut off.</p>
+  </div>
+  <div class="card">
+    <h2>Print Preview</h2>
+    <div class="grid">
+      <div><label>Show Preview Before Printing</label>
+        <select id="printPreviewEnabled"><option value="true">Yes</option><option value="false">No</option></select>
+      </div>
+      <div><label>Preview Timeout (seconds)</label><input id="printPreviewTimeout" type="number" min="5" max="300"></div>
+    </div>
+    <p class="muted">When enabled, each print job opens in your PDF viewer first. After the timeout, it prints automatically. Close the viewer to cancel.</p>
+  </div>
+  <div class="card">
+    <h2>Orthanc Forwarding</h2>
+    <div class="grid">
+      <div><label>Forward to Orthanc</label>
+        <select id="forwardToOrthanc"><option value="true">Yes</option><option value="false">No</option></select>
+      </div>
+      <div><label>Orthanc Host</label><input id="orthancHost"></div>
+      <div><label>Orthanc Port</label><input id="orthancPort" type="number"></div>
+      <div><label>Orthanc AE Title</label><input id="orthancAet"></div>
+      <div><label>Forward Only These AE Titles (comma-separated, empty=all)</label><input id="forwardAeTitles"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Batch Settings</h2>
+    <div class="grid">
+      <div><label>Batch Group By</label>
+        <select id="batchGroupBy"><option value="session">Session</option><option value="patient">Patient</option><option value="none">None</option></select>
+      </div>
+      <div><label>Batch Idle Timeout (seconds)</label><input id="batchIdleTimeout" type="number"></div>
+    </div>
+  </div>
+  <p><button class="btn" onclick="saveAllSettings()">Save All Settings</button></p>
 </section>
 
 <section id="tab-dicom" class="tab hidden">
@@ -100,7 +159,20 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
   <div class="card">
     <h2>Film / Layout</h2>
     <div class="grid">
-      <div><label>Page Size</label><input id="pageSize"></div>
+      <div><label>Page Size</label>
+        <select id="pageSize">
+          <option value="A4">A4 (210x297mm)</option>
+          <option value="A3">A3 (297x420mm)</option>
+          <option value="A5">A5 (148x210mm)</option>
+          <option value="8X10">8x10 inch (203x254mm)</option>
+          <option value="8_5X11">8.5x11 inch / Letter</option>
+          <option value="10X12">10x12 inch (254x305mm)</option>
+          <option value="10X14">10x14 inch (254x356mm)</option>
+          <option value="11X14">11x14 inch (279x356mm)</option>
+          <option value="11X17">11x17 inch (279x432mm)</option>
+          <option value="14X17">14x17 inch (356x432mm)</option>
+        </select>
+      </div>
       <div><label>Orientation</label><select id="pageOrientation"><option>AUTO</option><option>SCU</option><option>PORTRAIT</option><option>LANDSCAPE</option></select></div>
       <div><label>Default Rows</label><input id="layoutRows" type="number"></div>
       <div><label>Default Cols</label><input id="layoutCols" type="number"></div>
@@ -165,13 +237,52 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
     <div class="grid">
       <div><label>Print Method</label><select id="printMethod"><option>cups</option><option>jetdirect</option></select></div>
       <div><label>CUPS Server</label><input id="cupsServer"></div>
-      <div><label>CUPS Queue</label><input id="cupsPrinter"></div>
+      <div><label>Printer</label><select id="cupsPrinter"></select></div>
       <div><label>CUPS Media</label><input id="cupsMedia"></div>
       <div><label>JetDirect Host</label><input id="jetHost"></div>
       <div><label>JetDirect Port</label><input id="jetPort" type="number"></div>
     </div>
     <p class="muted">Test Printer checks queue reachability. A full CUPS test may physically print.</p>
-    <p><button class="btn" onclick="savePrinter()">Save</button> <button class="btn ghost" onclick="testPrinter()">Test Printer</button></p>
+    <p><button class="btn" onclick="savePrinter()">Save</button> <button class="btn ghost" onclick="testPrinter()">Test Printer</button> <button class="btn ghost" onclick="loadPrinters()">Refresh Printer List</button></p>
+  </div>
+</section>
+
+<section id="tab-profiles" class="tab hidden">
+  <div class="card">
+    <h2>AE/Modality Profiles</h2>
+    <p class="muted">Define per-source settings. When a print job arrives, the matching profile's settings override the defaults. Key format: <code>AE_TITLE:MODALITY</code> (e.g., <code>FILMPLUS:CR</code>, <code>CT_SCANNER:CT</code>). Use <code>*</code> as wildcard.</p>
+    <div class="grid">
+      <div><label>Profile Key (AE:MODALITY)</label><input id="profileKey" placeholder="FILMPLUS:CR"></div>
+      <div><label>Page Size</label>
+        <select id="profilePageSize">
+          <option value="">(default)</option>
+          <option value="8X10">8x10 inch</option>
+          <option value="A4">A4</option>
+          <option value="A3">A3</option>
+          <option value="10X12">10x12 inch</option>
+          <option value="11X14">11x14 inch</option>
+          <option value="14X17">14x17 inch</option>
+        </select>
+      </div>
+      <div><label>Orientation</label>
+        <select id="profileOrientation">
+          <option value="">(default)</option>
+          <option value="PORTRAIT">Portrait</option>
+          <option value="LANDSCAPE">Landscape</option>
+        </select>
+      </div>
+      <div><label>Printer</label><select id="profilePrinter"></select></div>
+      <div><label>Margin (mm)</label><input id="profileMargin" type="number" step="0.5" min="0" placeholder="(default)"></div>
+      <div><label>Brightness</label><input id="profileBrightness" type="number" step="0.1" placeholder="(default)"></div>
+      <div><label>Contrast</label><input id="profileContrast" type="number" step="0.1" placeholder="(default)"></div>
+    </div>
+    <p><button class="btn" onclick="addProfile()">Add/Update Profile</button> <button class="btn ghost" onclick="clearProfileForm()">Clear Form</button></p>
+  </div>
+  <div class="card">
+    <h2>Existing Profiles</h2>
+    <table id="profilesTable"><thead><tr>
+      <th>Key</th><th>Page Size</th><th>Orientation</th><th>Printer</th><th>Margin</th><th>Actions</th>
+    </tr></thead><tbody></tbody></table>
   </div>
 </section>
 
@@ -236,7 +347,9 @@ function tab(name){
   if(name==='jobs') loadJobs();
   if(name==='diagnostics') loadDiagnostics();
   if(name==='storage') loadStorage();
-  if(name==='calibration') document.getElementById('calPreview').src='/admin/api/calibration-preview?'+Date.now();
+  if(name==='printer') loadPrinters();
+  if(name==='profiles') loadProfiles();
+  if(name==='calibration') loadCalibrationPreview();
 }
 document.getElementById('tabs').addEventListener('click',e=>{if(e.target.dataset.tab) tab(e.target.dataset.tab)});
 function card(title,val,cls=''){return `<div class="card"><div class="muted">${title}</div><div><span class="status ${cls}">${val}</span></div></div>`}
@@ -277,11 +390,27 @@ async function loadSettings(){
   set('state',map.CLINIC_STATE); set('pin',map.CLINIC_PIN); set('phone',map.CLINIC_PHONE);
   set('email',map.CLINIC_EMAIL); set('website',map.CLINIC_WEBSITE); set('logoPath',map.CLINIC_LOGO_PATH);
   set('header1',map.HEADER_LINE1); set('header2',map.HEADER_LINE2); set('footer1',map.FOOTER_LINE1); set('footer2',map.FOOTER_LINE2);
-  set('printMethod',map.PRINT_METHOD); set('cupsServer',map.CUPS_SERVER); set('cupsPrinter',map.CUPS_PRINTER_NAME);
+  set('printMethod',map.PRINT_METHOD); set('cupsServer',map.CUPS_SERVER);
   set('cupsMedia',map.CUPS_MEDIA); set('jetHost',map.JETDIRECT_HOST); set('jetPort',map.JETDIRECT_PORT);
+  set('outputDir',map.OUTPUT_DIR); set('outputFormat',map.OUTPUT_FORMAT); set('jobRetention',map.JOB_RETENTION_DAYS);
+  set('logLevel',map.LOG_LEVEL);
+  set('marginMm',map.MARGIN_MM); set('gutterMm',map.GUTTER_MM); set('patientBannerH',map.PATIENT_BANNER_HEIGHT_MM);
+  set('printPreviewEnabled',String(map.PRINT_PREVIEW_ENABLED).toLowerCase());
+  set('printPreviewTimeout',map.PRINT_PREVIEW_TIMEOUT_SECONDS);
+  set('forwardToOrthanc',String(map.FORWARD_TO_ORTHANC).toLowerCase());
+  set('orthancHost',map.ORTHANC_HOST); set('orthancPort',map.ORTHANC_PORT); set('orthancAet',map.ORTHANC_AE_TITLE);
+  set('forwardAeTitles',map.FORWARD_AE_TITLES);
+  set('batchGroupBy',map.BATCH_GROUP_BY); set('batchIdleTimeout',map.BATCH_IDLE_TIMEOUT_SECONDS);
   document.querySelectorAll('input[name=brandSrc]').forEach(r=>r.checked=r.value===map.BRANDING_SOURCE);
   const ps=document.getElementById('presetSelect'); ps.innerHTML='';
   Object.keys(res.data.presets||{}).forEach(k=>ps.innerHTML+=`<option value="${k}">${k}</option>`);
+  loadPrinters(map.CUPS_PRINTER_NAME);
+}
+async function loadPrinters(selected){
+  const res=await api('/admin/api/printers'); if(!res.ok)return;
+  const sel=document.getElementById('cupsPrinter'); if(!sel)return;
+  const printers=res.data.printers||[];
+  sel.innerHTML=printers.length?printers.map(p=>`<option value="${p}"${p===selected?' selected':''}>${p}</option>`).join(''):'<option value="">No printers found</option>';
 }
 async function saveSettings(obj){const r=await api('/admin/api/settings',{method:'POST',body:{settings:obj}}); alert(JSON.stringify(r.data))}
 function saveDicomSettings(){saveSettings({DICOM_AET:document.getElementById('dicomAet').value,DICOM_PORT:+document.getElementById('dicomPort').value,ALLOWED_CALLING_AETS:document.getElementById('dicomAllowed').value,CAPTURE_MODE:document.getElementById('captureMode').value})}
@@ -290,14 +419,49 @@ function saveCalibration(){saveSettings({ENABLE_CALIBRATION:document.getElementB
 function resetCalibration(){saveSettings({GAMMA:2.0,BRIGHTNESS:0,CONTRAST:1,SHARPNESS:0,CONTRAST_LOW_PERCENTILE:1,CONTRAST_HIGH_PERCENTILE:99,INVERT_POLARITY:false,ENABLE_CALIBRATION:true});loadSettings()}
 function saveBranding(){const src=document.querySelector('input[name=brandSrc]:checked').value;saveSettings({BRANDING_SOURCE:src,ERP_BRANDING_URL:document.getElementById('erpUrl').value,CLINIC_NAME:document.getElementById('clinicName').value,CLINIC_TAGLINE:document.getElementById('clinicTagline').value,CLINIC_ADDRESS1:document.getElementById('addr1').value,CLINIC_ADDRESS2:document.getElementById('addr2').value,CLINIC_CITY:document.getElementById('city').value,CLINIC_STATE:document.getElementById('state').value,CLINIC_PIN:document.getElementById('pin').value,CLINIC_PHONE:document.getElementById('phone').value,CLINIC_EMAIL:document.getElementById('email').value,CLINIC_WEBSITE:document.getElementById('website').value,CLINIC_LOGO_PATH:document.getElementById('logoPath').value,HEADER_LINE1:document.getElementById('header1').value,HEADER_LINE2:document.getElementById('header2').value,FOOTER_LINE1:document.getElementById('footer1').value,FOOTER_LINE2:document.getElementById('footer2').value})}
 function savePrinter(){saveSettings({PRINT_METHOD:document.getElementById('printMethod').value,CUPS_SERVER:document.getElementById('cupsServer').value,CUPS_PRINTER_NAME:document.getElementById('cupsPrinter').value,CUPS_MEDIA:document.getElementById('cupsMedia').value,JETDIRECT_HOST:document.getElementById('jetHost').value,JETDIRECT_PORT:+document.getElementById('jetPort').value})}
+function saveAllSettings(){saveSettings({
+  OUTPUT_DIR:document.getElementById('outputDir').value,
+  OUTPUT_FORMAT:document.getElementById('outputFormat').value,
+  JOB_RETENTION_DAYS:+document.getElementById('jobRetention').value,
+  LOG_LEVEL:document.getElementById('logLevel').value,
+  MARGIN_MM:+document.getElementById('marginMm').value,
+  GUTTER_MM:+document.getElementById('gutterMm').value,
+  PATIENT_BANNER_HEIGHT_MM:+document.getElementById('patientBannerH').value,
+  PRINT_PREVIEW_ENABLED:document.getElementById('printPreviewEnabled').value==='true',
+  PRINT_PREVIEW_TIMEOUT_SECONDS:+document.getElementById('printPreviewTimeout').value,
+  FORWARD_TO_ORTHANC:document.getElementById('forwardToOrthanc').value==='true',
+  ORTHANC_HOST:document.getElementById('orthancHost').value,
+  ORTHANC_PORT:+document.getElementById('orthancPort').value,
+  ORTHANC_AE_TITLE:document.getElementById('orthancAet').value,
+  FORWARD_AE_TITLES:document.getElementById('forwardAeTitles').value,
+  BATCH_GROUP_BY:document.getElementById('batchGroupBy').value,
+  BATCH_IDLE_TIMEOUT_SECONDS:+document.getElementById('batchIdleTimeout').value
+})}
 async function loadJobs(){
   const res=await api('/admin/api/jobs'); if(!res.ok)return;
   const tb=document.querySelector('#jobsTable tbody'); tb.innerHTML='';
   res.data.jobs.forEach(j=>{
     const artifact=j.artifactPaths?.[0]||'';
-    const link=artifact?`<a href="/admin/api/artifact/${artifact.split('/').pop()}" target="_blank">Download</a>`:'';
+    const link=artifact?`<a href="#" onclick="downloadArtifact('${artifact.split(/[\\\\/]/).pop()}');return false;">Download</a>`:'';
     tb.innerHTML+=`<tr><td>${j.receivedAt||''}</td><td>${j.source}</td><td>${j.sourceCallingAE||''}</td><td>${j.patientId||j.patientName||''}</td><td>${j.pages||0}</td><td>${j.captureStatus}</td><td>${j.physicalPrintStatus}</td><td>${link}</td></tr>`;
   });
+}
+async function loadCalibrationPreview(){
+  const r=await fetch('/admin/api/calibration-preview',{headers:{'X-Admin-Session':token}});
+  if(!r.ok){document.getElementById('calPreview').alt='Preview failed: '+r.status;return}
+  const blob=await r.blob();
+  const url=URL.createObjectURL(blob);
+  const img=document.getElementById('calPreview');
+  const old=img.src; if(old.startsWith('blob:'))URL.revokeObjectURL(old);
+  img.src=url;
+}
+async function downloadArtifact(name){
+  const r=await fetch('/admin/api/artifact/'+name,{headers:{'X-Admin-Session':token}});
+  if(!r.ok){alert('Download failed: '+r.status);return}
+  const blob=await r.blob();
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click();
+  URL.revokeObjectURL(url);
 }
 async function loadDiagnostics(){const r=await api('/admin/api/diagnostics');document.getElementById('diagReport').textContent=JSON.stringify(r.data,null,2)}
 function copyDiagnostics(){navigator.clipboard.writeText(document.getElementById('diagReport').textContent)}
@@ -305,6 +469,66 @@ async function loadStorage(){const r=await api('/admin/api/dashboard');document.
 async function exportSettings(secrets){const r=await api('/admin/api/export-settings',{method:'POST',body:{includeSecrets:secrets}});document.getElementById('importJson').value=JSON.stringify(r.data,null,2)}
 async function importSettings(){const include=document.getElementById('importSecrets').checked;const payload=JSON.parse(document.getElementById('importJson').value);payload.includeSecrets=include;const r=await api('/admin/api/import-settings',{method:'POST',body:payload});alert(JSON.stringify(r.data))}
 async function applyPreset(){const name=document.getElementById('presetSelect').value;const r=await api('/admin/api/apply-preset',{method:'POST',body:{name}});alert(JSON.stringify(r.data));loadSettings()}
+let profiles={};
+async function loadProfiles(){
+  const res=await api('/admin/api/settings'); if(!res.ok)return;
+  const s=res.data.settings||[]; const map={}; s.forEach(x=>map[x.key]=x.effectiveValue);
+  profiles=map.PROFILES||{};
+  const tb=document.querySelector('#profilesTable tbody'); tb.innerHTML='';
+  Object.entries(profiles).forEach(([key,p])=>{
+    tb.innerHTML+=`<tr><td>${key}</td><td>${p.page_size||'-'}</td><td>${p.orientation||'-'}</td><td>${p.printer||'-'}</td><td>${p.margin_mm??'-'}</td><td><button class="btn ghost" onclick="editProfile('${key}')">Edit</button> <button class="btn ghost" onclick="deleteProfile('${key}')">Delete</button></td></tr>`;
+  });
+  loadPrintersForProfile();
+}
+function loadPrintersForProfile(){
+  api('/admin/api/printers').then(r=>{
+    if(!r.ok)return; const sel=document.getElementById('profilePrinter'); if(!sel)return;
+    const printers=r.data.printers||[];
+    sel.innerHTML='<option value="">(default)</option>'+printers.map(p=>`<option value="${p}">${p}</option>`).join('');
+  });
+}
+function addProfile(){
+  const key=document.getElementById('profileKey').value.trim().toUpperCase();
+  if(!key){alert('Enter a profile key');return}
+  const profile={};
+  const ps=document.getElementById('profilePageSize').value; if(ps) profile.page_size=ps;
+  const or=document.getElementById('profileOrientation').value; if(or) profile.orientation=or;
+  const pr=document.getElementById('profilePrinter').value; if(pr) profile.printer=pr;
+  const mg=document.getElementById('profileMargin').value; if(mg) profile.margin_mm=+mg;
+  const br=document.getElementById('profileBrightness').value; if(br) profile.brightness=+br;
+  const ct=document.getElementById('profileContrast').value; if(ct) profile.contrast=+ct;
+  profiles[key]=profile;
+  saveProfiles();
+}
+function editProfile(key){
+  const p=profiles[key]||{};
+  document.getElementById('profileKey').value=key;
+  document.getElementById('profilePageSize').value=p.page_size||'';
+  document.getElementById('profileOrientation').value=p.orientation||'';
+  document.getElementById('profilePrinter').value=p.printer||'';
+  document.getElementById('profileMargin').value=p.margin_mm??'';
+  document.getElementById('profileBrightness').value=p.brightness??'';
+  document.getElementById('profileContrast').value=p.contrast??'';
+}
+function deleteProfile(key){
+  if(!confirm('Delete profile '+key+'?'))return;
+  delete profiles[key];
+  saveProfiles();
+}
+function clearProfileForm(){
+  document.getElementById('profileKey').value='';
+  document.getElementById('profilePageSize').value='';
+  document.getElementById('profileOrientation').value='';
+  document.getElementById('profilePrinter').value='';
+  document.getElementById('profileMargin').value='';
+  document.getElementById('profileBrightness').value='';
+  document.getElementById('profileContrast').value='';
+}
+async function saveProfiles(){
+  const r=await api('/admin/api/settings',{method:'POST',body:{settings:{PROFILES:profiles}}});
+  alert(JSON.stringify(r.data));
+  loadProfiles();
+}
 async function boot(){await loadSettings();await loadDashboard();tab('dashboard')}
 </script>
 </body>

@@ -173,6 +173,18 @@ def diagnostic_report() -> dict[str, Any]:
     }
 
 
+def list_windows_printers() -> list[str]:
+    """Return names of printers installed on this Windows machine."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import win32print
+        printers = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
+        return [p[2] for p in printers if p[2]]
+    except Exception:
+        return []
+
+
 def handle_admin_get(handler, path: str) -> bool:
     if path == "/admin":
         body = _read_admin_ui()
@@ -240,6 +252,11 @@ def handle_admin_get(handler, path: str) -> bool:
             handler.end_headers()
             handler.wfile.write(data)
             return True
+        if sub == "printers":
+            if not _require_admin(handler):
+                return True
+            _json_response(handler, HTTPStatus.OK, {"printers": list_windows_printers()})
+            return True
         if sub.startswith("artifact/"):
             if not _require_admin(handler):
                 return True
@@ -250,7 +267,13 @@ def handle_admin_get(handler, path: str) -> bool:
                 _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "artifact not found"})
                 return True
             data = candidate.read_bytes()
-            ctype = "application/pdf" if candidate.suffix.lower() == ".pdf" else "image/png"
+            suffix = candidate.suffix.lower()
+            if suffix == ".pdf":
+                ctype = "application/pdf"
+            elif suffix in (".jpg", ".jpeg"):
+                ctype = "image/jpeg"
+            else:
+                ctype = "image/png"
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", ctype)
             handler.send_header("Content-Length", str(len(data)))
