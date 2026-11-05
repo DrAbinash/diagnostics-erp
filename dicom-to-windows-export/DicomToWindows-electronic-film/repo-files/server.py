@@ -1425,6 +1425,13 @@ def render_page(
         font = _load_font(_FONT_BOLD_PATHS, max(10, int(patient_h * 0.62)))
         bbox = draw.textbbox((0, 0), patient_label, font=font)
         text_w = bbox[2] - bbox[0]
+        max_text_w = page_w - 2 * margin_px
+        if text_w > max_text_w:
+            while patient_label and draw.textbbox((0, 0), patient_label + "...", font=font)[2] > max_text_w:
+                patient_label = patient_label[:-1]
+            patient_label = patient_label + "..."
+            bbox = draw.textbbox((0, 0), patient_label, font=font)
+            text_w = bbox[2] - bbox[0]
         if header_align == "LEFT":
             text_x = margin_px
         elif header_align == "RIGHT":
