@@ -405,13 +405,13 @@ def _parse_modality_layouts() -> dict:
 
 MODALITY_LAYOUTS = _parse_modality_layouts()
 
-OUTPUT_DIR = Path(_env_str("OUTPUT_DIR", "/data/print-jobs"))
-OUTPUT_FORMAT = _env_str("OUTPUT_FORMAT", "pdf").strip().lower()
+OUTPUT_DIR = Path(str(_config_store.get("OUTPUT_DIR")))
+OUTPUT_FORMAT = str(_config_store.get("OUTPUT_FORMAT")).strip().lower()
 if OUTPUT_FORMAT not in ("pdf", "png", "jpeg", "jpg"):
     OUTPUT_FORMAT = "pdf"
 if OUTPUT_FORMAT == "jpg":
     OUTPUT_FORMAT = "jpeg"
-JOB_RETENTION_DAYS = _env_int("JOB_RETENTION_DAYS", 30)
+JOB_RETENTION_DAYS = int(_config_store.get("JOB_RETENTION_DAYS"))
 
 PRINT_METHOD = _env_str("PRINT_METHOD", "cups").strip().lower()
 CUPS_SERVER = _env_str("CUPS_SERVER", "localhost:631").strip()
