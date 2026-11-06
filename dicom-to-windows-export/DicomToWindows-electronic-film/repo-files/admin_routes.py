@@ -17,6 +17,7 @@ import admin_auth
 import config_store
 import image_profiles
 import job_store
+import server
 from identity_audit import summarize_identity
 
 _CTX: dict[str, Any] = {}
@@ -363,7 +364,7 @@ def handle_admin_post(handler, path: str, payload: dict) -> bool:
             return True
         try:
             settings = payload if isinstance(payload, dict) else {}
-            preview_array = generate_layout_preview(settings)
+            preview_array = server.generate_layout_preview(settings)
             from PIL import Image
             from io import BytesIO
             buf = BytesIO()
