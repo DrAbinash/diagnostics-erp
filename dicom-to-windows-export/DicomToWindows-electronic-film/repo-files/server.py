@@ -1685,6 +1685,7 @@ def _forward_print_job_to_orthanc(
     modality: str,
     film_session_uid: str,
     source_calling_ae: str,
+    out_paths: list[Path],
 ) -> None:
     """Forward a print job to Orthanc as a DICOM study for ERP sync."""
     if not FORWARD_TO_ORTHANC:
@@ -1701,6 +1702,7 @@ def _forward_print_job_to_orthanc(
         from pydicom.dataset import Dataset, FileDataset
         from pydicom.uid import generate_uid
         import tempfile
+        from PIL import Image
         
         # Create a DICOM dataset from the print job
         study_uid = generate_uid()
@@ -1735,16 +1737,32 @@ def _forward_print_job_to_orthanc(
         ds.SOPInstanceUID = sop_uid
         ds.InstanceNumber = 1
         
-        # Create a minimal pixel data (1x1 white pixel)
-        ds.Rows = 1
-        ds.Columns = 1
-        ds.BitsAllocated = 8
-        ds.BitsStored = 8
-        ds.HighBit = 7
-        ds.PixelRepresentation = 0
-        ds.SamplesPerPixel = 1
-        ds.PhotometricInterpretation = "MONOCHROME2"
-        ds.PixelData = b'\xff'  # Single white pixel
+        # Read the first rendered image file and use its pixel data
+        if out_paths and out_paths[0].exists():
+            img = Image.open(out_paths[0]).convert("L")  # Convert to grayscale
+            img_array = np.array(img)
+            ds.Rows = img.height
+            ds.Columns = img.width
+            ds.BitsAllocated = 8
+            ds.BitsStored = 8
+            ds.HighBit = 7
+            ds.PixelRepresentation = 0
+            ds.SamplesPerPixel = 1
+            ds.PhotometricInterpretation = "MONOCHROME2"
+            ds.PixelData = img_array.tobytes()
+            log.info("Forwarding real image from %s (%dx%d)", out_paths[0].name, img.width, img.height)
+        else:
+            # Fallback to minimal pixel data if no image available
+            ds.Rows = 1
+            ds.Columns = 1
+            ds.BitsAllocated = 8
+            ds.BitsStored = 8
+            ds.HighBit = 7
+            ds.PixelRepresentation = 0
+            ds.SamplesPerPixel = 1
+            ds.PhotometricInterpretation = "MONOCHROME2"
+            ds.PixelData = b'\xff'
+            log.warning("No rendered image available for job %s, sending placeholder", job_key)
         
         # C-STORE to Orthanc
         ae = SCU_AE(ae_title=STORAGE_AE_TITLE)
@@ -1945,6 +1963,7 @@ def process_print_job(
                         modality=modality,
                         film_session_uid=film_session_uid,
                         source_calling_ae=source_calling_ae,
+                        out_paths=out_paths,
                     )
                 except Exception as exc:
                     log.exception("Orthanc forwarding failed for job %s", job_key)
