@@ -80,7 +80,7 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
     <div class="grid">
       <div><label>Output Directory</label><input id="outputDir"></div>
       <div><label>Output Format</label>
-        <select id="outputFormat"><option value="pdf">PDF</option><option value="png">PNG</option></select>
+        <select id="outputFormat"><option value="pdf">PDF</option><option value="png">PNG</option><option value="jpeg">JPEG</option></select>
       </div>
       <div><label>Job Retention (days)</label><input id="jobRetention" type="number"></div>
       <div><label>Log Level</label>
@@ -183,6 +183,34 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
     </div>
     <p><button class="btn" onclick="saveFilmSettings()">Save Settings</button></p>
   </div>
+  <div class="card">
+    <h2>Layout Adjustment Controls (Fix Image Cutting)</h2>
+    <div class="grid">
+      <div><label>Left Margin Offset (mm, -10 to 10)</label>
+        <input id="marginLeftOffset" type="number" step="0.5" min="-10" max="10">
+      </div>
+      <div><label>Right Margin Offset (mm, -10 to 10)</label>
+        <input id="marginRightOffset" type="number" step="0.5" min="-10" max="10">
+      </div>
+      <div><label>Top Margin Offset (mm, -10 to 10)</label>
+        <input id="marginTopOffset" type="number" step="0.5" min="-10" max="10">
+      </div>
+      <div><label>Bottom Margin Offset (mm, -10 to 10)</label>
+        <input id="marginBottomOffset" type="number" step="0.5" min="-10" max="10">
+      </div>
+      <div><label>Image Padding (mm, 0-20)</label>
+        <input id="imagePadding" type="number" step="0.5" min="0" max="20">
+      </div>
+      <div><label>X Position Offset (pixels, -100 to 100)</label>
+        <input id="positionXOffset" type="number" step="1" min="-100" max="100">
+      </div>
+      <div><label>Y Position Offset (pixels, -100 to 100)</label>
+        <input id="positionYOffset" type="number" step="1" min="-100" max="100">
+      </div>
+    </div>
+    <p class="muted">Use margin offsets to fix image cutting: increase left offset if cut on left, increase bottom offset if cut on bottom. Padding adds space around images. Position offsets for fine-tuning.</p>
+    <p><button class="btn" onclick="saveLayoutAdjustments()">Save Layout Adjustments</button></p>
+  </div>
 </section>
 
 <section id="tab-calibration" class="tab hidden">
@@ -201,6 +229,37 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
     <p><button class="btn" onclick="saveCalibration()">Save</button> <button class="btn ghost" onclick="resetCalibration()">Reset Defaults</button></p>
     <h2>Synthetic Preview</h2>
     <img class="preview" id="calPreview" alt="Calibration preview">
+  </div>
+  <div class="card">
+    <h2>Advanced Image Quality Enhancements</h2>
+    <div class="grid">
+      <div><label>Enable CLAHE (Contrast Enhancement)</label>
+        <select id="enableClahe"><option value="true">On</option><option value="false">Off</option></select>
+      </div>
+      <div><label>CLAHE Clip Limit (0.1-10.0)</label>
+        <input id="claheClipLimit" type="number" step="0.1" min="0.1" max="10.0">
+      </div>
+      <div><label>CLAHE Grid Size (1-16)</label>
+        <input id="claheGridSize" type="number" step="1" min="1" max="16">
+      </div>
+      <div><label>CLAHE Normalize</label>
+        <select id="claheNormalize"><option value="true">Yes</option><option value="false">No</option></select>
+      </div>
+      <div><label>Enable Denoise (Noise Reduction)</label>
+        <select id="enableDenoise"><option value="true">On</option><option value="false">Off</option></select>
+      </div>
+      <div><label>Denoise Strength (1-20)</label>
+        <input id="denoiseStrength" type="number" step="1" min="1" max="20">
+      </div>
+      <div><label>Enable Auto Exposure</label>
+        <select id="enableAutoExposure"><option value="true">On</option><option value="false">Off</option></select>
+      </div>
+      <div><label>Exposure Correction (-1.0 to 1.0)</label>
+        <input id="exposureCorrection" type="number" step="0.1" min="-1.0" max="1.0">
+      </div>
+    </div>
+    <p class="muted">CLAHE enhances local contrast (excellent for medical images). Denoise reduces graininess. Auto Exposure corrects brightness/contrast automatically. Recommended: All enabled for X-ray films.</p>
+    <p><button class="btn" onclick="saveImageQuality()">Save Image Quality Settings</button></p>
   </div>
 </section>
 
@@ -385,6 +444,14 @@ async function loadSettings(){
   set('enableCalib',map.ENABLE_CALIBRATION); set('gamma',map.GAMMA); set('brightness',map.BRIGHTNESS);
   set('contrast',map.CONTRAST); set('sharpness',map.SHARPNESS); set('blackPoint',map.CONTRAST_LOW_PERCENTILE);
   set('whitePoint',map.CONTRAST_HIGH_PERCENTILE); set('invert',map.INVERT_POLARITY);
+  set('enableClahe',String(map.ENABLE_CLAHE).toLowerCase()); set('claheClipLimit',map.CLAHE_CLIP_LIMIT);
+  set('claheGridSize',map.CLAHE_GRID_SIZE); set('claheNormalize',String(map.CLAHE_NORMALIZE).toLowerCase());
+  set('enableDenoise',String(map.ENABLE_DENOISE).toLowerCase()); set('denoiseStrength',map.DENOISE_STRENGTH);
+  set('enableAutoExposure',String(map.ENABLE_AUTO_EXPOSURE).toLowerCase()); set('exposureCorrection',map.EXPOSURE_CORRECTION);
+  set('marginLeftOffset',map.MARGIN_LEFT_OFFSET_MM); set('marginRightOffset',map.MARGIN_RIGHT_OFFSET_MM);
+  set('marginTopOffset',map.MARGIN_TOP_OFFSET_MM); set('marginBottomOffset',map.MARGIN_BOTTOM_OFFSET_MM);
+  set('imagePadding',map.IMAGE_PADDING_MM); set('positionXOffset',map.IMAGE_POSITION_X_OFFSET);
+  set('positionYOffset',map.IMAGE_POSITION_Y_OFFSET);
   set('erpUrl',map.ERP_BRANDING_URL); set('clinicName',map.CLINIC_NAME); set('clinicTagline',map.CLINIC_TAGLINE);
   set('addr1',map.CLINIC_ADDRESS1); set('addr2',map.CLINIC_ADDRESS2); set('city',map.CLINIC_CITY);
   set('state',map.CLINIC_STATE); set('pin',map.CLINIC_PIN); set('phone',map.CLINIC_PHONE);
@@ -416,6 +483,8 @@ async function saveSettings(obj){const r=await api('/admin/api/settings',{method
 function saveDicomSettings(){saveSettings({DICOM_AET:document.getElementById('dicomAet').value,DICOM_PORT:+document.getElementById('dicomPort').value,ALLOWED_CALLING_AETS:document.getElementById('dicomAllowed').value,CAPTURE_MODE:document.getElementById('captureMode').value})}
 function saveFilmSettings(){saveSettings({PAGE_SIZE:document.getElementById('pageSize').value,PAGE_ORIENTATION:document.getElementById('pageOrientation').value,LAYOUT_ROWS:+document.getElementById('layoutRows').value,LAYOUT_COLS:+document.getElementById('layoutCols').value,HONOR_SCU_FILM_SIZE:document.getElementById('honorFilmSize').value==='true',PRESERVE_CONSOLE_LAYOUT:document.getElementById('preserveLayout').value==='true',AUTO_FIT_LAYOUT:document.getElementById('autoFit').value==='true',STRETCH_TO_FIT:document.getElementById('stretchFit').value==='true'})}
 function saveCalibration(){saveSettings({ENABLE_CALIBRATION:document.getElementById('enableCalib').value==='true',GAMMA:+document.getElementById('gamma').value,BRIGHTNESS:+document.getElementById('brightness').value,CONTRAST:+document.getElementById('contrast').value,SHARPNESS:+document.getElementById('sharpness').value,CONTRAST_LOW_PERCENTILE:+document.getElementById('blackPoint').value,CONTRAST_HIGH_PERCENTILE:+document.getElementById('whitePoint').value,INVERT_POLARITY:document.getElementById('invert').value==='true'})}
+function saveImageQuality(){saveSettings({ENABLE_CLAHE:document.getElementById('enableClahe').value==='true',CLAHE_CLIP_LIMIT:+document.getElementById('claheClipLimit').value,CLAHE_GRID_SIZE:+document.getElementById('claheGridSize').value,CLAHE_NORMALIZE:document.getElementById('claheNormalize').value==='true',ENABLE_DENOISE:document.getElementById('enableDenoise').value==='true',DENOISE_STRENGTH:+document.getElementById('denoiseStrength').value,ENABLE_AUTO_EXPOSURE:document.getElementById('enableAutoExposure').value==='true',EXPOSURE_CORRECTION:+document.getElementById('exposureCorrection').value})}
+function saveLayoutAdjustments(){saveSettings({MARGIN_LEFT_OFFSET_MM:+document.getElementById('marginLeftOffset').value,MARGIN_RIGHT_OFFSET_MM:+document.getElementById('marginRightOffset').value,MARGIN_TOP_OFFSET_MM:+document.getElementById('marginTopOffset').value,MARGIN_BOTTOM_OFFSET_MM:+document.getElementById('marginBottomOffset').value,IMAGE_PADDING_MM:+document.getElementById('imagePadding').value,IMAGE_POSITION_X_OFFSET:+document.getElementById('positionXOffset').value,IMAGE_POSITION_Y_OFFSET:+document.getElementById('positionYOffset').value})}
 function resetCalibration(){saveSettings({GAMMA:2.0,BRIGHTNESS:0,CONTRAST:1,SHARPNESS:0,CONTRAST_LOW_PERCENTILE:1,CONTRAST_HIGH_PERCENTILE:99,INVERT_POLARITY:false,ENABLE_CALIBRATION:true});loadSettings()}
 function saveBranding(){const src=document.querySelector('input[name=brandSrc]:checked').value;saveSettings({BRANDING_SOURCE:src,ERP_BRANDING_URL:document.getElementById('erpUrl').value,CLINIC_NAME:document.getElementById('clinicName').value,CLINIC_TAGLINE:document.getElementById('clinicTagline').value,CLINIC_ADDRESS1:document.getElementById('addr1').value,CLINIC_ADDRESS2:document.getElementById('addr2').value,CLINIC_CITY:document.getElementById('city').value,CLINIC_STATE:document.getElementById('state').value,CLINIC_PIN:document.getElementById('pin').value,CLINIC_PHONE:document.getElementById('phone').value,CLINIC_EMAIL:document.getElementById('email').value,CLINIC_WEBSITE:document.getElementById('website').value,CLINIC_LOGO_PATH:document.getElementById('logoPath').value,HEADER_LINE1:document.getElementById('header1').value,HEADER_LINE2:document.getElementById('header2').value,FOOTER_LINE1:document.getElementById('footer1').value,FOOTER_LINE2:document.getElementById('footer2').value})}
 function savePrinter(){saveSettings({PRINT_METHOD:document.getElementById('printMethod').value,CUPS_SERVER:document.getElementById('cupsServer').value,CUPS_PRINTER_NAME:document.getElementById('cupsPrinter').value,CUPS_MEDIA:document.getElementById('cupsMedia').value,JETDIRECT_HOST:document.getElementById('jetHost').value,JETDIRECT_PORT:+document.getElementById('jetPort').value})}

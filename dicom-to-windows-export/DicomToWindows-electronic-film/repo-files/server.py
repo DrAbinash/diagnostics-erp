@@ -306,6 +306,17 @@ BRIGHTNESS = _env_float("BRIGHTNESS", 0.0)
 CONTRAST = max(0.1, _env_float("CONTRAST", 1.0))
 SHARPNESS = max(0.0, _env_float("SHARPNESS", 0.0))
 INVERT_POLARITY = _env_bool("INVERT_POLARITY", False)
+
+# Advanced image quality enhancements
+ENABLE_CLAHE = _env_bool("ENABLE_CLAHE", True)
+CLAHE_CLIP_LIMIT = max(0.1, _env_float("CLAHE_CLIP_LIMIT", 2.0))
+CLAHE_GRID_SIZE = max(1, _env_int("CLAHE_GRID_SIZE", 8))
+CLAHE_NORMALIZE = _env_bool("CLAHE_NORMALIZE", True)
+ENABLE_DENOISE = _env_bool("ENABLE_DENOISE", True)
+DENOISE_STRENGTH = max(1, min(20, _env_int("DENOISE_STRENGTH", 5)))
+ENABLE_AUTO_EXPOSURE = _env_bool("ENABLE_AUTO_EXPOSURE", True)
+EXPOSURE_CORRECTION = max(-1.0, min(1.0, _env_float("EXPOSURE_CORRECTION", 0.0)))
+
 HONOR_SCU_LAYOUT = _env_bool("HONOR_SCU_LAYOUT", True)
 PRESERVE_CONSOLE_LAYOUT = _env_bool("PRESERVE_CONSOLE_LAYOUT", True)
 BRANDING_SOURCE = _env_str("BRANDING_SOURCE", "LOCAL").strip().upper()
@@ -328,6 +339,15 @@ LAYOUT_COLS = max(1, _env_int("LAYOUT_COLS", 3))
 STRETCH_TO_FIT = _env_bool("STRETCH_TO_FIT", False)
 AUTO_FIT_LAYOUT = _env_bool("AUTO_FIT_LAYOUT", True)
 BACKGROUND_COLOR = _env_str("BACKGROUND_COLOR", "WHITE").strip().upper()
+
+# Layout adjustment controls (to fix image cutting issues)
+MARGIN_LEFT_OFFSET_MM = _env_float("MARGIN_LEFT_OFFSET_MM", 0.0)
+MARGIN_RIGHT_OFFSET_MM = _env_float("MARGIN_RIGHT_OFFSET_MM", 0.0)
+MARGIN_TOP_OFFSET_MM = _env_float("MARGIN_TOP_OFFSET_MM", 0.0)
+MARGIN_BOTTOM_OFFSET_MM = _env_float("MARGIN_BOTTOM_OFFSET_MM", 0.0)
+IMAGE_PADDING_MM = max(0.0, _env_float("IMAGE_PADDING_MM", 0.0))
+IMAGE_POSITION_X_OFFSET = _env_int("IMAGE_POSITION_X_OFFSET", 0)
+IMAGE_POSITION_Y_OFFSET = _env_int("IMAGE_POSITION_Y_OFFSET", 0)
 
 BATCH_GROUP_BY = _env_str("BATCH_GROUP_BY", "auto").strip().lower()
 if BATCH_GROUP_BY not in ("auto", "session"):
@@ -1334,6 +1354,125 @@ def render_banner(
     return band
 
 
+# =============================================================================
+# Advanced image quality enhancements
+# =============================================================================
+
+def _apply_clahe(image: np.ndarray, clip_limit: float = 2.0, grid_size: int = 8, normalize: bool = True) -> np.ndarray:
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
+
+    Excellent for medical images - enhances local contrast without over-amplifying noise.
+    """
+    if len(image.shape) == 3:
+        # Convert to LAB color space for color images
+        lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+        l_channel, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
+        l_enhanced = clahe.apply(l_channel)
+        enhanced = cv2.merge([l_enhanced, a, b])
+        result = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
+    else:
+        # Grayscale image
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
+        result = clahe.apply(image)
+
+    if normalize:
+        result = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX)
+
+    return result
+
+
+def _apply_denoise(image: np.ndarray, strength: int = 5) -> np.ndarray:
+    """Apply non-local means denoising.
+
+    Reduces noise while preserving edges - important for medical image details.
+    """
+    if len(image.shape) == 3:
+        # Color image
+        result = cv2.fastNlMeansDenoisingColored(image, None, h=strength, hForColorComponents=strength,
+                                                   templateWindowSize=7, searchWindowSize=21)
+    else:
+        # Grayscale image
+        result = cv2.fastNlMeansDenoising(image, None, h=strength, templateWindowSize=7, searchWindowSize=21)
+
+    return result
+
+
+def _apply_auto_exposure(image: np.ndarray, correction: float = 0.0) -> np.ndarray:
+    """Apply automatic exposure correction.
+
+    Analyzes histogram and adjusts brightness/contrast to optimize dynamic range.
+    correction: manual adjustment factor (-1.0 to 1.0, where 0 = no adjustment)
+    """
+    if len(image.shape) == 3:
+        # Convert to grayscale for analysis
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+
+    # Calculate histogram
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist = hist.flatten()
+
+    # Find 1st and 99th percentiles (ignore extreme outliers)
+    cumsum = np.cumsum(hist)
+    total = cumsum[-1]
+    low_idx = np.searchsorted(cumsum, total * 0.01)
+    high_idx = np.searchsorted(cumsum, total * 0.99)
+
+    # Apply contrast stretch
+    if high_idx > low_idx:
+        alpha = 255.0 / (high_idx - low_idx)
+        beta = -low_idx * alpha
+
+        if len(image.shape) == 3:
+            result = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+        else:
+            result = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+        # Apply manual correction
+        if correction != 0.0:
+            brightness_adjust = correction * 50  # Scale correction to meaningful range
+            result = cv2.convertScaleAbs(result, alpha=1.0, beta=brightness_adjust)
+
+        return result
+    else:
+        return image
+
+
+def _enhance_image_quality(image: np.ndarray, modality: str = "") -> np.ndarray:
+    """Apply all enabled image quality enhancements.
+
+    Pipeline: Denoise → Auto Exposure → CLAHE
+    Order matters: denoise first to avoid amplifying noise, then exposure, then local contrast.
+    """
+    result = image.copy()
+
+    # Step 1: Denoise (if enabled)
+    if ENABLE_DENOISE:
+        try:
+            result = _apply_denoise(result, strength=DENOISE_STRENGTH)
+        except Exception as exc:
+            log.warning("Denoise failed: %s", exc)
+
+    # Step 2: Auto Exposure (if enabled)
+    if ENABLE_AUTO_EXPOSURE:
+        try:
+            result = _apply_auto_exposure(result, correction=EXPOSURE_CORRECTION)
+        except Exception as exc:
+            log.warning("Auto exposure failed: %s", exc)
+
+    # Step 3: CLAHE (if enabled)
+    if ENABLE_CLAHE:
+        try:
+            result = _apply_clahe(result, clip_limit=CLAHE_CLIP_LIMIT,
+                                 grid_size=CLAHE_GRID_SIZE, normalize=CLAHE_NORMALIZE)
+        except Exception as exc:
+            log.warning("CLAHE failed: %s", exc)
+
+    return result
+
+
 def render_page(
     images: list[np.ndarray],
     color_flags: list[bool],
@@ -1467,18 +1606,34 @@ def render_page(
         else:
             calibrated = normalize_bit_depth(arr)
 
+        # Apply advanced image quality enhancements
+        calibrated = _enhance_image_quality(calibrated, modality=modality)
+
         # Reserve a strip under the frame for its caption, so the label never
         # overlaps the image or the row below it.
         caption = (labels[index] if labels and index < len(labels) else "") or ""
         caption_h = label_h if caption else 0
 
-        resized = _fit_into_cell(calibrated, cell_w, cell_h - caption_h, STRETCH_TO_FIT)
+        # Apply image padding if configured
+        padding_px = _mm_to_px(IMAGE_PADDING_MM, DPI) if IMAGE_PADDING_MM > 0 else 0
+        effective_cell_w = cell_w - 2 * padding_px
+        effective_cell_h = cell_h - caption_h - 2 * padding_px
+
+        resized = _fit_into_cell(calibrated, effective_cell_w, effective_cell_h, STRETCH_TO_FIT)
         tile = Image.fromarray(resized).convert("RGB")
 
+        # Calculate position with layout adjustments
         cell_x = margin_px + col * (cell_w + gutter_px)
         cell_y = grid_top + row * (cell_h + gutter_px)
-        x = cell_x + (cell_w - tile.width) // 2
-        y = cell_y + (cell_h - caption_h - tile.height) // 2
+
+        # Apply margin offsets
+        cell_x += _mm_to_px(MARGIN_LEFT_OFFSET_MM, DPI) if col == 0 else _mm_to_px(MARGIN_RIGHT_OFFSET_MM, DPI)
+        cell_y += _mm_to_px(MARGIN_TOP_OFFSET_MM, DPI) if row == 0 else _mm_to_px(MARGIN_BOTTOM_OFFSET_MM, DPI)
+
+        # Center image in cell with padding and position offsets
+        x = cell_x + padding_px + (effective_cell_w - tile.width) // 2 + IMAGE_POSITION_X_OFFSET
+        y = cell_y + padding_px + (effective_cell_h - tile.height) // 2 + IMAGE_POSITION_Y_OFFSET
+
         canvas.paste(tile, (x, y))
 
         if caption:
@@ -1675,6 +1830,78 @@ def check_printer_status() -> tuple[str, str]:
         # This is a best-effort health probe called from inside a DIMSE
         # handler; it must report a status, never raise.
         return "WARNING", f"Could not query CUPS: {exc}"
+
+
+# =============================================================================
+# OCR-based patient info extraction
+# =============================================================================
+
+def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:
+    """Extract patient name and referring doctor from film image using OCR.
+
+    Returns dict with 'patient_name' and 'referring_doctor' keys.
+    Values are empty strings if extraction fails.
+    """
+    result = {"patient_name": "", "referring_doctor": ""}
+
+    try:
+        import pytesseract
+        from PIL import Image
+        import re
+
+        # Configure Tesseract path (Windows default)
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+        # Load image
+        img = Image.open(image_path)
+
+        # Run OCR
+        text = pytesseract.image_to_string(img)
+
+        # Parse extracted text for patient info
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+        for line in lines:
+            line_lower = line.lower()
+
+            # Skip clinic name lines
+            if "care diagnostics" in line_lower or "deoghar" in line_lower:
+                continue
+
+            # Look for doctor pattern (DR. or Dr followed by name, with or without space)
+            doctor_match = re.search(r'(DR\.?\s*[A-Z][A-Z\.\s,]+?)(?:\s+ID|\s+C\s+\d|\s+R\s+\d|\s*$)', line, re.IGNORECASE)
+            if doctor_match:
+                doctor = doctor_match.group(1).strip()
+                # Clean up doctor name
+                doctor = re.sub(r'\s+', ' ', doctor)
+                if len(doctor) > 3:
+                    result["referring_doctor"] = doctor
+
+            # Look for patient name pattern (typically before doctor or on separate line)
+            # Pattern: uppercase name, possibly followed by age/sex code
+            patient_match = re.search(r'^([A-Z][A-Z\s]+?)(?:\s+\d+[YMF]|\s+S\d+|\s+\w+\s+DR\.|$)', line)
+            if patient_match:
+                patient = patient_match.group(1).strip()
+                # Clean up patient name
+                patient = re.sub(r'\s+', ' ', patient)
+                if len(patient) > 3 and patient != result["referring_doctor"]:
+                    result["patient_name"] = patient
+
+            # Alternative: look for explicit labels
+            if any(keyword in line_lower for keyword in ["patient", "name:", "pt:"]):
+                for sep in [":", "Patient", "Pt"]:
+                    if sep in line:
+                        name = line.split(sep, 1)[1].strip()
+                        if name and len(name) > 2:
+                            result["patient_name"] = name
+                            break
+
+        log.info("OCR extracted: patient=%s, doctor=%s", result["patient_name"], result["referring_doctor"])
+
+    except Exception as exc:
+        log.warning("OCR extraction failed: %s", exc)
+
+    return result
 
 
 # =============================================================================
@@ -1919,6 +2146,28 @@ def process_print_job(
         out_path = OUTPUT_DIR / f"print_{timestamp}_{suffix}.{OUTPUT_FORMAT}"
         out_paths = save_pages(canvases, out_path)
         log.info("Saved %d rendered page file(s): %s", len(out_paths), ", ".join(p.name for p in out_paths))
+
+        # OCR extraction: try to get patient info from rendered film if not already present
+        if out_paths and (not patient_info or not patient_info.name):
+            try:
+                ocr_data = _extract_patient_info_via_ocr(out_paths[0])
+                if ocr_data["patient_name"] or ocr_data["referring_doctor"]:
+                    if patient_info is None:
+                        patient_info = PatientInfo()
+                    if ocr_data["patient_name"] and not patient_info.name:
+                        patient_info.name = ocr_data["patient_name"]
+                        log.info("OCR: extracted patient name '%s'", patient_info.name)
+                    if ocr_data["referring_doctor"] and not patient_info.referring_doctor:
+                        patient_info.referring_doctor = ocr_data["referring_doctor"]
+                        log.info("OCR: extracted referring doctor '%s'", patient_info.referring_doctor)
+                    # Update job store with OCR-extracted info
+                    job_store.update_job(
+                        job_key,
+                        patientName=patient_info.name,
+                        patientId=patient_info.patient_id,
+                    )
+            except Exception as exc:
+                log.warning("OCR extraction step failed: %s", exc)
 
         global LAST_SUCCESSFUL_CAPTURE
         LAST_SUCCESSFUL_CAPTURE = {
