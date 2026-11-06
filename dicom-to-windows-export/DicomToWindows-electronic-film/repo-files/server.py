@@ -107,6 +107,10 @@ job can be spooled.
   JOB_RETENTION_DAYS             delete old files after N days (0=off) 30
 
   PRINT_METHOD                   cups | jetdirect                       cups
+                                 (on Windows this is ignored: the OS backend is used)
+  WINDOWS_PRINT_SETTINGS         SumatraPDF -print-settings value          fit
+                                 keep "fit" unless the printer's default paper really
+                                 is the film size; "noscale" can print off the edge
   CUPS_SERVER                    host:port of the CUPS daemon           localhost:631
   CUPS_PRINTER_NAME              CUPS queue name to print to            (none)
   JETDIRECT_HOST / JETDIRECT_PORT raw socket target                    (none) / 9100
@@ -348,6 +352,11 @@ MARGIN_BOTTOM_OFFSET_MM = _env_float("MARGIN_BOTTOM_OFFSET_MM", 0.0)
 IMAGE_PADDING_MM = max(0.0, _env_float("IMAGE_PADDING_MM", 0.0))
 IMAGE_POSITION_X_OFFSET = _env_int("IMAGE_POSITION_X_OFFSET", 0)
 IMAGE_POSITION_Y_OFFSET = _env_int("IMAGE_POSITION_Y_OFFSET", 0)
+# Windows has no per-job paper selection in the path this app uses (SumatraPDF /
+# ShellExecute), so the sheet size can only be respected by letting the job scale
+# onto whatever the driver default is. "fit" is the safe default: it can lose a
+# little resolution but it cannot print an anatomical edge off the film.
+WINDOWS_PRINT_SETTINGS = _env_str("WINDOWS_PRINT_SETTINGS", "fit").strip()
 
 BATCH_GROUP_BY = _env_str("BATCH_GROUP_BY", "auto").strip().lower()
 if BATCH_GROUP_BY not in ("auto", "session"):
@@ -604,7 +613,17 @@ def reload_live_config() -> None:
     CONTRAST = max(0.1, float(_config_store.get("CONTRAST")))
     SHARPNESS = max(0.0, float(_config_store.get("SHARPNESS")))
     INVERT_POLARITY = bool(_config_store.get("INVERT_POLARITY"))
-    PAGE_SIZE = normalize_page_size(str(_config_store.get("PAGE_SIZE")), "A4")
+    # A missing or unreadable PAGE_SIZE used to fall back to "A4" here, silently,
+    # while the env default above is 8X10. Radiology film IS 8x10in (203.2 x 254 mm)
+    # and A4 is 210 x 297 mm, so every sheet quietly rendered 43 mm taller than the
+    # film it was printed on and the surplus ran off the bottom edge. Falling back to
+    # the value already in force keeps a config that lacks the key on the size the
+    # operator chose, and tells them when the stored value is not a known size.
+    _stored_page_size = _config_store.get("PAGE_SIZE")
+    PAGE_SIZE = normalize_page_size(str(_stored_page_size or ""), PAGE_SIZE)
+    if _stored_page_size and not normalize_page_size(str(_stored_page_size), ""):
+        log.warning("Stored PAGE_SIZE=%r is not a known sheet size; keeping %s",
+                    _stored_page_size, PAGE_SIZE)
     PAGE_ORIENTATION = str(_config_store.get("PAGE_ORIENTATION")).upper()
     HONOR_SCU_FILM_SIZE = bool(_config_store.get("HONOR_SCU_FILM_SIZE"))
     HONOR_SCU_LAYOUT = bool(_config_store.get("HONOR_SCU_LAYOUT"))
@@ -1498,11 +1517,21 @@ def generate_layout_preview(settings: dict) -> np.ndarray:
     page_w, page_h = _page_size_px(page_size, orientation, DPI)
     base_margin = _mm_to_px(MARGIN_MM, DPI)
 
-    # Apply margin offsets
-    left_margin = base_margin + _mm_to_px(margin_left, DPI)
-    right_margin = base_margin + _mm_to_px(margin_right, DPI)
-    top_margin = base_margin + _mm_to_px(margin_top, DPI)
-    bottom_margin = base_margin + _mm_to_px(margin_bottom, DPI)
+    # Apply margin offsets - clamped at zero and grown into the margin, exactly as
+    # render_page now does, so the preview measures the page the printer produces.
+    # It used to ignore the header band, the patient banner and the footer entirely,
+    # which made every preview taller than the sheet it was supposed to predict.
+    left_margin = base_margin + max(0, _mm_to_px(margin_left, DPI))
+    right_margin = base_margin + max(0, _mm_to_px(margin_right, DPI))
+    top_margin = base_margin + max(0, _mm_to_px(margin_top, DPI))
+    bottom_margin = base_margin + max(0, _mm_to_px(margin_bottom, DPI))
+
+    if HEADER_LINE1 or HEADER_LINE2 or HEADER_LOGO_PATH:
+        top_margin += _mm_to_px(HEADER_HEIGHT_MM, DPI)
+    if SHOW_PATIENT_BANNER and PATIENT_BANNER_HEIGHT_MM > 0:
+        top_margin += _mm_to_px(PATIENT_BANNER_HEIGHT_MM, DPI)
+    if FOOTER_LINE1 or FOOTER_LINE2 or FOOTER_LOGO_PATH:
+        bottom_margin += _mm_to_px(FOOTER_HEIGHT_MM, DPI)
 
     # Create canvas
     bg_color = (0, 0, 0) if BACKGROUND_COLOR == "BLACK" else (255, 255, 255)
@@ -1687,11 +1716,25 @@ def render_page(
     label_h = _mm_to_px(IMAGE_LABEL_HEIGHT_MM, DPI) if (SHOW_IMAGE_LABELS and labels) else 0
     label_ink = (255, 255, 255) if BACKGROUND_COLOR == "BLACK" else (0, 0, 0)
 
-    usable_w = page_w - 2 * margin_px
-    usable_h = page_h - 2 * margin_px - header_h - footer_h - patient_h
+    # The four MARGIN_*_OFFSET_MM knobs used to be applied as a TRANSLATION of each
+    # tile (cell_x += LEFT/RIGHT, cell_y += TOP/BOTTOM) while usable_w/h stayed at
+    # page minus 2*MARGIN_MM. So raising MARGIN_BOTTOM_OFFSET_MM pushed the image
+    # further down and off the sheet instead of protecting it, and the layout preview
+    # - which treats the same four knobs as margin growth - showed a page that could
+    # not be reproduced by printing. They now grow the margin each is named after, so
+    # no offset value can move content out of the printable area. Negative values are
+    # clamped at zero for the same reason: a negative bottom margin is a claim that
+    # content may print off the film.
+    left_margin = margin_px + max(0, _mm_to_px(MARGIN_LEFT_OFFSET_MM, DPI))
+    right_margin = margin_px + max(0, _mm_to_px(MARGIN_RIGHT_OFFSET_MM, DPI))
+    top_margin = margin_px + max(0, _mm_to_px(MARGIN_TOP_OFFSET_MM, DPI)) + header_h + patient_h
+    bottom_margin = margin_px + max(0, _mm_to_px(MARGIN_BOTTOM_OFFSET_MM, DPI)) + footer_h
+
+    usable_w = page_w - left_margin - right_margin
+    usable_h = page_h - top_margin - bottom_margin
     cell_w = max(1, (usable_w - (cols - 1) * gutter_px) // cols)
     cell_h = max(1, (usable_h - (rows - 1) * gutter_px) // rows)
-    grid_top = margin_px + header_h + patient_h
+    grid_top = top_margin
 
     # Images beyond the grid are never handed to this function (the N-ACTION
     # handler / batch flush already caps the list at MAX_IMAGES_PER_PAGE),
@@ -1716,25 +1759,29 @@ def render_page(
         caption = (labels[index] if labels and index < len(labels) else "") or ""
         caption_h = label_h if caption else 0
 
-        # Apply image padding if configured
+        # Apply image padding if configured - never allow it to close the cell
+        # completely, which previously produced a zero/negative fit box.
         padding_px = _mm_to_px(IMAGE_PADDING_MM, DPI) if IMAGE_PADDING_MM > 0 else 0
-        effective_cell_w = cell_w - 2 * padding_px
-        effective_cell_h = cell_h - caption_h - 2 * padding_px
+        effective_cell_w = max(1, cell_w - 2 * padding_px)
+        effective_cell_h = max(1, cell_h - caption_h - 2 * padding_px)
 
         resized = _fit_into_cell(calibrated, effective_cell_w, effective_cell_h, STRETCH_TO_FIT)
         tile = Image.fromarray(resized).convert("RGB")
 
-        # Calculate position with layout adjustments
-        cell_x = margin_px + col * (cell_w + gutter_px)
+        cell_x = left_margin + col * (cell_w + gutter_px)
         cell_y = grid_top + row * (cell_h + gutter_px)
 
-        # Apply margin offsets
-        cell_x += _mm_to_px(MARGIN_LEFT_OFFSET_MM, DPI) if col == 0 else _mm_to_px(MARGIN_RIGHT_OFFSET_MM, DPI)
-        cell_y += _mm_to_px(MARGIN_TOP_OFFSET_MM, DPI) if row == 0 else _mm_to_px(MARGIN_BOTTOM_OFFSET_MM, DPI)
-
-        # Center image in cell with padding and position offsets
+        # Centre the tile in the cell, then honour the two nudge knobs - but clamped.
+        # IMAGE_POSITION_X/Y_OFFSET used to be added unconditionally, so one wrong
+        # value parked part of a patient's film off the edge of the film.
         x = cell_x + padding_px + (effective_cell_w - tile.width) // 2 + IMAGE_POSITION_X_OFFSET
         y = cell_y + padding_px + (effective_cell_h - tile.height) // 2 + IMAGE_POSITION_Y_OFFSET
+        lo_x = left_margin
+        hi_x = max(lo_x, page_w - right_margin - tile.width)
+        lo_y = top_margin
+        hi_y = max(lo_y, page_h - bottom_margin - tile.height)
+        x = min(max(x, lo_x), hi_x)
+        y = min(max(y, lo_y), hi_y)
 
         canvas.paste(tile, (x, y))
 
@@ -1823,7 +1870,37 @@ def print_via_windows(path: Path, copies: int, page_size: str = "") -> None:
     abs_path = path.resolve()
     if not abs_path.exists():
         raise RuntimeError(f"Print file not found: {abs_path}")
-    
+
+    # The CUPS backend names the sheet with `-o media=` and carries its own warning
+    # that without it the printer uses its default tray size. This backend took a
+    # page_size argument and ignored it, so the driver's default decided the film
+    # while the page had already been laid out for the size the console asked for -
+    # which prints as content running off the left and lower edge, and which no
+    # amount of renderer margin can repair. Compare the two, say so, and scale.
+    want = normalize_page_size(page_size or PAGE_SIZE, PAGE_SIZE)
+    want_w_mm, want_h_mm = _PAGE_SIZES_MM.get(want, _PAGE_SIZES_MM["A4"])
+    got_w_mm = got_h_mm = None
+    try:
+        with Image.open(abs_path) as im:
+            px_w, px_h = im.size
+            raw_dpi = im.info.get("dpi") or (DPI, DPI)
+        dpi_x = float(raw_dpi[0] or DPI) or float(DPI)
+        dpi_y = float(raw_dpi[1] or DPI) or float(DPI)
+        got_w_mm = px_w / dpi_x * 25.4
+        got_h_mm = px_h / dpi_y * 25.4
+    except Exception as exc:
+        log.warning("Could not read page geometry from %s: %s", abs_path.name, exc)
+
+    if got_w_mm is not None and (
+        abs(got_w_mm - want_w_mm) > 2.0 or abs(got_h_mm - want_h_mm) > 2.0
+    ):
+        log.warning(
+            "Page geometry mismatch: page renders %.1f x %.1f mm but film size %s is "
+            "%.1f x %.1f mm. Scaling to fit so nothing clips; set PAGE_SIZE to the film "
+            "in the tray (or HONOR_SCU_FILM_SIZE=true to take it from the console) for 1:1.",
+            got_w_mm, got_h_mm, want, want_w_mm, want_h_mm,
+        )
+
     # Try using SumatraPDF (common on Windows) or Adobe Reader
     pdf_readers = [
         r"C:\Users\abina\AppData\Local\DicomViewer\SumatraPDF-3.5.2-64.exe",
@@ -1840,14 +1917,21 @@ def print_via_windows(path: Path, copies: int, page_size: str = "") -> None:
             break
     
     if pdf_reader:
-        # Use PDF reader command line printing
-        cmd = [pdf_reader, "-print-to", CUPS_PRINTER_NAME, str(abs_path)]
+        # Use PDF reader command line printing. "fit" is forced unless the operator
+        # overrode WINDOWS_PRINT_SETTINGS, because Windows gives this path no way to
+        # name the paper per job - fitting can cost a little resolution, clipping
+        # costs the edge of a patient's film.
+        cmd = [pdf_reader, "-print-to", CUPS_PRINTER_NAME,
+               "-print-settings", (WINDOWS_PRINT_SETTINGS or "fit"), str(abs_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if result.returncode != 0:
             raise RuntimeError(f"PDF reader print failed: {(result.stderr or result.stdout).strip()}")
-        log.info("Printed via %s to %s: %s", pdf_reader, CUPS_PRINTER_NAME, abs_path.name)
+        log.info("Printed via %s to %s: %s (settings=%s, film=%s)", pdf_reader,
+                 CUPS_PRINTER_NAME, abs_path.name, WINDOWS_PRINT_SETTINGS or "fit", want)
     else:
         # Fallback: Use win32api ShellExecute to print
+        log.warning("No SumatraPDF/Adobe found - ShellExecute printing cannot name a "
+                    "paper size at all, so the driver default governs the sheet")
         try:
             import win32api
             import win32print
