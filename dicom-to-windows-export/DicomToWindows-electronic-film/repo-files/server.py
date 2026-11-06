@@ -664,6 +664,7 @@ class PatientInfo:
     patient_id: str = ""
     study_date: str = ""
     modality: str = ""
+    referring_doctor: str = ""
 
     def merged_with(self, other: "PatientInfo") -> "PatientInfo":
         """`other`'s non-empty fields win; used to enrich as tags arrive."""
@@ -672,6 +673,7 @@ class PatientInfo:
             patient_id=other.patient_id or self.patient_id,
             study_date=other.study_date or self.study_date,
             modality=other.modality or self.modality,
+            referring_doctor=other.referring_doctor or self.referring_doctor,
         )
 
     def label(self) -> str:
@@ -1719,12 +1721,16 @@ def _forward_print_job_to_orthanc(
         # Patient Module
         ds.PatientName = patient_info.name or "UNKNOWN"
         ds.PatientID = patient_info.patient_id or "UNKNOWN"
+        if patient_info.referring_doctor:
+            ds.ReferringPhysicianName = patient_info.referring_doctor
         
         # Study Module
         ds.StudyInstanceUID = study_uid
         ds.StudyDate = patient_info.study_date or datetime.now().strftime("%Y%m%d")
         ds.StudyTime = datetime.now().strftime("%H%M%S")
         ds.StudyDescription = f"Print Job {job_key}"[:64]
+        if patient_info.referring_doctor:
+            ds.StudyDescription = f"{ds.StudyDescription} | Ref: {patient_info.referring_doctor}"[:64]
         
         # Series Module
         ds.SeriesInstanceUID = series_uid
@@ -2078,6 +2084,7 @@ def _extract_patient_info(*datasets) -> PatientInfo:
             patient_id=text("PatientID"),
             study_date=text("StudyDate"),
             modality=text("Modality").upper(),
+            referring_doctor=text("ReferringPhysicianName"),
         ))
     return info
 
