@@ -209,7 +209,13 @@ img.preview{max-width:100%;border:1px solid var(--border);border-radius:.4rem}
       </div>
     </div>
     <p class="muted">Use margin offsets to fix image cutting: increase left offset if cut on left, increase bottom offset if cut on bottom. Padding adds space around images. Position offsets for fine-tuning.</p>
-    <p><button class="btn" onclick="saveLayoutAdjustments()">Save Layout Adjustments</button></p>
+    <p><button class="btn" onclick="saveLayoutAdjustments()">Save Layout Adjustments</button> <button class="btn ghost" onclick="previewLayout()">Preview Layout</button></p>
+  </div>
+  <div class="card">
+    <h2>Layout Preview</h2>
+    <p class="muted">Preview shows how images will be positioned with current margin, padding, and offset settings. Click "Preview Layout" to generate.</p>
+    <img class="preview" id="layoutPreview" alt="Layout preview" style="display:none; max-height: 600px;">
+    <p id="previewStatus" class="muted"></p>
   </div>
 </section>
 
@@ -523,6 +529,46 @@ async function loadCalibrationPreview(){
   const img=document.getElementById('calPreview');
   const old=img.src; if(old.startsWith('blob:'))URL.revokeObjectURL(old);
   img.src=url;
+}
+async function previewLayout(){
+  const status=document.getElementById('previewStatus');
+  const img=document.getElementById('layoutPreview');
+  status.textContent='Generating preview...';
+  img.style.display='none';
+  try{
+    const settings={
+      PAGE_SIZE:document.getElementById('pageSize').value,
+      PAGE_ORIENTATION:document.getElementById('pageOrientation').value,
+      LAYOUT_ROWS:+document.getElementById('layoutRows').value,
+      LAYOUT_COLS:+document.getElementById('layoutCols').value,
+      MARGIN_LEFT_OFFSET_MM:+document.getElementById('marginLeftOffset').value,
+      MARGIN_RIGHT_OFFSET_MM:+document.getElementById('marginRightOffset').value,
+      MARGIN_TOP_OFFSET_MM:+document.getElementById('marginTopOffset').value,
+      MARGIN_BOTTOM_OFFSET_MM:+document.getElementById('marginBottomOffset').value,
+      IMAGE_PADDING_MM:+document.getElementById('imagePadding').value,
+      IMAGE_POSITION_X_OFFSET:+document.getElementById('positionXOffset').value,
+      IMAGE_POSITION_Y_OFFSET:+document.getElementById('positionYOffset').value,
+      STRETCH_TO_FIT:document.getElementById('stretchFit').value==='true',
+      AUTO_FIT_LAYOUT:document.getElementById('autoFit').value==='true'
+    };
+    const r=await fetch('/admin/api/layout-preview',{
+      method:'POST',
+      headers:{'X-Admin-Session':token,'Content-Type':'application/json'},
+      body:JSON.stringify(settings)
+    });
+    if(!r.ok){
+      status.textContent='Preview failed: '+r.status;
+      return;
+    }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const old=img.src; if(old.startsWith('blob:'))URL.revokeObjectURL(old);
+    img.src=url;
+    img.style.display='block';
+    status.textContent='Preview generated successfully. Shows layout with current margin, padding, and offset settings.';
+  }catch(e){
+    status.textContent='Preview error: '+e.message;
+  }
 }
 async function downloadArtifact(name){
   const r=await fetch('/admin/api/artifact/'+name,{headers:{'X-Admin-Session':token}});

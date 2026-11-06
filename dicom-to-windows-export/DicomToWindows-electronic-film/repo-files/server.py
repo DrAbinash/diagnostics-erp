@@ -1473,6 +1473,108 @@ def _enhance_image_quality(image: np.ndarray, modality: str = "") -> np.ndarray:
     return result
 
 
+def generate_layout_preview(settings: dict) -> np.ndarray:
+    """Generate a preview image showing layout with current margin/padding/offset settings.
+
+    Creates a synthetic test pattern to visualize how images will be positioned.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    # Extract settings with defaults
+    page_size = settings.get("PAGE_SIZE", PAGE_SIZE)
+    orientation = settings.get("PAGE_ORIENTATION", PAGE_ORIENTATION)
+    rows = settings.get("LAYOUT_ROWS", LAYOUT_ROWS)
+    cols = settings.get("LAYOUT_COLS", LAYOUT_COLS)
+    margin_left = settings.get("MARGIN_LEFT_OFFSET_MM", 0.0)
+    margin_right = settings.get("MARGIN_RIGHT_OFFSET_MM", 0.0)
+    margin_top = settings.get("MARGIN_TOP_OFFSET_MM", 0.0)
+    margin_bottom = settings.get("MARGIN_BOTTOM_OFFSET_MM", 0.0)
+    padding = settings.get("IMAGE_PADDING_MM", 0.0)
+    pos_x = settings.get("IMAGE_POSITION_X_OFFSET", 0)
+    pos_y = settings.get("IMAGE_POSITION_Y_OFFSET", 0)
+
+    # Calculate page dimensions
+    page_w, page_h = _page_size_px(page_size, orientation, DPI)
+    base_margin = _mm_to_px(MARGIN_MM, DPI)
+
+    # Apply margin offsets
+    left_margin = base_margin + _mm_to_px(margin_left, DPI)
+    right_margin = base_margin + _mm_to_px(margin_right, DPI)
+    top_margin = base_margin + _mm_to_px(margin_top, DPI)
+    bottom_margin = base_margin + _mm_to_px(margin_bottom, DPI)
+
+    # Create canvas
+    bg_color = (0, 0, 0) if BACKGROUND_COLOR == "BLACK" else (255, 255, 255)
+    canvas = Image.new("RGB", (page_w, page_h), bg_color)
+    draw = ImageDraw.Draw(canvas)
+
+    # Calculate usable area
+    usable_w = page_w - left_margin - right_margin
+    usable_h = page_h - top_margin - bottom_margin
+
+    # Calculate cell dimensions
+    gutter = _mm_to_px(GUTTER_MM, DPI)
+    cell_w = max(1, (usable_w - (cols - 1) * gutter) // cols)
+    cell_h = max(1, (usable_h - (rows - 1) * gutter) // rows)
+
+    # Draw grid and sample images
+    padding_px = _mm_to_px(padding, DPI)
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+
+    for row in range(rows):
+        for col in range(cols):
+            idx = row * cols + col
+            if idx >= rows * cols:
+                break
+
+            # Calculate cell position
+            cell_x = left_margin + col * (cell_w + gutter)
+            cell_y = top_margin + row * (cell_h + gutter)
+
+            # Draw cell border
+            border_color = (100, 100, 100) if BACKGROUND_COLOR == "BLACK" else (200, 200, 200)
+            draw.rectangle([cell_x, cell_y, cell_x + cell_w, cell_y + cell_h], outline=border_color, width=2)
+
+            # Draw sample image with padding and position offset
+            img_x = cell_x + padding_px + pos_x
+            img_y = cell_y + padding_px + pos_y
+            img_w = cell_w - 2 * padding_px
+            img_h = cell_h - 2 * padding_px
+
+            if img_w > 0 and img_h > 0:
+                color = colors[idx % len(colors)]
+                draw.rectangle([img_x, img_y, img_x + img_w, img_y + img_h], fill=color)
+
+                # Draw "Image X" text
+                text_color = (255, 255, 255) if BACKGROUND_COLOR == "BLACK" else (0, 0, 0)
+                try:
+                    from PIL import ImageFont
+                    font = ImageFont.load_default()
+                    text = f"Image {idx + 1}"
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    text_x = img_x + (img_w - text_w) // 2
+                    text_y = img_y + (img_h - text_h) // 2
+                    draw.text((text_x, text_y), text, fill=text_color, font=font)
+                except Exception:
+                    pass
+
+    # Draw margin indicators
+    indicator_color = (255, 100, 100) if BACKGROUND_COLOR == "BLACK" else (200, 50, 50)
+    # Left margin line
+    draw.line([left_margin, 0, left_margin, page_h], fill=indicator_color, width=1)
+    # Right margin line
+    draw.line([page_w - right_margin, 0, page_w - right_margin, page_h], fill=indicator_color, width=1)
+    # Top margin line
+    draw.line([0, top_margin, page_w, top_margin], fill=indicator_color, width=1)
+    # Bottom margin line
+    draw.line([0, page_h - bottom_margin, page_w, page_h - bottom_margin], fill=indicator_color, width=1)
+
+    return np.array(canvas)
+
+
 def render_page(
     images: list[np.ndarray],
     color_flags: list[bool],

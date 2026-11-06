@@ -358,6 +358,26 @@ def handle_admin_post(handler, path: str, payload: dict) -> bool:
         })
         return True
 
+    if sub == "layout-preview":
+        if not _require_admin(handler):
+            return True
+        try:
+            settings = payload if isinstance(payload, dict) else {}
+            preview_array = generate_layout_preview(settings)
+            from PIL import Image
+            from io import BytesIO
+            buf = BytesIO()
+            Image.fromarray(preview_array).save(buf, format="PNG")
+            data = buf.getvalue()
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "image/png")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+        except Exception as exc:
+            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        return True
+
     if sub == "export-settings":
         include_secrets = bool(payload.get("includeSecrets"))
         _json_response(handler, HTTPStatus.OK, config_store.export_settings(include_secrets))
