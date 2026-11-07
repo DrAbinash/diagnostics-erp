@@ -92,17 +92,24 @@ router.post("/", async (req, res) => {
         },
       });
     
-    // Create admin user (simplified — in production, hash the PIN)
+    // Create the admin user.
+    //
+    // `../lib/pinHash` never existed in this repository, so this import threw at
+    // runtime and the wizard could not finish on a fresh install; and `pin_hash`
+    // is not a column on `users` either. Staff-login compares the stored value
+    // with bcrypt against `users.pin` (portal.ts), and the bootstrap seeder in
+    // index.ts writes bcrypt at cost 12 into that same column - so the wizard has
+    // to do exactly the same or the account it creates can never be signed into.
     const { usersTable } = await import("@workspace/db");
-    const { hashPin } = await import("../lib/pinHash");
-    
+    const bcrypt = (await import("bcryptjs")).default;
+
     await db.insert(usersTable).values({
       email: admin.username,
       name: admin.name || admin.username,
-      pin_hash: hashPin(admin.pin),
+      pin: await bcrypt.hash(String(admin.pin), 12),
       role: "admin",
-      created_at: now,
-      updated_at: now,
+      createdAt: now,
+      updatedAt: now,
     });
     
     res.json({ ok: true, message: "Setup complete" });
