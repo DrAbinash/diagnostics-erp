@@ -2051,23 +2051,34 @@ def check_printer_status() -> tuple[str, str]:
 # OCR-based patient info extraction
 # =============================================================================
 
-# Body part / projection vocabulary for the forwarded study description. A print
-# job carries no Modality and the console sends no BodyPartExamined (measured 0
-# of its 18 DX studies), so the exam name exists only as pixels on the film.
-# These are the words CARE's own X-ray test names use, because the ERP matcher
-# scores keyword overlap between the study description and the billed test name.
+# Vocabulary for the forwarded study description. A print job carries no Modality
+# and the console sends no BodyPartExamined (measured 0 of its 18 DX studies), so
+# the exam name exists only as pixels on the film. This list was built from CARE's
+# own X-Ray test catalogue (65 rows in diagnostic_tests, measured 2026-11-07),
+# because the ERP matcher scores keyword overlap between the study description and
+# the billed test name - a word the bill does not use buys nothing, and a word the
+# film does not print invents an exam.
+#
+# Deliberately absent: JOINT, BONE, VIEW, SIDE, TUBE and the bare two-letter "EM"
+# and "AP/LAT"-style qualifiers when they carry no part. They name nothing, and
+# matching them would attach a film to whichever bill happened to use the word.
 _OCR_BODY_PART_WORDS = (
+    # multi-word first: at one position the longest phrase is the exam
     "CERVICAL SPINE", "LUMBAR SPINE", "THORACIC SPINE", "DORSAL SPINE",
-    "LS SPINE", "TS SPINE", "DS SPINE",
-    "TEMPOROMANDIBULAR", "PANORAMIC",
-    "ABDOMEN", "ABDOMINAL", "CERVICAL", "CLAVICLE", "COCCYX", "CRANIUM",
-    "FEMUR", "FIBULA", "HUMERUS", "KUB", "NASAL", "OPG", "PELVIS", "RADIUS",
-    "SACRUM", "SCAPULA", "SHOULDER", "SKULL", "SPINE", "SINUS", "TIBIA",
-    "ULNA", "ANKLE", "CHEST", "ELBOW", "FINGER", "FOOT", "HAND", "HEAD",
-    "HIP", "HSG", "KNEE", "RIBS", "TOE", "WRIST",
+    "LS SPINE", "TS SPINE", "DS SPINE", "DL SPINE", "TM JOINT",
+    "TEMPOROMANDIBULAR", "PANORAMIC", "HYSTEROSALPINGOGRAPHY",
+    "ABDOMEN", "ABDOMINAL", "ANKLE", "BARIUM", "CERVICAL", "CEPHALOMETRY",
+    "CHEST", "CHOLANGIOGRAM", "CLAVICLE", "COCCYX", "CRANIUM", "ELBOW", "FEMUR",
+    "FIBULA",
+    "FINGER", "FISTULOGRAM", "FOOT", "FOREARM", "HAND", "HEAD", "HSG",
+    "HIP", "HUMERUS", "INVERTOGRAM", "IVP", "IVU", "KNEE", "KUB", "LOOPOGRAM",
+    "MAMMOGRAPHY", "MASTOID", "MCU", "NASAL", "OPG", "PELVIS", "PNS", "RADIUS",
+    "RGU", "RIBS", "SACRUM", "SCAPULA", "SHOULDER", "SINOGRAM", "SKULL", "SINUS",
+    "SPINE", "THIGH", "THORACIC", "THUMB", "TIBIA", "TOE", "ULNA", "URETHROGRAM",
+    "UROGRAM", "WRIST",
 )
 _OCR_VIEW_WORDS = (
-    "AP/LAT", "AP", "PA", "LAT", "OBL", "AXIAL", "APICAL", "ERECT",
+    "AP/LAT", "AP", "PA", "LAT", "OBL", "OBLIQUE", "AXIAL", "APICAL", "ERECT",
     "PRONE", "SUPINE", "TOWNE",
 )
 
@@ -2076,48 +2087,67 @@ def extract_study_description_from_ocr(text: str) -> str:
     """The exam named on the film, as "<part> [<part>] [<view>]", or "".
 
     Deliberately conservative: it only ever returns words that are physically on
-    the film, it guesses nothing when none match, and two parts are enough to
-    tell a cervical from a chest film apart without inventing a third.
+    the film, it guesses nothing when none match, and two parts are enough to tell
+    a cervical from a chest film apart without inventing a third.
+
+    Each piece is the film's own text, not the search term: the ERP compares whole
+    words, so "FOREARMS" has to come out as "FOREARMS" to match the bill that says
+    FOREARMS, and two exams written "SINOGRAM/FISTULOGRAM" on the film stay one
+    token so they still match the bill that says the same thing.
     """
     blob = re.sub(r"[^A-Z0-9/ ]+", " ", str(text or "").upper())
     if not blob.strip():
         return ""
     hits = []
     for word in _OCR_BODY_PART_WORDS:
-        match = re.search(rf"\b{re.escape(word)}\b", blob)
+        # S? so a plural on the film ("FOREARMS", "MASTOIDS") still names the part.
+        match = re.search(rf"\b{re.escape(word)}S?\b", blob)
         if match:
-            hits.append((match.start(), word))
+            hits.append((match.start(), match.end(), len(word)))
     if not hits:
         return ""
-    hits.sort()
-    chosen: list[str] = []
-    claimed: list[tuple[int, int]] = []
-    for start, word in hits:
-        # "CERVICAL" is also found inside "CERVICAL SPINE"; the span check keeps
-        # the longer phrase that was claimed at that position.
-        if any(low <= start < high for low, high in claimed):
+    # Longest phrase at a position claims it first, so "CERVICAL SPINE" is one exam
+    # and the second slot is still free for a genuinely different part.
+    hits.sort(key=lambda hit: (hit[0], -hit[2]))
+    chosen: list[tuple[int, int]] = []
+    for start, end, _length in hits:
+        if any(low <= start < high for low, high in chosen):
             continue
-        claimed.append((start, start + len(word)))
-        chosen.append(word)
+        chosen.append((start, end))
         if len(chosen) == 2:
             break
-    views: list[str] = []
+    views: list[tuple[int, int]] = []
     for view in _OCR_VIEW_WORDS:
         # Longer spellings are tried first, so "AP/LAT" claims its span before the
         # bare "AP" and "LAT" inside it are ever considered.
         match = None
         for candidate in re.finditer(rf"\b{re.escape(view)}\b", blob):
-            if any(low <= candidate.start() < high for low, high in claimed):
+            if any(low <= candidate.start() < high for low, high in chosen):
+                continue
+            if any(low <= candidate.start() < high for low, high in views):
                 continue
             match = candidate
             break
         if not match:
             continue
-        claimed.append((match.start(), match.end()))
-        views.append(view)
+        views.append((match.start(), match.end()))
         if len(views) == 2:
             break
-    return " ".join(chosen + views)[:64]
+
+    pieces: list[tuple[int, int]] = []
+    join_with_slash: list[bool] = []
+    for span in chosen + views:
+        if pieces and blob[pieces[-1][1]:span[0]] == "/":
+            join_with_slash.append(True)
+        else:
+            join_with_slash.append(False)
+        pieces.append(span)
+    out = ""
+    for index, (start, end) in enumerate(pieces):
+        out += blob[start:end]
+        if index + 1 < len(pieces):
+            out += "/" if join_with_slash[index + 1] else " "
+    return out[:64]
 
 
 def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:

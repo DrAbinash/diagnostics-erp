@@ -75,6 +75,15 @@ class StudyDescriptionExtractionTests(unittest.TestCase):
             server.extract_study_description_from_ocr("XRAY LS SPINE AP/LAT"), "LS SPINE AP/LAT"
         )
 
+    def test_the_longer_phrase_claims_the_slot_so_a_real_second_part_still_fits(self):
+        # If "CERVICAL" were allowed to claim the position that "CERVICAL SPINE"
+        # occupies, one exam would eat both slots and a two-part film would lose
+        # the second part entirely.
+        self.assertEqual(
+            server.extract_study_description_from_ocr("CERVICAL SPINE AND KUB AP"),
+            "CERVICAL SPINE KUB AP",
+        )
+
     def test_word_boundaries_keep_unrelated_words_from_becoming_an_exam(self):
         # "HIP" inside "SHIP", "AP" inside "HAPPY", "PA" inside "PAPER": none are exams.
         self.assertEqual(server.extract_study_description_from_ocr("PATIENT SHIPPED HAPPY PAPER"), "")
@@ -93,23 +102,44 @@ class StudyDescriptionExtractionTests(unittest.TestCase):
     def test_the_words_are_the_ones_the_erp_scores_against_test_names(self):
         # matchingEngine.ts rule 5 overlaps description words longer than two
         # characters with the billed test name, so a description sharing no word
-        # with it buys nothing. These are CARE's own X-ray test names, measured
-        # from radiology_studies joined to diagnostic_tests on 2026-11-07.
-        cases = (
-            ("CERVICAL SPINE AP", "X-RAY CERVICAL SPINE AP/LAT"),
-            ("LS SPINE LAT", "XRAY LS SPINE AP/LAT"),
-            ("CHEST PA", "CHEST X-RAY"),
-            ("KUB AP", "X-RAY KUB"),
-            ("OPG PANORAMIC", "OPG PAN VIEW (Orthopantomogram)"),
+        # with it buys nothing. Every name here is a live row of this clinic's
+        # diagnostic_tests X-Ray department (65 rows, measured 2026-11-07).
+        billed_names = (
+            "CHEST X-RAY", "X-RAY KUB", "X-RAY CERVICAL SPINE AP/LAT",
+            "X-RAY CERVICAL SPINE LAT", "XRAY LS SPINE AP/LAT", "X-RAY LS SPINE LAT",
+            "XRAY DL SPINE AP/LAT", "X-RAY DORSAL SPINE AP/LAT",
+            "X-RAY PELVIS AP", "X-RAY SKULL AP/LAT", "X-RAY SHOULDER JOINT AP/LAT",
+            "X-RAY ELBOW AP/LAT", "X-RAY WRIST - AP & LAT", "X-RAY HAND - AP & LAT",
+            "X-RAY FINGER AP/LAT", "X-RAY THUMB - AP & LAT", "X-RAY KNEE AP/LAT",
+            "X-RAY ANKLE JOINT AP/LAT", "X-RAY FOOT AP & OBL", "X-RAY FOREARM AP/LAT",
+            "X-RAY FEMUR AP/LAT", "X-RAY THIGH - AP & LAT", "X-RAY HIP JOINT AP/LAT",
+            "X-RAY NASAL BONE", "X-RAY MASTOID", "X-RAY PNS", "X-RAY TM JOINT",
+            "X-RAY OPG PAN VIEW (Orthopantomogram)", "OPG PAN VIEW (Orthopantomogram)",
+            "OPG OPEN/CLOSE MOUTH", "X-RAY LOOPOGRAM", "LOOPOGRAM",
+            "SINOGRAM/FISTULOGRAM", "X-RAY FISTULOGRAM / SINOGRAM", "INVERTOGRAM",
+            "URETHROGRAM", "Retrograde Urethrogram ( RGU )", "RGU", "IVU/IVP",
+            "INTRAVENOUS UROGRAM ( IVU  / IVP )", "T-TUBE CHOLANGIOGRAM",
+            "HYSTEROSALPINGOGRAPHY ( HSG )", "BARIUM MEAL", "BARIUM ENEMA",
+            "BARIUM SWALLOW", "CEPHALOMETRY", "DIGITAL MAMMOGRAPHY (BOTH)",
+            "X-RAY BOTH FOREARMS AP/LAT",
+            "X-RAY KNEE B/L AP/LAT", "X-RAY KNEE JOINT AP/LAT",
+            "X-RAY ELBOW JOINT AP/LAT", "X-RAY WRIST JOINT AP/LAT",
         )
-        for film, billed_test_name in cases:
-            desc = server.extract_study_description_from_ocr(f"CARE DIAGNOSTICS {film} SELFTEST SURNAME")
-            overlap = _keywords(desc) & _keywords(billed_test_name)
-            self.assertTrue(
-                overlap,
-                f"film naming {film!r} extracted {desc!r}, which shares no keyword with "
-                f"the billed test {billed_test_name!r}",
-            )
+        unmatched = []
+        for billed in billed_names:
+            desc = server.extract_study_description_from_ocr(f"CARE DIAGNOSTICS {billed}")
+            if not (_keywords(desc) & _keywords(billed)):
+                unmatched.append(f"{billed!r} -> {desc!r}")
+        self.assertEqual(unmatched, [], "these billed X-ray tests share no keyword with "
+                                       "what the film names, so the matcher gets nothing:\n  "
+                                       + "\n  ".join(unmatched))
+
+    def test_a_bill_that_names_no_body_part_cannot_be_matched_this_way(self):
+        # Documented limit, not a defect in the extraction: these four catalogue
+        # rows name no part at all, so no description can overlap them. They stay
+        # on name+date, which the matcher refuses when it is not unique.
+        for billed in ("X-RAY AP", "X-RAY LAT", "XRAY AP/LAT", "EM X-RAY "):
+            self.assertEqual(server.extract_study_description_from_ocr(f"CARE {billed}"), "")
 
 
 class ModalityResolutionTests(unittest.TestCase):
