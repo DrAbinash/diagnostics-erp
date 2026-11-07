@@ -24,6 +24,25 @@ job can be spooled.
   ORTHANC_HOST                   Orthanc host for forwarding          192.168.1.137
   ORTHANC_PORT                   Orthanc DICOM port                   5680
   ORTHANC_AET                    Orthanc AE Title                     ORTHANC2
+  PRINT_FORWARD_MODALITY         Modality to tag forwarded print jobs with (empty)
+           A DICOM print job carries no Modality, so a forwarded film used to be
+           sent as OT - and the ERP's bill matcher refuses any candidate whose
+           Modality contradicts the bill (MODALITY_MISMATCH bars even proposing
+           it), so an untagged X-ray film can never be linked to its bill. Set it
+           to the department's DICOM modality code, e.g. CR for the X-ray room.
+           Left empty the forward stays OT exactly as before.
+  PRINT_FORWARD_MODALITY_AETS    which calling AEs that applies to      (empty)
+           Comma-separated, e.g. FILMPLUS. REQUIRED to be non-empty before
+           PRINT_FORWARD_MODALITY is applied: the SCP receives films from several
+           departments on one port, and relabelling a sonographer's print as CR
+           would move a healthy ultrasound study into the wrong queue.
+  OCR_EXTRACT_STUDY_DESCRIPTION  read the body part / view off the film  true
+           The printed header names the exam ("CERVICAL SPINE AP"), which is the
+           only place the body part exists: the console's own DICOM carries no
+           BodyPartExamined at all (measured 0 studies of 18). Forwarded as
+           StudyDescription so the ERP can overlap its words with the billed test
+           name. Setting the modality without this still leaves the film one
+           keyword short of a unique match.
 
   GAMMA                          gamma correction exponent             2.0
   CONTRAST_LOW_PERCENTILE        black-point percentile for stretch    1.0
@@ -298,6 +317,9 @@ ORTHANC_HOST = _env_str("ORTHANC_HOST", "192.168.1.137")
 ORTHANC_PORT = _env_int("ORTHANC_PORT", 5680)
 ORTHANC_AE_TITLE = _env_str("ORTHANC_AET", "ORTHANC2").strip()[:16] or "ORTHANC2"
 FORWARD_AE_TITLES = _env_str("FORWARD_AE_TITLES", "").strip()
+PRINT_FORWARD_MODALITY = _env_str("PRINT_FORWARD_MODALITY", "").strip().upper()[:16]
+PRINT_FORWARD_MODALITY_AETS = _env_str("PRINT_FORWARD_MODALITY_AETS", "").strip()
+OCR_EXTRACT_STUDY_DESCRIPTION = _env_bool("OCR_EXTRACT_STUDY_DESCRIPTION", True)
 
 GAMMA = max(0.01, _env_float("GAMMA", 2.0))
 CONTRAST_LOW_PCT = min(max(_env_float("CONTRAST_LOW_PERCENTILE", 1.0), 0.0), 49.0)
@@ -674,6 +696,9 @@ def reload_live_config() -> None:
     ORTHANC_PORT = int(_config_store.get("ORTHANC_PORT") or 5680)
     ORTHANC_AE_TITLE = str(_config_store.get("ORTHANC_AE_TITLE") or "ORTHANC2").strip()[:16] or "ORTHANC2"
     FORWARD_AE_TITLES = str(_config_store.get("FORWARD_AE_TITLES") or "").strip()
+    PRINT_FORWARD_MODALITY = str(_config_store.get("PRINT_FORWARD_MODALITY") or "").strip().upper()[:16]
+    PRINT_FORWARD_MODALITY_AETS = str(_config_store.get("PRINT_FORWARD_MODALITY_AETS") or "").strip()
+    OCR_EXTRACT_STUDY_DESCRIPTION = bool(_config_store.get("OCR_EXTRACT_STUDY_DESCRIPTION"))
     PROFILES = dict(_config_store.get("PROFILES") or {})
     MODALITY_LAYOUTS = _parse_modality_layouts()
     MAX_IMAGES_PER_PAGE = LAYOUT_ROWS * LAYOUT_COLS
@@ -704,6 +729,9 @@ class PatientInfo:
     study_date: str = ""
     modality: str = ""
     referring_doctor: str = ""
+    # What exam the film is (body part + projection). Used only to tag the study
+    # forwarded to PACS - never part of label(), so it cannot change a film.
+    study_description: str = ""
 
     def merged_with(self, other: "PatientInfo") -> "PatientInfo":
         """`other`'s non-empty fields win; used to enrich as tags arrive."""
@@ -713,6 +741,7 @@ class PatientInfo:
             study_date=other.study_date or self.study_date,
             modality=other.modality or self.modality,
             referring_doctor=other.referring_doctor or self.referring_doctor,
+            study_description=other.study_description or self.study_description,
         )
 
     def label(self) -> str:
@@ -2022,13 +2051,82 @@ def check_printer_status() -> tuple[str, str]:
 # OCR-based patient info extraction
 # =============================================================================
 
-def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:
-    """Extract patient name and referring doctor from film image using OCR.
+# Body part / projection vocabulary for the forwarded study description. A print
+# job carries no Modality and the console sends no BodyPartExamined (measured 0
+# of its 18 DX studies), so the exam name exists only as pixels on the film.
+# These are the words CARE's own X-ray test names use, because the ERP matcher
+# scores keyword overlap between the study description and the billed test name.
+_OCR_BODY_PART_WORDS = (
+    "CERVICAL SPINE", "LUMBAR SPINE", "THORACIC SPINE", "DORSAL SPINE",
+    "LS SPINE", "TS SPINE", "DS SPINE",
+    "TEMPOROMANDIBULAR", "PANORAMIC",
+    "ABDOMEN", "ABDOMINAL", "CERVICAL", "CLAVICLE", "COCCYX", "CRANIUM",
+    "FEMUR", "FIBULA", "HUMERUS", "KUB", "NASAL", "OPG", "PELVIS", "RADIUS",
+    "SACRUM", "SCAPULA", "SHOULDER", "SKULL", "SPINE", "SINUS", "TIBIA",
+    "ULNA", "ANKLE", "CHEST", "ELBOW", "FINGER", "FOOT", "HAND", "HEAD",
+    "HIP", "HSG", "KNEE", "RIBS", "TOE", "WRIST",
+)
+_OCR_VIEW_WORDS = (
+    "AP/LAT", "AP", "PA", "LAT", "OBL", "AXIAL", "APICAL", "ERECT",
+    "PRONE", "SUPINE", "TOWNE",
+)
 
-    Returns dict with 'patient_name' and 'referring_doctor' keys.
-    Values are empty strings if extraction fails.
+
+def extract_study_description_from_ocr(text: str) -> str:
+    """The exam named on the film, as "<part> [<part>] [<view>]", or "".
+
+    Deliberately conservative: it only ever returns words that are physically on
+    the film, it guesses nothing when none match, and two parts are enough to
+    tell a cervical from a chest film apart without inventing a third.
     """
-    result = {"patient_name": "", "referring_doctor": ""}
+    blob = re.sub(r"[^A-Z0-9/ ]+", " ", str(text or "").upper())
+    if not blob.strip():
+        return ""
+    hits = []
+    for word in _OCR_BODY_PART_WORDS:
+        match = re.search(rf"\b{re.escape(word)}\b", blob)
+        if match:
+            hits.append((match.start(), word))
+    if not hits:
+        return ""
+    hits.sort()
+    chosen: list[str] = []
+    claimed: list[tuple[int, int]] = []
+    for start, word in hits:
+        # "CERVICAL" is also found inside "CERVICAL SPINE"; the span check keeps
+        # the longer phrase that was claimed at that position.
+        if any(low <= start < high for low, high in claimed):
+            continue
+        claimed.append((start, start + len(word)))
+        chosen.append(word)
+        if len(chosen) == 2:
+            break
+    views: list[str] = []
+    for view in _OCR_VIEW_WORDS:
+        # Longer spellings are tried first, so "AP/LAT" claims its span before the
+        # bare "AP" and "LAT" inside it are ever considered.
+        match = None
+        for candidate in re.finditer(rf"\b{re.escape(view)}\b", blob):
+            if any(low <= candidate.start() < high for low, high in claimed):
+                continue
+            match = candidate
+            break
+        if not match:
+            continue
+        claimed.append((match.start(), match.end()))
+        views.append(view)
+        if len(views) == 2:
+            break
+    return " ".join(chosen + views)[:64]
+
+
+def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:
+    """Extract patient name, referring doctor and exam name from the film image.
+
+    Returns dict with 'patient_name', 'referring_doctor' and 'study_description'
+    keys. Values are empty strings if extraction fails.
+    """
+    result = {"patient_name": "", "referring_doctor": "", "study_description": ""}
 
     try:
         import pytesseract
@@ -2082,7 +2180,11 @@ def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:
                             result["patient_name"] = name
                             break
 
-        log.info("OCR extracted: patient=%s, doctor=%s", result["patient_name"], result["referring_doctor"])
+        if OCR_EXTRACT_STUDY_DESCRIPTION:
+            result["study_description"] = extract_study_description_from_ocr(text)
+
+        log.info("OCR extracted: patient=%s, doctor=%s, exam=%s",
+                 result["patient_name"], result["referring_doctor"], result["study_description"])
 
     except Exception as exc:
         log.warning("OCR extraction failed: %s", exc)
@@ -2093,6 +2195,47 @@ def _extract_patient_info_via_ocr(image_path: Path) -> dict[str, str]:
 # =============================================================================
 # Background print-job worker
 # =============================================================================
+
+# A DICOM print job has no Modality attribute, so a forwarded film used to be
+# tagged OT. That is not cosmetic: the ERP's bill matcher refuses any candidate
+# whose modality contradicts the bill, so an OT-tagged X-ray can never be linked
+# to its CR bill - the name and the exam were already enough to find it.
+_MODALITY_PLACEHOLDERS = {"", "OT", "UNKNOWN", "N/A", "NA", "NONE", "SC"}
+
+
+def resolve_print_forward_modality(job_modality: str, calling_ae: str) -> str:
+    """Modality to tag a forwarded print job with, defaulting to today's OT."""
+    explicit = str(job_modality or "").strip().upper()
+    if explicit and explicit not in _MODALITY_PLACEHOLDERS:
+        return explicit
+
+    configured = str(PRINT_FORWARD_MODALITY or "").strip().upper()
+    if not configured:
+        return "OT"
+
+    aets = {ae.strip().upper() for ae in str(PRINT_FORWARD_MODALITY_AETS or "").split(",") if ae.strip()}
+    if not aets:
+        log.warning(
+            "PRINT_FORWARD_MODALITY=%s is set but PRINT_FORWARD_MODALITY_AETS is empty; "
+            "forwarding as OT rather than relabel every department's films", configured,
+        )
+        return "OT"
+    if str(calling_ae or "").strip().upper() not in aets:
+        return "OT"
+    return configured
+
+
+def _refuse_empty_forward(job_key: str, reason: str) -> None:
+    """Say in the job record why nothing was sent, rather than sending a blank."""
+    log.error("Refusing to forward job %s to Orthanc: %s", job_key, reason)
+    _record_error(f"Orthanc forward refused for {job_key}: {reason}")
+    try:
+        job_store.update_job(
+            job_key, orthancForwardStatus="refused", orthancForwardError=reason[:500]
+        )
+    except Exception as exc:
+        log.warning("Could not record the refused forward for job %s: %s", job_key, exc)
+
 
 def _forward_print_job_to_orthanc(
     job_key: str,
@@ -2141,14 +2284,20 @@ def _forward_print_job_to_orthanc(
         ds.StudyInstanceUID = study_uid
         ds.StudyDate = patient_info.study_date or datetime.now().strftime("%Y%m%d")
         ds.StudyTime = datetime.now().strftime("%H%M%S")
-        ds.StudyDescription = f"Print Job {job_key}"[:64]
+        exam = str(patient_info.study_description or "").strip()
+        if exam:
+            # The exam words first, so the ERP's keyword overlap against the
+            # billed test name sees them even if the 64-char cap cuts the tail.
+            ds.StudyDescription = f"{exam} | Print Job"[:64]
+        else:
+            ds.StudyDescription = f"Print Job {job_key}"[:64]
         if patient_info.referring_doctor:
             ds.StudyDescription = f"{ds.StudyDescription} | Ref: {patient_info.referring_doctor}"[:64]
         
         # Series Module
         ds.SeriesInstanceUID = series_uid
         ds.SeriesNumber = 1
-        ds.Modality = modality or "OT"
+        ds.Modality = resolve_print_forward_modality(modality, source_calling_ae)
         ds.SeriesDescription = "DICOM Print Job"
         
         # SOP Module
@@ -2156,32 +2305,35 @@ def _forward_print_job_to_orthanc(
         ds.SOPInstanceUID = sop_uid
         ds.InstanceNumber = 1
         
-        # Read the first rendered image file and use its pixel data
-        if out_paths and out_paths[0].exists():
-            img = Image.open(out_paths[0]).convert("L")  # Convert to grayscale
+        # Pixel data comes from the first rendered page. A page that cannot be
+        # read is REFUSED rather than sent as a blank: placeholder studies landed
+        # in the archive wearing a real patient's name, where a blank is
+        # indistinguishable from a delivered film. The paper film has printed
+        # already, so refusing costs the clinic a bad study and nothing else.
+        page_path = out_paths[0] if out_paths else None
+        if page_path is None or not page_path.exists():
+            _refuse_empty_forward(job_key, "no rendered page file was produced")
+            return
+        try:
+            img = Image.open(page_path).convert("L")
             img_array = np.array(img)
-            ds.Rows = img.height
-            ds.Columns = img.width
-            ds.BitsAllocated = 8
-            ds.BitsStored = 8
-            ds.HighBit = 7
-            ds.PixelRepresentation = 0
-            ds.SamplesPerPixel = 1
-            ds.PhotometricInterpretation = "MONOCHROME2"
-            ds.PixelData = img_array.tobytes()
-            log.info("Forwarding real image from %s (%dx%d)", out_paths[0].name, img.width, img.height)
-        else:
-            # Fallback to minimal pixel data if no image available
-            ds.Rows = 1
-            ds.Columns = 1
-            ds.BitsAllocated = 8
-            ds.BitsStored = 8
-            ds.HighBit = 7
-            ds.PixelRepresentation = 0
-            ds.SamplesPerPixel = 1
-            ds.PhotometricInterpretation = "MONOCHROME2"
-            ds.PixelData = b'\xff'
-            log.warning("No rendered image available for job %s, sending placeholder", job_key)
+        except Exception as exc:
+            _refuse_empty_forward(job_key, f"{page_path.name} could not be read: {exc}")
+            return
+        if img.width < 16 or img.height < 16 or img_array.size == 0:
+            _refuse_empty_forward(job_key, f"{page_path.name} is {img.width}x{img.height}, too small to be a film")
+            return
+
+        ds.Rows = int(img.height)
+        ds.Columns = int(img.width)
+        ds.BitsAllocated = 8
+        ds.BitsStored = 8
+        ds.HighBit = 7
+        ds.PixelRepresentation = 0
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelData = img_array.tobytes()
+        log.info("Forwarding real image from %s (%dx%d)", page_path.name, img.width, img.height)
         
         # C-STORE to Orthanc
         ae = SCU_AE(ae_title=STORAGE_AE_TITLE)
@@ -2190,9 +2342,12 @@ def _forward_print_job_to_orthanc(
         
         assoc = ae.associate(ORTHANC_HOST, ORTHANC_PORT, ae_title=ORTHANC_AE_TITLE)
         if not assoc.is_established:
+            reason = f"could not associate with Orthanc at {ORTHANC_HOST}:{ORTHANC_PORT}"
             log.error("Failed to associate with Orthanc for job %s", job_key)
+            _record_error(f"Orthanc forward failed for {job_key}: {reason}")
+            job_store.update_job(job_key, orthancForwardStatus="failed", orthancForwardError=reason[:500])
             return
-        
+
         try:
             status = assoc.send_c_store(ds)
             if status and status.Status == 0x0000:
@@ -2200,14 +2355,21 @@ def _forward_print_job_to_orthanc(
                     "Forwarded print job %s to Orthanc: study=%s patient=%s",
                     job_key, study_uid, ds.PatientName
                 )
-            else:
-                log.error(
-                    "Orthanc rejected C-STORE for job %s: status=%s",
-                    job_key, status.Status if status else "NO_STATUS"
+                job_store.update_job(
+                    job_key,
+                    orthancForwardStatus="sent",
+                    orthancForwardStudyUID=study_uid,
+                    orthancForwardModality=str(ds.Modality),
+                    orthancForwardDescription=str(ds.StudyDescription),
                 )
+            else:
+                reason = f"Orthanc rejected C-STORE: status={status.Status if status else 'NO_STATUS'}"
+                log.error("Orthanc rejected C-STORE for job %s: status=%s",
+                          job_key, status.Status if status else "NO_STATUS")
+                _record_error(f"Orthanc forward failed for {job_key}: {reason}")
+                job_store.update_job(job_key, orthancForwardStatus="failed", orthancForwardError=reason[:500])
         finally:
             assoc.release()
-            
     except Exception as exc:
         log.exception("Error forwarding job %s to Orthanc", job_key)
 
@@ -2333,11 +2495,20 @@ def process_print_job(
         out_paths = save_pages(canvases, out_path)
         log.info("Saved %d rendered page file(s): %s", len(out_paths), ", ".join(p.name for p in out_paths))
 
-        # OCR extraction: try to get patient info from rendered film if not already present
-        if out_paths and (not patient_info or not patient_info.name):
+        # OCR extraction: recover from the film itself what the print job did not
+        # send. It runs when the patient is unknown, and also when a department has
+        # opted into PACS forwarding by AE (so its films must carry a modality) but
+        # the exam name is still missing - that name is what lets the ERP find the
+        # bill. Anywhere else the job is printed and forwarded exactly as before,
+        # with no OCR cost added.
+        needs_ocr = not patient_info or not patient_info.name or (
+            not patient_info.study_description
+            and resolve_print_forward_modality(modality, source_calling_ae) != "OT"
+        )
+        if out_paths and needs_ocr:
             try:
                 ocr_data = _extract_patient_info_via_ocr(out_paths[0])
-                if ocr_data["patient_name"] or ocr_data["referring_doctor"]:
+                if ocr_data["patient_name"] or ocr_data["referring_doctor"] or ocr_data["study_description"]:
                     if patient_info is None:
                         patient_info = PatientInfo()
                     if ocr_data["patient_name"] and not patient_info.name:
@@ -2346,6 +2517,9 @@ def process_print_job(
                     if ocr_data["referring_doctor"] and not patient_info.referring_doctor:
                         patient_info.referring_doctor = ocr_data["referring_doctor"]
                         log.info("OCR: extracted referring doctor '%s'", patient_info.referring_doctor)
+                    if ocr_data["study_description"] and not patient_info.study_description:
+                        patient_info.study_description = ocr_data["study_description"]
+                        log.info("OCR: extracted exam '%s'", patient_info.study_description)
                     # Update job store with OCR-extracted info
                     job_store.update_job(
                         job_key,
